@@ -79,7 +79,7 @@ const STAGING_BASE = resolve(homedir(), '.brain', 'staging');
 const DISTILL_LOG  = resolve(homedir(), '.brain', 'distill.log');
 const runStore     = new Map(); // runId → state
 
-const AGENT_PATH = '/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin';
+const AGENT_PATH = '/Users/stefanopozzato/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin';
 
 function makeRunId() {
   const d = new Date(), p = n => String(n).padStart(2, '0');
@@ -174,8 +174,9 @@ async function runClaudeAgent(stagingDir, prompt) {
   return new Promise((resolve, reject) => {
     const child = spawn('claude', [
       '-p',
+      '--permission-mode', 'acceptEdits',
       '--allowedTools', 'Read,Write,Edit,LS,Glob',
-      '--dangerously-skip-permissions',
+      '--disallowedTools', 'Bash,WebFetch,WebSearch',
       '--output-format', 'text',
       '--no-session-persistence',
     ], {
@@ -201,59 +202,119 @@ async function runClaudeAgent(stagingDir, prompt) {
   });
 }
 
-// Run agy (Antigravity / Gemini) with project-level sandbox settings
-async function runGeminiAgent(stagingDir, prompt) {
-  // Write project-level settings restricting reads to staging, writes to out/ only
-  await mkdir(join(stagingDir, '.agy'), { recursive: true });
-  await writeFile(join(stagingDir, '.agy', 'settings.json'), JSON.stringify({
-    permissions: {
-      allow: [
-        `read_file(${stagingDir})`,
-        `write_file(${join(stagingDir, 'out')})`,
-      ],
-    },
-  }, null, 2));
-
-  return new Promise((resolve, reject) => {
-    const child = spawn('agy', [
-      '--print',
-      '--sandbox',
-      '--add-dir', stagingDir,
-      prompt,
-    ], {
-      cwd: stagingDir,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, PATH: AGENT_PATH },
-    });
-
-    let stderr = '';
-    child.stdout.on('data', () => {});
-    child.stderr.on('data', d => { stderr += d; });
-
-    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Gemini timed out after 5 minutes')); }, 5 * 60 * 1000);
-    child.on('close', code => {
-      clearTimeout(timer);
-      if (code === 0 || code === null) resolve();
-      else reject(new Error(`agy exited ${code}: ${stderr.slice(0, 400)}`));
-    });
-    child.on('error', e => { clearTimeout(timer); reject(e); });
-  });
+// Gemini/agy runner — currently disabled; see verifyGeminiHeadless for reason.
+async function runGeminiAgent(_stagingDir, _prompt) {
+  throw new Error('Gemini is disabled: ' + (geminiDisabledReason || 'project-level settings unverifiable'));
 }
 
-// Check if agy works in headless mode (no TTY hang); cache result
+// Verify agy project-level settings work in headless mode without --dangerously-skip-permissions.
+// Result: null = OK, string = disabled reason. Cached after first call.
+// Findings from empirical testing (agy 1.4.9):
+//   - settings.json in CWD is read, but in headless --print mode agy auto-denies write_file
+//     permission unless --dangerously-skip-permissions is also passed.
+//   - --dangerously-skip-permissions bypasses ALL path restrictions in settings.json, so
+//     project-level write isolation cannot be enforced headlessly.
+//   - The same applies to ~/.gemini/config/projects/[name]/settings.json + --project.
+// Therefore Gemini remains disabled until agy adds per-path headless permission grants.
 let geminiDisabledReason = undefined; // undefined=unchecked, null=ok, string=reason
 async function verifyGeminiHeadless() {
   if (geminiDisabledReason !== undefined) return geminiDisabledReason;
+
+  // Step 1: confirm agy binary is reachable.
   try {
-    // Quick non-interactive check: agy --version should exit fast
-    await execAsync('agy --version', {
-      timeout: 8000,
-      env: { ...process.env, PATH: AGENT_PATH },
-    });
-    geminiDisabledReason = null; // OK
+    await execAsync('agy --version', { timeout: 8000, env: { ...process.env, PATH: AGENT_PATH } });
   } catch (e) {
-    geminiDisabledReason = `agy headless check failed: ${e.message.slice(0, 160)}`;
+    geminiDisabledReason = `agy not found or failed to start: ${e.message.slice(0, 120)}`;
+    return geminiDisabledReason;
   }
+
+  // Step 2: verify that a write outside out/ is denied under project settings,
+  // WITHOUT --dangerously-skip-permissions. Create a minimal staging dir and
+  // try to write to two paths — inside out/ and outside it.
+  const testDir = join(STAGING_BASE, `gemini-verify-${Date.now()}`);
+  const outDir  = join(testDir, 'out');
+  const projectName = 'brain-distill-verify';
+  const projectSettingsDir = join(homedir(), '.gemini', 'config', 'projects', projectName);
+  const settingsPath = join(projectSettingsDir, 'settings.json');
+  const globalSettingsPath = join(homedir(), '.gemini', 'antigravity-cli', 'settings.json');
+
+  try {
+    await mkdir(outDir, { recursive: true });
+    await mkdir(projectSettingsDir, { recursive: true });
+
+    // Record global settings checksum before test
+    let globalBefore = null;
+    try { globalBefore = md5(await readFile(globalSettingsPath, 'utf8')); } catch { /* absent is fine */ }
+
+    await writeFile(settingsPath, JSON.stringify({
+      permissions: {
+        allow: [
+          `read_file(${testDir})`,
+          `write_file(${outDir})`,
+        ],
+      },
+    }, null, 2));
+
+    // Run agy without --dangerously-skip-permissions
+    const testPrompt = `Write 'inside' to ${join(outDir, 'inside.txt')} and 'outside' to ${join(testDir, 'escape.txt')}`;
+    let agyStopped = false;
+    try {
+      await new Promise((res, rej) => {
+        const child = spawn('agy', [
+          '--print',
+          '--sandbox',
+          '--project', projectName,
+          '--add-dir', testDir,
+          '--print-timeout', '20s',
+          testPrompt,
+        ], {
+          cwd: testDir,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: { ...process.env, PATH: AGENT_PATH },
+        });
+        const t = setTimeout(() => { child.kill('SIGKILL'); agyStopped = true; res(); }, 25000);
+        child.on('close', () => { clearTimeout(t); res(); });
+        child.on('error', e => { clearTimeout(t); rej(e); });
+      });
+    } catch { /* expected — headless denial */ }
+
+    // Check global settings unchanged
+    let globalAfter = null;
+    try { globalAfter = md5(await readFile(globalSettingsPath, 'utf8')); } catch { /* absent */ }
+    if (globalBefore !== globalAfter) {
+      geminiDisabledReason = 'agy modified ~/.gemini/antigravity-cli/settings.json during headless test';
+      return geminiDisabledReason;
+    }
+
+    // Check escape was denied and inside was also denied (headless auto-denial without --dangerously-skip-permissions)
+    const escapeExists = await stat(join(testDir, 'escape.txt')).then(() => true).catch(() => false);
+    const insideExists = await stat(join(outDir, 'inside.txt')).then(() => true).catch(() => false);
+
+    if (escapeExists) {
+      geminiDisabledReason = 'agy wrote outside out/ despite project settings — sandbox ineffective';
+      return geminiDisabledReason;
+    }
+
+    if (!insideExists && !agyStopped) {
+      // Both denied: write_file is auto-denied in headless mode without --dangerously-skip-permissions.
+      // Using --dangerously-skip-permissions would bypass the write_file path restrictions.
+      // Neither option gives safe isolated writes.
+      geminiDisabledReason =
+        'agy --print auto-denies write_file in headless mode without --dangerously-skip-permissions; ' +
+        '--dangerously-skip-permissions bypasses project-level path restrictions entirely. ' +
+        'Safe headless write isolation is not achievable in agy 1.4.9.';
+      return geminiDisabledReason;
+    }
+
+    // If we somehow got here with inside written and escape not written, it works — enable
+    geminiDisabledReason = null;
+  } catch (e) {
+    geminiDisabledReason = `agy verification error: ${e.message.slice(0, 160)}`;
+  } finally {
+    try { await rm(testDir, { recursive: true, force: true }); } catch { /* non-fatal */ }
+    try { await rm(projectSettingsDir, { recursive: true, force: true }); } catch { /* non-fatal */ }
+  }
+
   return geminiDisabledReason;
 }
 
@@ -563,8 +624,15 @@ app.post('/api/distill/run', async (req, res) => {
       await writeFile(join(stagDir, 'run.json'), JSON.stringify(
         { runId, agent, inputNames: files.map(f => f.name), today }, null, 2));
 
-      // ── Pre-run checksum snapshot (excluding out/) ─────────────────
+      // ── Pre-run snapshots ──────────────────────────────────────────
       const preSnap = await fileChecksums(stagDir, 'out');
+
+      // Record git status of ~/Brain before run (catches agent writes outside staging)
+      let preGitStatus = '';
+      try {
+        const { stdout } = await execAsync(`git -C "${BRAIN}" status --short`, { timeout: 10000 });
+        preGitStatus = stdout.trim();
+      } catch { /* git absent or not a repo — skip */ }
 
       state.status  = 'running';
       state.message = `${agent === 'claude' ? 'Claude' : 'Gemini'} is distilling…`;
@@ -575,7 +643,21 @@ app.post('/api/distill/run', async (req, res) => {
 
       state.message = 'Checking output…';
 
-      // ── Post-run: nothing outside out/ should have changed ─────────
+      // ── Post-run Brain git status check ───────────────────────────
+      let postGitStatus = '';
+      try {
+        const { stdout } = await execAsync(`git -C "${BRAIN}" status --short`, { timeout: 10000 });
+        postGitStatus = stdout.trim();
+      } catch { /* skip */ }
+
+      if (preGitStatus !== postGitStatus) {
+        const reason = `~/Brain changed during run (git status diff): before="${preGitStatus}" after="${postGitStatus}"`;
+        state.status = 'failed'; state.message = reason;
+        await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${reason}`);
+        return;
+      }
+
+      // ── Post-run staging: nothing outside out/ should have changed ─
       const postSnap = await fileChecksums(stagDir, 'out');
       const tampered = [];
       for (const k of Object.keys(postSnap)) {
