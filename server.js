@@ -1,7 +1,7 @@
 // Local API server — reads and writes ~/Brain .md files.
 // Listens only on localhost:3001. Never touches anything outside ~/Brain.
 import express from 'express';
-import { readdir, readFile, writeFile, stat, access } from 'fs/promises';
+import { readdir, readFile, writeFile, stat, access, unlink, mkdir } from 'fs/promises';
 import { resolve, join, sep, extname, basename, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
@@ -53,6 +53,24 @@ function guardPermalink(original, edited) {
 
 function prettify(s) {
   return s.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function parseFM(content) {
+  const m = content.match(/^---\s*\n([\s\S]*?)\n---/);
+  if (!m) return {};
+  const obj = {};
+  for (const line of m[1].split('\n')) {
+    const i = line.indexOf(':');
+    if (i > 0) obj[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  }
+  return obj;
+}
+
+function safeInbox(filename) {
+  if (!filename || typeof filename !== 'string') throw err400('Missing filename');
+  if (filename.includes('/') || filename.includes('\\') || filename.includes('..')) throw err400('Invalid filename');
+  if (extname(filename) !== '.md') throw err400('Only .md files are allowed');
+  return join(BRAIN, 'inbox', filename);
 }
 
 async function mdFilesIn(dir) {
@@ -175,6 +193,112 @@ app.get('/api/gitlog', async (_req, res) => {
     res.json({ lastCommit: raw ? new Date(raw).toISOString() : null });
   } catch {
     res.json({ lastCommit: null });
+  }
+});
+
+// ─── INBOX ROUTES ────────────────────────────────────────────────────────────
+
+// List inbox items with parsed frontmatter and hashes
+app.get('/api/inbox', async (_req, res) => {
+  try {
+    const inboxDir = join(BRAIN, 'inbox');
+    let files;
+    try {
+      files = (await readdir(inboxDir)).filter(f => f.endsWith('.md') && f !== '.gitkeep');
+    } catch {
+      return res.json([]);
+    }
+
+    const items = await Promise.all(files.map(async (filename) => {
+      const content = await readFile(join(inboxDir, filename), 'utf8');
+      const fm = parseFM(content);
+      let targetHash = null;
+      if (fm.target) {
+        try {
+          const tc = await readFile(safe(fm.target), 'utf8');
+          targetHash = md5(tc);
+        } catch { /* target absent or invalid — leave null */ }
+      }
+      return {
+        filename,
+        path: `inbox/${filename}`,
+        title: fm.title || prettify(basename(filename, '.md')),
+        target: fm.target || null,
+        content,
+        inboxHash: md5(content),
+        targetHash,
+      };
+    }));
+
+    res.json(items);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Approve: append bullet lines to target, update target's updated date, delete inbox file
+app.post('/api/inbox/approve', async (req, res) => {
+  try {
+    const { filename, inboxHash, targetHash } = req.body;
+    const inboxAbs = safeInbox(filename);
+
+    let inboxContent;
+    try { inboxContent = await readFile(inboxAbs, 'utf8'); }
+    catch { return res.status(404).json({ error: 'Inbox file not found' }); }
+
+    if (inboxHash && md5(inboxContent) !== inboxHash) {
+      return res.status(409).json({ error: 'conflict', message: 'Inbox file changed since it was opened.' });
+    }
+
+    const fm = parseFM(inboxContent);
+    if (!fm.target) return res.status(400).json({ error: 'No target field in inbox file' });
+
+    const targetAbs = safe(fm.target);
+    const bodyRaw = inboxContent.replace(/^---[\s\S]*?---\s*\n?/, '').trimStart();
+    const body = bodyRaw.trimEnd() + '\n';
+    const today = new Date().toISOString().split('T')[0];
+
+    let targetContent;
+    let targetExists = true;
+    try { targetContent = await readFile(targetAbs, 'utf8'); }
+    catch { targetExists = false; }
+
+    let newTargetContent;
+    if (targetExists) {
+      if (targetHash && md5(targetContent) !== targetHash) {
+        return res.status(409).json({ error: 'conflict', message: 'Target file changed since it was opened.' });
+      }
+      let updated = targetContent.replace(/^(updated:[ \t]*).*$/m, `$1${today}`);
+      if (updated === targetContent) {
+        updated = targetContent.replace(/^(---[ \t]*\r?\n)/, `$1updated: ${today}\n`);
+      }
+      newTargetContent = guardPermalink(targetContent, updated.trimEnd() + '\n' + body);
+    } else {
+      const titleStem = basename(fm.target, '.md').replace(/-/g, ' ');
+      newTargetContent = `---\ntitle: ${titleStem}\nupdated: ${today}\n---\n\n${body}`;
+      await mkdir(dirname(targetAbs), { recursive: true });
+    }
+
+    await writeFile(targetAbs, newTargetContent, 'utf8');
+    await unlink(inboxAbs);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// Discard: delete inbox file
+app.delete('/api/inbox/:filename', async (req, res) => {
+  try {
+    const inboxAbs = safeInbox(req.params.filename);
+    try {
+      await unlink(inboxAbs);
+      res.json({ ok: true });
+    } catch {
+      res.status(404).json({ error: 'File not found' });
+    }
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
   }
 });
 

@@ -3,11 +3,13 @@ import { camera, surfPool, surfNormVecs, onAnimate } from './brain.js';
 import { initLabels, updateLabels } from './labels.js';
 import { initPanel, openPanel } from './panel.js';
 import { initTopbar } from './topbar.js';
+import { initInbox } from './inbox.js';
 import { fetchItems } from './api.js';
 
 async function boot() {
   initPanel();
   initTopbar();
+  initInbox();
 
   let items = [];
   try {
