@@ -602,12 +602,8 @@ app.post('/api/distill/run', async (req, res) => {
         }
       }
 
-      // ── Pre-run git snapshot ───────────────────────────────────────
-      let preGitStatus = '';
-      try {
-        const { stdout } = await execAsync(`git -C "${BRAIN}" status --short`, { timeout: 10000 });
-        preGitStatus = stdout.trim();
-      } catch { /* git absent or not a repo — skip */ }
+      // ── Pre-run Brain checksum ─────────────────────────────────────
+      const preBrainSnap = await fileChecksums(BRAIN, '.git');
 
       // ── Run agent ──────────────────────────────────────────────────
       if (agent !== 'claude' && agent !== 'gemini') throw new Error(`Unknown agent: ${agent}`);
@@ -622,15 +618,18 @@ app.post('/api/distill/run', async (req, res) => {
 
       state.message = 'Checking output…';
 
-      // ── Post-run git status check ──────────────────────────────────
-      let postGitStatus = '';
-      try {
-        const { stdout } = await execAsync(`git -C "${BRAIN}" status --short`, { timeout: 10000 });
-        postGitStatus = stdout.trim();
-      } catch { /* skip */ }
-
-      if (preGitStatus !== postGitStatus) {
-        const reason = `~/Brain changed during run: before="${preGitStatus}" after="${postGitStatus}"`;
+      // ── Post-run Brain checksum check ──────────────────────────────
+      const postBrainSnap = await fileChecksums(BRAIN, '.git');
+      const brainChanged = [];
+      for (const k of Object.keys(postBrainSnap)) {
+        if (!preBrainSnap[k])                          brainChanged.push(`appeared: ${k}`);
+        else if (preBrainSnap[k] !== postBrainSnap[k]) brainChanged.push(`modified: ${k}`);
+      }
+      for (const k of Object.keys(preBrainSnap)) {
+        if (!postBrainSnap[k]) brainChanged.push(`deleted: ${k}`);
+      }
+      if (brainChanged.length > 0) {
+        const reason = `~/Brain changed during run: ${brainChanged.join('; ')}`;
         state.status = 'failed'; state.message = reason;
         await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${reason}`);
         return;
