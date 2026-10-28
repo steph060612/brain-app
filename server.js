@@ -1,11 +1,11 @@
 // Local API server — reads and writes ~/Brain .md files.
 // Listens only on localhost:3001. Never touches anything outside ~/Brain.
 import express from 'express';
-import { readdir, readFile, writeFile, stat, access, unlink, mkdir } from 'fs/promises';
+import { readdir, readFile, writeFile, stat, access, unlink, mkdir, rm } from 'fs/promises';
 import { resolve, join, sep, extname, basename, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import { homedir } from 'os';
 
@@ -71,6 +71,190 @@ function safeInbox(filename) {
   if (filename.includes('/') || filename.includes('\\') || filename.includes('..')) throw err400('Invalid filename');
   if (extname(filename) !== '.md') throw err400('Only .md files are allowed');
   return join(BRAIN, 'inbox', filename);
+}
+
+// ─── DISTILL CONSTANTS & HELPERS ─────────────────────────────────────────────
+
+const STAGING_BASE = resolve(homedir(), '.brain', 'staging');
+const DISTILL_LOG  = resolve(homedir(), '.brain', 'distill.log');
+const runStore     = new Map(); // runId → state
+
+const AGENT_PATH = '/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin';
+
+function makeRunId() {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}-${Math.random().toString(36).slice(2,6)}`;
+}
+
+// Walk ~/Brain and return "rel/path.md | title" lines
+async function buildBrainIndex() {
+  const rows = [];
+  async function walk(dir, pfx) {
+    let entries;
+    try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const rel = pfx ? `${pfx}/${e.name}` : e.name;
+      if (e.isDirectory()) { await walk(join(dir, e.name), rel); }
+      else if (e.name.endsWith('.md')) {
+        try {
+          const fm = parseFM(await readFile(join(dir, e.name), 'utf8'));
+          rows.push(`${rel} | ${fm.title || prettify(basename(e.name, '.md'))}`);
+        } catch { /* skip unreadable */ }
+      }
+    }
+  }
+  await walk(BRAIN, '');
+  return rows.join('\n');
+}
+
+// md5 checksums of every file in dir, skipping one named top-level subdirectory
+async function fileChecksums(dir, skipSub) {
+  const map = {};
+  async function walk(d, base) {
+    let entries;
+    try { entries = await readdir(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const rel = base ? `${base}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        if (skipSub && e.name === skipSub && base === '') continue;
+        await walk(join(d, e.name), rel);
+      } else {
+        map[rel] = md5((await readFile(join(d, e.name))).toString());
+      }
+    }
+  }
+  await walk(dir, '');
+  return map;
+}
+
+// Validate all files in out/ against checker rules
+async function checkOutFiles(outDir) {
+  const errors = [];
+  let names;
+  try { names = (await readdir(outDir)).filter(f => !f.startsWith('.')); }
+  catch { return { ok: false, errors: ['out/ directory missing'] }; }
+  if (names.length === 0) return { ok: false, errors: ['No files written to out/'] };
+
+  const mdFiles = [];
+  for (const f of names) {
+    if (!f.endsWith('.md')) { errors.push(`Non-.md file in out/: ${f}`); continue; }
+    let content;
+    try { content = await readFile(join(outDir, f), 'utf8'); }
+    catch { errors.push(`Cannot read out/${f}`); continue; }
+
+    if (Buffer.byteLength(content, 'utf8') > 20 * 1024) { errors.push(`out/${f} exceeds 20 KB`); continue; }
+    if (/^permalink:/m.test(content)) { errors.push(`out/${f} has a permalink line`); continue; }
+
+    const fm = parseFM(content);
+    if (!fm.title)   errors.push(`out/${f}: missing title`);
+    if (!fm.updated) errors.push(`out/${f}: missing updated`);
+    if (!fm.target)  { errors.push(`out/${f}: missing target`); continue; }
+
+    const t = fm.target;
+    if (t.includes('..') || t.startsWith('/')) { errors.push(`out/${f}: invalid target path`); continue; }
+    if (!['projects/', 'archive/', 'people/', 'topics/'].some(p => t.startsWith(p))) {
+      errors.push(`out/${f}: target "${t}" outside allowed folders`); continue;
+    }
+    mdFiles.push(f);
+  }
+  if (errors.length > 0) return { ok: false, errors };
+  return { ok: true, mdFiles };
+}
+
+async function appendDistillLog(line) {
+  try {
+    await mkdir(resolve(homedir(), '.brain'), { recursive: true });
+    const ts = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    await writeFile(DISTILL_LOG, `${ts} | ${line}\n`, { flag: 'a' });
+  } catch { /* non-fatal */ }
+}
+
+// Run claude -p with prompt on stdin, cwd = stagingDir
+async function runClaudeAgent(stagingDir, prompt) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('claude', [
+      '-p',
+      '--allowedTools', 'Read,Write,Edit,LS,Glob',
+      '--dangerously-skip-permissions',
+      '--output-format', 'text',
+      '--no-session-persistence',
+    ], {
+      cwd: stagingDir,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, PATH: AGENT_PATH },
+    });
+
+    child.stdin.write(prompt, 'utf8');
+    child.stdin.end();
+
+    let stderr = '';
+    child.stdout.on('data', () => {});
+    child.stderr.on('data', d => { stderr += d; });
+
+    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Claude timed out after 5 minutes')); }, 5 * 60 * 1000);
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (code === 0 || code === null) resolve();
+      else reject(new Error(`claude exited ${code}: ${stderr.slice(0, 400)}`));
+    });
+    child.on('error', e => { clearTimeout(timer); reject(e); });
+  });
+}
+
+// Run agy (Antigravity / Gemini) with project-level sandbox settings
+async function runGeminiAgent(stagingDir, prompt) {
+  // Write project-level settings restricting reads to staging, writes to out/ only
+  await mkdir(join(stagingDir, '.agy'), { recursive: true });
+  await writeFile(join(stagingDir, '.agy', 'settings.json'), JSON.stringify({
+    permissions: {
+      allow: [
+        `read_file(${stagingDir})`,
+        `write_file(${join(stagingDir, 'out')})`,
+      ],
+    },
+  }, null, 2));
+
+  return new Promise((resolve, reject) => {
+    const child = spawn('agy', [
+      '--print',
+      '--sandbox',
+      '--add-dir', stagingDir,
+      prompt,
+    ], {
+      cwd: stagingDir,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, PATH: AGENT_PATH },
+    });
+
+    let stderr = '';
+    child.stdout.on('data', () => {});
+    child.stderr.on('data', d => { stderr += d; });
+
+    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Gemini timed out after 5 minutes')); }, 5 * 60 * 1000);
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (code === 0 || code === null) resolve();
+      else reject(new Error(`agy exited ${code}: ${stderr.slice(0, 400)}`));
+    });
+    child.on('error', e => { clearTimeout(timer); reject(e); });
+  });
+}
+
+// Check if agy works in headless mode (no TTY hang); cache result
+let geminiDisabledReason = undefined; // undefined=unchecked, null=ok, string=reason
+async function verifyGeminiHeadless() {
+  if (geminiDisabledReason !== undefined) return geminiDisabledReason;
+  try {
+    // Quick non-interactive check: agy --version should exit fast
+    await execAsync('agy --version', {
+      timeout: 8000,
+      env: { ...process.env, PATH: AGENT_PATH },
+    });
+    geminiDisabledReason = null; // OK
+  } catch (e) {
+    geminiDisabledReason = `agy headless check failed: ${e.message.slice(0, 160)}`;
+  }
+  return geminiDisabledReason;
 }
 
 async function mdFilesIn(dir) {
@@ -300,6 +484,157 @@ app.delete('/api/inbox/:filename', async (req, res) => {
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
   }
+});
+
+// ─── DISTILL ROUTES ──────────────────────────────────────────────────────────
+
+// Detect installed + working agents
+app.get('/api/distill/agents', async (_req, res) => {
+  const agents = [], reasons = {};
+
+  try {
+    await execAsync('which claude', { env: { ...process.env, PATH: AGENT_PATH } });
+    agents.push('claude');
+  } catch {
+    reasons.claude = 'claude not found in PATH';
+  }
+
+  try {
+    await execAsync('which agy', { env: { ...process.env, PATH: AGENT_PATH } });
+    const reason = await verifyGeminiHeadless();
+    if (reason) { reasons.gemini = reason; }
+    else { agents.push('gemini'); }
+  } catch {
+    reasons.gemini = 'agy not installed';
+  }
+
+  res.json({ agents, reasons });
+});
+
+// Start a distill run. Body: { agent, files: [{name, content}] }
+app.post('/api/distill/run', async (req, res) => {
+  const { agent, files } = req.body;
+  if (!agent || !Array.isArray(files) || files.length === 0)
+    return res.status(400).json({ error: 'agent and files[] required' });
+
+  const runId   = makeRunId();
+  const stagDir = join(STAGING_BASE, runId);
+  const state   = {
+    status: 'pending', message: 'Preparing staging folder…',
+    result: null, agent, inputNames: files.map(f => f.name),
+    startedAt: new Date().toISOString(),
+  };
+  runStore.set(runId, state);
+  res.json({ runId });
+
+  const inputLabel = files.map(f => f.name).join(', ');
+
+  (async () => {
+    try {
+      // ── Setup staging ──────────────────────────────────────────────
+      await mkdir(STAGING_BASE, { recursive: true });
+      await mkdir(join(stagDir, 'input'), { recursive: true });
+      await mkdir(join(stagDir, 'out'));
+
+      await writeFile(join(stagDir, 'README.md'),
+        await readFile(join(BRAIN, 'README.md'), 'utf8'));
+      await writeFile(join(stagDir, 'brain-index.txt'), await buildBrainIndex());
+
+      for (const f of files) {
+        await writeFile(join(stagDir, 'input', basename(f.name)), f.content, 'utf8');
+      }
+
+      const today = new Date().toISOString().split('T')[0];
+      const prompt = [
+        'Read README.md for Brain file format rules, brain-index.txt for every existing Brain path,',
+        'and all files in input/ for the content to distill.',
+        '',
+        'Write your output to the out/ directory ONLY — never write anywhere else.',
+        '',
+        'Each output file must have YAML frontmatter with:',
+        `  title: <short descriptive title>`,
+        `  updated: ${today}`,
+        `  target: <relative path from brain-index.txt, OR a new path under projects/ for a brand-new project>`,
+        '',
+        'Body: bullet-point facts only — exactly as stated in the input, distilled and organised.',
+        'No raw transcript. No opinions. No permalink line. One file per target. Lowercase-hyphenated filenames.',
+      ].join('\n');
+
+      await writeFile(join(stagDir, 'run.json'), JSON.stringify(
+        { runId, agent, inputNames: files.map(f => f.name), today }, null, 2));
+
+      // ── Pre-run checksum snapshot (excluding out/) ─────────────────
+      const preSnap = await fileChecksums(stagDir, 'out');
+
+      state.status  = 'running';
+      state.message = `${agent === 'claude' ? 'Claude' : 'Gemini'} is distilling…`;
+
+      if (agent === 'claude')       await runClaudeAgent(stagDir, prompt);
+      else if (agent === 'gemini')  await runGeminiAgent(stagDir, prompt);
+      else throw new Error(`Unknown agent: ${agent}`);
+
+      state.message = 'Checking output…';
+
+      // ── Post-run: nothing outside out/ should have changed ─────────
+      const postSnap = await fileChecksums(stagDir, 'out');
+      const tampered = [];
+      for (const k of Object.keys(postSnap)) {
+        if (!preSnap[k]) tampered.push(`new file: ${k}`);
+        else if (preSnap[k] !== postSnap[k]) tampered.push(`modified: ${k}`);
+      }
+      for (const k of Object.keys(preSnap)) {
+        if (!postSnap[k]) tampered.push(`deleted: ${k}`);
+      }
+      if (tampered.length > 0) {
+        const reason = `Files changed outside out/: ${tampered.join('; ')}`;
+        state.status = 'failed'; state.message = reason;
+        await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${reason}`);
+        return;
+      }
+
+      // ── Validate out/ contents ─────────────────────────────────────
+      const { ok, errors, mdFiles } = await checkOutFiles(join(stagDir, 'out'));
+      if (!ok) {
+        const reason = errors.join('; ');
+        state.status = 'failed'; state.message = `Checker: ${reason}`;
+        await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${reason}`);
+        return;
+      }
+
+      // ── Move approved files to ~/Brain/inbox/ ──────────────────────
+      await mkdir(join(BRAIN, 'inbox'), { recursive: true });
+      const inboxed = [];
+      for (const f of mdFiles) {
+        let dest = join(BRAIN, 'inbox', f); let n = 0;
+        while (true) {
+          try { await stat(dest); n++; dest = join(BRAIN, 'inbox', `${basename(f, '.md')}-${n}.md`); }
+          catch { break; }
+        }
+        await writeFile(dest, await readFile(join(stagDir, 'out', f), 'utf8'));
+        inboxed.push(basename(dest));
+      }
+
+      // ── Delete staging on success ──────────────────────────────────
+      await rm(stagDir, { recursive: true, force: true });
+
+      state.status = 'done';
+      state.result = { inboxed };
+      state.message = `${inboxed.length} suggestion${inboxed.length !== 1 ? 's' : ''} moved to inbox: ${inboxed.join(', ')}`;
+      await appendDistillLog(`${agent} | ${inputLabel} | OK: ${inboxed.length} → inbox (${inboxed.join(', ')})`);
+
+    } catch (e) {
+      state.status  = 'failed';
+      state.message = `Error: ${e.message}`;
+      await appendDistillLog(`${agent} | ${inputLabel} | ERROR: ${e.message}`);
+    }
+  })();
+});
+
+// Poll run status
+app.get('/api/distill/status/:runId', (req, res) => {
+  const run = runStore.get(req.params.runId);
+  if (!run) return res.status(404).json({ error: 'Run not found' });
+  res.json(run);
 });
 
 // Serve the Vite production build; fall through to index.html for SPA

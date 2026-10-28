@@ -4,12 +4,14 @@ import { initLabels, updateLabels } from './labels.js';
 import { initPanel, openPanel } from './panel.js';
 import { initTopbar } from './topbar.js';
 import { initInbox } from './inbox.js';
+import { initDistill } from './distill.js';
 import { fetchItems } from './api.js';
 
 async function boot() {
   initPanel();
   initTopbar();
   initInbox();
+  initDistill();
 
   let items = [];
   try {
