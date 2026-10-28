@@ -169,18 +169,15 @@ async function appendDistillLog(line) {
   } catch { /* non-fatal */ }
 }
 
-// Run claude -p with prompt on stdin, cwd = stagingDir
-async function runClaudeAgent(stagingDir, prompt) {
+// Run claude -p with no tools; returns captured stdout.
+async function runClaudeAgent(prompt) {
   return new Promise((resolve, reject) => {
     const child = spawn('claude', [
       '-p',
-      '--permission-mode', 'acceptEdits',
-      '--allowedTools', 'Read,Write,Edit,LS,Glob',
-      '--disallowedTools', 'Bash,WebFetch,WebSearch',
+      '--tools', '',
       '--output-format', 'text',
       '--no-session-persistence',
     ], {
-      cwd: stagingDir,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, PATH: AGENT_PATH },
     });
@@ -188,134 +185,91 @@ async function runClaudeAgent(stagingDir, prompt) {
     child.stdin.write(prompt, 'utf8');
     child.stdin.end();
 
-    let stderr = '';
-    child.stdout.on('data', () => {});
+    let stdout = '', stderr = '';
+    child.stdout.on('data', d => { stdout += d; });
     child.stderr.on('data', d => { stderr += d; });
 
     const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Claude timed out after 5 minutes')); }, 5 * 60 * 1000);
     child.on('close', code => {
       clearTimeout(timer);
-      if (code === 0 || code === null) resolve();
+      if (code === 0 || code === null) resolve(stdout);
       else reject(new Error(`claude exited ${code}: ${stderr.slice(0, 400)}`));
     });
     child.on('error', e => { clearTimeout(timer); reject(e); });
   });
 }
 
-// Gemini/agy runner — currently disabled; see verifyGeminiHeadless for reason.
-async function runGeminiAgent(_stagingDir, _prompt) {
-  throw new Error('Gemini is disabled: ' + (geminiDisabledReason || 'project-level settings unverifiable'));
+// Run agy --sandbox with no file access; returns captured stdout.
+async function runGeminiAgent(prompt) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('agy', [
+      '--sandbox',
+      '--print-timeout', '300s',
+      '--print', prompt,
+    ], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, PATH: AGENT_PATH },
+    });
+
+    let stdout = '', stderr = '';
+    child.stdout.on('data', d => { stdout += d; });
+    child.stderr.on('data', d => { stderr += d; });
+
+    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Gemini timed out after 5 minutes')); }, 5 * 60 * 1000);
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (code === 0 || code === null) resolve(stdout);
+      else reject(new Error(`agy exited ${code}: ${stderr.slice(0, 400)}`));
+    });
+    child.on('error', e => { clearTimeout(timer); reject(e); });
+  });
 }
 
-// Verify agy project-level settings work in headless mode without --dangerously-skip-permissions.
-// Result: null = OK, string = disabled reason. Cached after first call.
-// Findings from empirical testing (agy 1.4.9):
-//   - settings.json in CWD is read, but in headless --print mode agy auto-denies write_file
-//     permission unless --dangerously-skip-permissions is also passed.
-//   - --dangerously-skip-permissions bypasses ALL path restrictions in settings.json, so
-//     project-level write isolation cannot be enforced headlessly.
-//   - The same applies to ~/.gemini/config/projects/[name]/settings.json + --project.
-// Therefore Gemini remains disabled until agy adds per-path headless permission grants.
+// Confirm agy is reachable and produces text output in headless mode (no file tools needed).
 let geminiDisabledReason = undefined; // undefined=unchecked, null=ok, string=reason
 async function verifyGeminiHeadless() {
   if (geminiDisabledReason !== undefined) return geminiDisabledReason;
-
-  // Step 1: confirm agy binary is reachable.
   try {
-    await execAsync('agy --version', { timeout: 8000, env: { ...process.env, PATH: AGENT_PATH } });
-  } catch (e) {
-    geminiDisabledReason = `agy not found or failed to start: ${e.message.slice(0, 120)}`;
-    return geminiDisabledReason;
-  }
-
-  // Step 2: verify that a write outside out/ is denied under project settings,
-  // WITHOUT --dangerously-skip-permissions. Create a minimal staging dir and
-  // try to write to two paths — inside out/ and outside it.
-  const testDir = join(STAGING_BASE, `gemini-verify-${Date.now()}`);
-  const outDir  = join(testDir, 'out');
-  const projectName = 'brain-distill-verify';
-  const projectSettingsDir = join(homedir(), '.gemini', 'config', 'projects', projectName);
-  const settingsPath = join(projectSettingsDir, 'settings.json');
-  const globalSettingsPath = join(homedir(), '.gemini', 'antigravity-cli', 'settings.json');
-
-  try {
-    await mkdir(outDir, { recursive: true });
-    await mkdir(projectSettingsDir, { recursive: true });
-
-    // Record global settings checksum before test
-    let globalBefore = null;
-    try { globalBefore = md5(await readFile(globalSettingsPath, 'utf8')); } catch { /* absent is fine */ }
-
-    await writeFile(settingsPath, JSON.stringify({
-      permissions: {
-        allow: [
-          `read_file(${testDir})`,
-          `write_file(${outDir})`,
-        ],
-      },
-    }, null, 2));
-
-    // Run agy without --dangerously-skip-permissions
-    const testPrompt = `Write 'inside' to ${join(outDir, 'inside.txt')} and 'outside' to ${join(testDir, 'escape.txt')}`;
-    let agyStopped = false;
-    try {
-      await new Promise((res, rej) => {
-        const child = spawn('agy', [
-          '--print',
-          '--sandbox',
-          '--project', projectName,
-          '--add-dir', testDir,
-          '--print-timeout', '20s',
-          testPrompt,
-        ], {
-          cwd: testDir,
-          stdio: ['ignore', 'pipe', 'pipe'],
-          env: { ...process.env, PATH: AGENT_PATH },
-        });
-        const t = setTimeout(() => { child.kill('SIGKILL'); agyStopped = true; res(); }, 25000);
-        child.on('close', () => { clearTimeout(t); res(); });
-        child.on('error', e => { clearTimeout(t); rej(e); });
+    const out = await new Promise((resolve, reject) => {
+      const child = spawn('agy', ['--sandbox', '--print', 'ping'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, PATH: AGENT_PATH },
       });
-    } catch { /* expected — headless denial */ }
-
-    // Check global settings unchanged
-    let globalAfter = null;
-    try { globalAfter = md5(await readFile(globalSettingsPath, 'utf8')); } catch { /* absent */ }
-    if (globalBefore !== globalAfter) {
-      geminiDisabledReason = 'agy modified ~/.gemini/antigravity-cli/settings.json during headless test';
-      return geminiDisabledReason;
-    }
-
-    // Check escape was denied and inside was also denied (headless auto-denial without --dangerously-skip-permissions)
-    const escapeExists = await stat(join(testDir, 'escape.txt')).then(() => true).catch(() => false);
-    const insideExists = await stat(join(outDir, 'inside.txt')).then(() => true).catch(() => false);
-
-    if (escapeExists) {
-      geminiDisabledReason = 'agy wrote outside out/ despite project settings — sandbox ineffective';
-      return geminiDisabledReason;
-    }
-
-    if (!insideExists && !agyStopped) {
-      // Both denied: write_file is auto-denied in headless mode without --dangerously-skip-permissions.
-      // Using --dangerously-skip-permissions would bypass the write_file path restrictions.
-      // Neither option gives safe isolated writes.
-      geminiDisabledReason =
-        'agy --print auto-denies write_file in headless mode without --dangerously-skip-permissions; ' +
-        '--dangerously-skip-permissions bypasses project-level path restrictions entirely. ' +
-        'Safe headless write isolation is not achievable in agy 1.4.9.';
-      return geminiDisabledReason;
-    }
-
-    // If we somehow got here with inside written and escape not written, it works — enable
-    geminiDisabledReason = null;
+      let stdout = '';
+      child.stdout.on('data', d => { stdout += d; });
+      const t = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('agy ping timed out')); }, 15000);
+      child.on('close', code => { clearTimeout(t); code === 0 ? resolve(stdout) : reject(new Error(`agy ping exited ${code}`)); });
+      child.on('error', e => { clearTimeout(t); reject(e); });
+    });
+    geminiDisabledReason = out.trim() ? null : 'agy returned empty output for ping test';
   } catch (e) {
-    geminiDisabledReason = `agy verification error: ${e.message.slice(0, 160)}`;
-  } finally {
-    try { await rm(testDir, { recursive: true, force: true }); } catch { /* non-fatal */ }
-    try { await rm(projectSettingsDir, { recursive: true, force: true }); } catch { /* non-fatal */ }
+    geminiDisabledReason = `agy headless test failed: ${e.message.slice(0, 160)}`;
   }
-
   return geminiDisabledReason;
+}
+
+// Split agent reply on === SUGGESTION === markers; write each block as .md to outDir.
+// Returns count of files written (0 if no valid blocks — writes raw-reply.txt instead).
+async function parseAgentReply(stdout, outDir) {
+  const blocks = stdout.split(/===[ \t]*SUGGESTION[ \t]*===/).map(b => b.trim()).filter(b => b.length > 0);
+  if (blocks.length === 0) {
+    await writeFile(join(outDir, 'raw-reply.txt'), stdout, 'utf8');
+    return 0;
+  }
+  let count = 0;
+  const used = new Set();
+  for (const block of blocks) {
+    const fm = parseFM(block);
+    if (!fm.title && !fm.target) continue;
+    const base = (fm.title || 'suggestion').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'suggestion';
+    let name = `${base}.md`; let n = 1;
+    while (used.has(name)) name = `${base}-${n++}.md`;
+    used.add(name);
+    await writeFile(join(outDir, name), block + '\n', 'utf8');
+    count++;
+  }
+  if (count === 0) await writeFile(join(outDir, 'raw-reply.txt'), stdout, 'utf8');
+  return count;
 }
 
 async function mdFilesIn(dir) {
@@ -581,7 +535,7 @@ app.post('/api/distill/run', async (req, res) => {
   const runId   = makeRunId();
   const stagDir = join(STAGING_BASE, runId);
   const state   = {
-    status: 'pending', message: 'Preparing staging folder…',
+    status: 'pending', message: 'Preparing…',
     result: null, agent, inputNames: files.map(f => f.name),
     startedAt: new Date().toISOString(),
   };
@@ -589,61 +543,86 @@ app.post('/api/distill/run', async (req, res) => {
   res.json({ runId });
 
   const inputLabel = files.map(f => f.name).join(', ');
+  const agentLabel = agent === 'claude' ? 'Claude' : 'Gemini';
 
   (async () => {
     try {
-      // ── Setup staging ──────────────────────────────────────────────
-      await mkdir(STAGING_BASE, { recursive: true });
+      // ── Setup staging (input files kept for inspection on failure) ─
       await mkdir(join(stagDir, 'input'), { recursive: true });
-      await mkdir(join(stagDir, 'out'));
-
-      await writeFile(join(stagDir, 'README.md'),
-        await readFile(join(BRAIN, 'README.md'), 'utf8'));
-      await writeFile(join(stagDir, 'brain-index.txt'), await buildBrainIndex());
-
+      await mkdir(join(stagDir, 'out'),   { recursive: true });
       for (const f of files) {
         await writeFile(join(stagDir, 'input', basename(f.name)), f.content, 'utf8');
       }
 
-      const today = new Date().toISOString().split('T')[0];
-      const prompt = [
-        'Read README.md for Brain file format rules, brain-index.txt for every existing Brain path,',
-        'and all files in input/ for the content to distill.',
-        '',
-        'Write your output to the out/ directory ONLY — never write anywhere else.',
-        '',
-        'Each output file must have YAML frontmatter with:',
-        `  title: <short descriptive title>`,
-        `  updated: ${today}`,
-        `  target: <relative path from brain-index.txt, OR a new path under projects/ for a brand-new project>`,
-        '',
-        'Body: bullet-point facts only — exactly as stated in the input, distilled and organised.',
-        'No raw transcript. No opinions. No permalink line. One file per target. Lowercase-hyphenated filenames.',
-      ].join('\n');
+      // ── Build prompt ───────────────────────────────────────────────
+      const today      = new Date().toISOString().split('T')[0];
+      const readme     = await readFile(join(BRAIN, 'README.md'), 'utf8');
+      const brainIndex = await buildBrainIndex();
+      const inputText  = files.map(f => `=== ${f.name} ===\n${f.content}`).join('\n\n');
 
-      await writeFile(join(stagDir, 'run.json'), JSON.stringify(
-        { runId, agent, inputNames: files.map(f => f.name), today }, null, 2));
+      const header = [
+        'Respond ONLY with === SUGGESTION === blocks — no other text before, between, or after them.',
+        'Each block is a complete Markdown file with YAML frontmatter:',
+        '',
+        '=== SUGGESTION ===',
+        '---',
+        'title: Short descriptive title',
+        `updated: ${today}`,
+        'target: projects/foo/state.md',
+        '---',
+        '',
+        '- Bullet point fact distilled from the input',
+        '',
+        'Rules:',
+        '- One block per target file.',
+        '- target must be a relative path from the Brain Index, or a new path under projects/ for a brand-new project.',
+        '- Body: bullet-point facts only — distilled and organised. No opinions, no raw transcript.',
+        '- No permalink line in the output.',
+        '- If nothing is worth adding, output nothing.',
+        '',
+        '=== README (Brain format rules) ===',
+        readme.trim(),
+        '',
+        '=== BRAIN INDEX ===',
+        brainIndex,
+        '',
+        '=== INPUT ===',
+      ].join('\n') + '\n';
 
-      // ── Pre-run snapshots ──────────────────────────────────────────
-      const preSnap = await fileChecksums(stagDir, 'out');
+      const CHUNK_SIZE = 50_000;
+      const available  = Math.max(CHUNK_SIZE - header.length, 5_000);
+      const prompts    = [];
+      if (inputText.length <= available) {
+        prompts.push(header + inputText);
+      } else {
+        let offset = 0;
+        while (offset < inputText.length) {
+          prompts.push(header + inputText.slice(offset, offset + available));
+          offset += available;
+        }
+      }
 
-      // Record git status of ~/Brain before run (catches agent writes outside staging)
+      // ── Pre-run git snapshot ───────────────────────────────────────
       let preGitStatus = '';
       try {
         const { stdout } = await execAsync(`git -C "${BRAIN}" status --short`, { timeout: 10000 });
         preGitStatus = stdout.trim();
       } catch { /* git absent or not a repo — skip */ }
 
-      state.status  = 'running';
-      state.message = `${agent === 'claude' ? 'Claude' : 'Gemini'} is distilling…`;
+      // ── Run agent ──────────────────────────────────────────────────
+      if (agent !== 'claude' && agent !== 'gemini') throw new Error(`Unknown agent: ${agent}`);
+      const runAgent = agent === 'claude' ? runClaudeAgent : runGeminiAgent;
 
-      if (agent === 'claude')       await runClaudeAgent(stagDir, prompt);
-      else if (agent === 'gemini')  await runGeminiAgent(stagDir, prompt);
-      else throw new Error(`Unknown agent: ${agent}`);
+      let allStdout = '';
+      for (let i = 0; i < prompts.length; i++) {
+        state.status  = 'running';
+        state.message = `${agentLabel} distilling${prompts.length > 1 ? ` (chunk ${i+1}/${prompts.length})` : ''}…`;
+        allStdout += await runAgent(prompts[i]) + '\n';
+      }
 
       state.message = 'Checking output…';
 
-      // ── Post-run Brain git status check ───────────────────────────
+      // ── Post-run git status check ──────────────────────────────────
       let postGitStatus = '';
       try {
         const { stdout } = await execAsync(`git -C "${BRAIN}" status --short`, { timeout: 10000 });
@@ -651,24 +630,16 @@ app.post('/api/distill/run', async (req, res) => {
       } catch { /* skip */ }
 
       if (preGitStatus !== postGitStatus) {
-        const reason = `~/Brain changed during run (git status diff): before="${preGitStatus}" after="${postGitStatus}"`;
+        const reason = `~/Brain changed during run: before="${preGitStatus}" after="${postGitStatus}"`;
         state.status = 'failed'; state.message = reason;
         await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${reason}`);
         return;
       }
 
-      // ── Post-run staging: nothing outside out/ should have changed ─
-      const postSnap = await fileChecksums(stagDir, 'out');
-      const tampered = [];
-      for (const k of Object.keys(postSnap)) {
-        if (!preSnap[k]) tampered.push(`new file: ${k}`);
-        else if (preSnap[k] !== postSnap[k]) tampered.push(`modified: ${k}`);
-      }
-      for (const k of Object.keys(preSnap)) {
-        if (!postSnap[k]) tampered.push(`deleted: ${k}`);
-      }
-      if (tampered.length > 0) {
-        const reason = `Files changed outside out/: ${tampered.join('; ')}`;
+      // ── Parse reply → out/ ─────────────────────────────────────────
+      const nBlocks = await parseAgentReply(allStdout, join(stagDir, 'out'));
+      if (nBlocks === 0) {
+        const reason = 'No === SUGGESTION === blocks in agent reply';
         state.status = 'failed'; state.message = reason;
         await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${reason}`);
         return;
