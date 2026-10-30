@@ -13,25 +13,46 @@ export const CHARS_PER_CALL = 40_000; // conservative estimate of distiller chun
 
 // ── Branch reconstruction ─────────────────────────────────────────────────────
 
+// Returns true if cleanMessage(msg) would produce non-empty output.
+// Defined before getActiveBranch; cleanMessage is hoisted as a function declaration.
+function hasTextContent(msg) {
+  return cleanMessage(msg).trim().length > 0;
+}
+
 function getActiveBranch(messages) {
   if (!messages || messages.length === 0) return [];
-  const byUuid     = new Map(messages.map(m => [m.uuid, m]));
-  const parentSet  = new Set(messages.map(m => m.parent_message_uuid).filter(Boolean));
-  const leaves     = messages.filter(m => !parentSet.has(m.uuid));
+  const byUuid    = new Map(messages.map(m => [m.uuid, m]));
+  const parentSet = new Set(messages.map(m => m.parent_message_uuid).filter(Boolean));
+  const leaves    = messages.filter(m => !parentSet.has(m.uuid));
   if (leaves.length === 0) return messages.slice(); // degenerate fallback
 
-  const latestLeaf = leaves.reduce((a, b) =>
+  // Prefer the latest leaf that has text; only fall back to any leaf if none has text.
+  const textLeaves = leaves.filter(hasTextContent);
+  const candidates = textLeaves.length > 0 ? textLeaves : leaves;
+  const startLeaf  = candidates.reduce((a, b) =>
     new Date(a.created_at) > new Date(b.created_at) ? a : b
   );
 
+  // Walk the branch backwards from the chosen starting leaf.
   const branch = [];
-  let cur = latestLeaf;
+  let cur = startLeaf;
   const seen = new Set();
   while (cur && !seen.has(cur.uuid)) {
     branch.unshift(cur);
     seen.add(cur.uuid);
     cur = cur.parent_message_uuid ? byUuid.get(cur.parent_message_uuid) : null;
   }
+
+  // Fallback: if any text-bearing messages exist outside this branch (broken walk),
+  // return all text-bearing messages sorted by created_at instead.
+  const branchIds  = new Set(branch.map(m => m.uuid));
+  const missedText = messages.filter(m => !branchIds.has(m.uuid) && hasTextContent(m));
+  if (missedText.length > 0) {
+    return messages
+      .filter(hasTextContent)
+      .sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
+  }
+
   return branch;
 }
 
