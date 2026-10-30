@@ -5,6 +5,7 @@ import { initPanel, openPanel } from './panel.js';
 import { initTopbar } from './topbar.js';
 import { initInbox } from './inbox.js';
 import { initDistill } from './distill.js';
+import { initImport } from './import.js';
 import { fetchItems } from './api.js';
 
 async function boot() {
@@ -12,6 +13,7 @@ async function boot() {
   initTopbar();
   initInbox();
   initDistill();
+  initImport();
 
   let items = [];
   try {

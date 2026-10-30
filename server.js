@@ -8,6 +8,7 @@ import { createHash } from 'crypto';
 import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import { homedir } from 'os';
+import { parseConversations, parseMemories, getConvDir, getMemDir, CHARS_PER_CALL } from './src/claude-parser.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -79,6 +80,8 @@ const STAGING_BASE = resolve(homedir(), '.brain', 'staging');
 const DISTILL_LOG  = resolve(homedir(), '.brain', 'distill.log');
 const runStore     = new Map(); // runId → state
 
+let importParseState = null; // null = never run, or { status, startedAt, finishedAt, result, error }
+
 const AGENT_PATH = '/Users/stefanopozzato/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin';
 
 function makeRunId() {
@@ -105,6 +108,24 @@ async function buildBrainIndex() {
   }
   await walk(BRAIN, '');
   return rows.join('\n');
+}
+
+// Read every projects/*/state.md and return a formatted block for the distill prompt
+async function buildProjectStates() {
+  const rows = [];
+  const projDir = join(BRAIN, 'projects');
+  let entries;
+  try { entries = await readdir(projDir, { withFileTypes: true }); }
+  catch { return ''; }
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const statePath = join(projDir, e.name, 'state.md');
+    try {
+      const content = await readFile(statePath, 'utf8');
+      rows.push(`--- projects/${e.name}/state.md ---\n${content.trim()}`);
+    } catch { /* no state.md — skip */ }
+  }
+  return rows.join('\n\n');
 }
 
 // md5 checksums of every file in dir, skipping one named top-level subdirectory
@@ -526,160 +547,234 @@ app.get('/api/distill/agents', async (_req, res) => {
   res.json({ agents, reasons });
 });
 
-// Start a distill run. Body: { agent, files: [{name, content}] }
+// ── Shared distill pipeline ───────────────────────────────────────────────────
+
+async function runDistillPipeline(state, agent, files) {
+  const stagDir    = join(STAGING_BASE, state.runId);
+  const inputLabel = files.map(f => f.name).join(', ');
+  const agentLabel = agent === 'claude' ? 'Claude' : 'Gemini';
+
+  try {
+    // ── Setup staging ──────────────────────────────────────────────
+    await mkdir(join(stagDir, 'input'), { recursive: true });
+    await mkdir(join(stagDir, 'out'),   { recursive: true });
+    for (const f of files) {
+      await writeFile(join(stagDir, 'input', basename(f.name)), f.content, 'utf8');
+    }
+
+    // ── Build prompt ───────────────────────────────────────────────
+    const today         = new Date().toISOString().split('T')[0];
+    const readme        = await readFile(join(BRAIN, 'README.md'), 'utf8');
+    const brainIndex    = await buildBrainIndex();
+    const projectStates = await buildProjectStates();
+    const inputText     = files.map(f => `=== ${f.name} ===\n${f.content}`).join('\n\n');
+
+    const stateSection = projectStates
+      ? [
+          '=== CURRENT PROJECT STATES ===',
+          'Compare every candidate fact against these files. Skip anything already recorded; suggest only new or changed facts.',
+          '',
+          projectStates,
+          '',
+        ].join('\n')
+      : '';
+
+    const header = [
+      'Respond ONLY with === SUGGESTION === blocks — no other text before, between, or after them.',
+      'Each block is a complete Markdown file with YAML frontmatter:',
+      '',
+      '=== SUGGESTION ===',
+      '---',
+      'title: Short descriptive title',
+      `updated: ${today}`,
+      'target: projects/foo/state.md',
+      '---',
+      '',
+      '- Bullet point fact distilled from the input',
+      '',
+      'Rules:',
+      '- One block per target file.',
+      '- target must be a relative path from the Brain Index, or a new path under projects/ for a brand-new project.',
+      '- Body: bullet-point facts only — distilled and organised. No opinions, no raw transcript.',
+      '- No permalink line in the output.',
+      '- If CURRENT PROJECT STATES is present, only suggest facts that are new or changed relative to it.',
+      '- If nothing is worth adding, output nothing.',
+      '',
+      '=== README (Brain format rules) ===',
+      readme.trim(),
+      '',
+      '=== BRAIN INDEX ===',
+      brainIndex,
+      '',
+      stateSection,
+      '=== INPUT ===',
+    ].join('\n') + '\n';
+
+    const CHUNK_SIZE = 50_000;
+    const available  = Math.max(CHUNK_SIZE - header.length, 5_000);
+    const prompts    = [];
+    if (inputText.length <= available) {
+      prompts.push(header + inputText);
+    } else {
+      let offset = 0;
+      while (offset < inputText.length) {
+        prompts.push(header + inputText.slice(offset, offset + available));
+        offset += available;
+      }
+    }
+
+    // ── Pre-run Brain checksum ─────────────────────────────────────
+    const preBrainSnap = await fileChecksums(BRAIN, '.git');
+
+    // ── Run agent ──────────────────────────────────────────────────
+    if (agent !== 'claude' && agent !== 'gemini') throw new Error(`Unknown agent: ${agent}`);
+    const runAgent = agent === 'claude' ? runClaudeAgent : runGeminiAgent;
+
+    let allStdout = '';
+    for (let i = 0; i < prompts.length; i++) {
+      state.status  = 'running';
+      state.message = `${agentLabel} distilling${prompts.length > 1 ? ` (chunk ${i+1}/${prompts.length})` : ''}…`;
+      allStdout += await runAgent(prompts[i]) + '\n';
+    }
+
+    state.message = 'Checking output…';
+
+    // ── Post-run Brain checksum check ──────────────────────────────
+    const postBrainSnap = await fileChecksums(BRAIN, '.git');
+    const brainChanged  = [];
+    for (const k of Object.keys(postBrainSnap)) {
+      if (!preBrainSnap[k])                          brainChanged.push(`appeared: ${k}`);
+      else if (preBrainSnap[k] !== postBrainSnap[k]) brainChanged.push(`modified: ${k}`);
+    }
+    for (const k of Object.keys(preBrainSnap)) {
+      if (!postBrainSnap[k]) brainChanged.push(`deleted: ${k}`);
+    }
+    if (brainChanged.length > 0) {
+      const reason = `~/Brain changed during run: ${brainChanged.join('; ')}`;
+      state.status = 'failed'; state.message = reason;
+      await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${reason}`);
+      return;
+    }
+
+    // ── Parse reply → out/ ─────────────────────────────────────────
+    const nBlocks = await parseAgentReply(allStdout, join(stagDir, 'out'));
+    if (nBlocks === 0) {
+      const reason = 'No === SUGGESTION === blocks in agent reply';
+      state.status = 'failed'; state.message = reason;
+      await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${reason}`);
+      return;
+    }
+
+    // ── Validate out/ contents ─────────────────────────────────────
+    const { ok, errors, mdFiles } = await checkOutFiles(join(stagDir, 'out'));
+    if (!ok) {
+      const reason = errors.join('; ');
+      state.status = 'failed'; state.message = `Checker: ${reason}`;
+      await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${reason}`);
+      return;
+    }
+
+    // ── Move approved files to ~/Brain/inbox/ ──────────────────────
+    await mkdir(join(BRAIN, 'inbox'), { recursive: true });
+    const inboxed = [];
+    for (const f of mdFiles) {
+      let dest = join(BRAIN, 'inbox', f); let n = 0;
+      while (true) {
+        try { await stat(dest); n++; dest = join(BRAIN, 'inbox', `${basename(f, '.md')}-${n}.md`); }
+        catch { break; }
+      }
+      await writeFile(dest, await readFile(join(stagDir, 'out', f), 'utf8'));
+      inboxed.push(basename(dest));
+    }
+
+    // ── Delete staging on success ──────────────────────────────────
+    await rm(stagDir, { recursive: true, force: true });
+
+    state.status = 'done';
+    state.result = { inboxed };
+    state.message = `${inboxed.length} suggestion${inboxed.length !== 1 ? 's' : ''} moved to inbox: ${inboxed.join(', ')}`;
+    await appendDistillLog(`${agent} | ${inputLabel} | OK: ${inboxed.length} → inbox (${inboxed.join(', ')})`);
+
+  } catch (e) {
+    state.status  = 'failed';
+    state.message = `Error: ${e.message}`;
+    await appendDistillLog(`${agent} | ${inputLabel} | ERROR: ${e.message}`);
+  }
+}
+
+// ── DISTILL ROUTES ────────────────────────────────────────────────────────────
+
+// Start a distill run from uploaded files. Body: { agent, files: [{name, content}] }
 app.post('/api/distill/run', async (req, res) => {
   const { agent, files } = req.body;
   if (!agent || !Array.isArray(files) || files.length === 0)
     return res.status(400).json({ error: 'agent and files[] required' });
 
-  const runId   = makeRunId();
-  const stagDir = join(STAGING_BASE, runId);
-  const state   = {
-    status: 'pending', message: 'Preparing…',
+  const runId = makeRunId();
+  const state = {
+    runId, status: 'pending', message: 'Preparing…',
     result: null, agent, inputNames: files.map(f => f.name),
     startedAt: new Date().toISOString(),
   };
   runStore.set(runId, state);
   res.json({ runId });
+  runDistillPipeline(state, agent, files).catch(() => {});
+});
 
-  const inputLabel = files.map(f => f.name).join(', ');
-  const agentLabel = agent === 'claude' ? 'Claude' : 'Gemini';
+// Start a distill run from parsed import items.
+// Body: { agent, conversationUuids?: string[], includeMemories?: bool }
+app.post('/api/distill/import', async (req, res) => {
+  const { agent, conversationUuids = [], includeMemories = false } = req.body;
+  if (!agent) return res.status(400).json({ error: 'agent required' });
 
-  (async () => {
+  const files = [];
+  const convDir = getConvDir();
+  const memDir  = getMemDir();
+
+  for (const uuid of conversationUuids) {
+    if (!/^[0-9a-f-]{8,}$/i.test(uuid)) continue;
     try {
-      // ── Setup staging (input files kept for inspection on failure) ─
-      await mkdir(join(stagDir, 'input'), { recursive: true });
-      await mkdir(join(stagDir, 'out'),   { recursive: true });
-      for (const f of files) {
-        await writeFile(join(stagDir, 'input', basename(f.name)), f.content, 'utf8');
+      const content = await readFile(join(convDir, `${uuid}.txt`), 'utf8');
+      files.push({ name: `conv-${uuid.slice(0, 8)}.txt`, content });
+    } catch { /* skip missing */ }
+  }
+
+  if (includeMemories) {
+    const load = async (p, name) => {
+      try { files.push({ name, content: await readFile(p, 'utf8') }); } catch { }
+    };
+    await load(join(memDir, 'conversations_memory.txt'), 'memory-conversations.txt');
+
+    try {
+      const projDir = join(memDir, 'project_memories');
+      const pmFiles = (await readdir(projDir)).filter(f => f.endsWith('.txt'));
+      for (const f of pmFiles) {
+        await load(join(projDir, f), `memory-project-${f}`);
       }
+    } catch { }
 
-      // ── Build prompt ───────────────────────────────────────────────
-      const today      = new Date().toISOString().split('T')[0];
-      const readme     = await readFile(join(BRAIN, 'README.md'), 'utf8');
-      const brainIndex = await buildBrainIndex();
-      const inputText  = files.map(f => `=== ${f.name} ===\n${f.content}`).join('\n\n');
-
-      const header = [
-        'Respond ONLY with === SUGGESTION === blocks — no other text before, between, or after them.',
-        'Each block is a complete Markdown file with YAML frontmatter:',
-        '',
-        '=== SUGGESTION ===',
-        '---',
-        'title: Short descriptive title',
-        `updated: ${today}`,
-        'target: projects/foo/state.md',
-        '---',
-        '',
-        '- Bullet point fact distilled from the input',
-        '',
-        'Rules:',
-        '- One block per target file.',
-        '- target must be a relative path from the Brain Index, or a new path under projects/ for a brand-new project.',
-        '- Body: bullet-point facts only — distilled and organised. No opinions, no raw transcript.',
-        '- No permalink line in the output.',
-        '- If nothing is worth adding, output nothing.',
-        '',
-        '=== README (Brain format rules) ===',
-        readme.trim(),
-        '',
-        '=== BRAIN INDEX ===',
-        brainIndex,
-        '',
-        '=== INPUT ===',
-      ].join('\n') + '\n';
-
-      const CHUNK_SIZE = 50_000;
-      const available  = Math.max(CHUNK_SIZE - header.length, 5_000);
-      const prompts    = [];
-      if (inputText.length <= available) {
-        prompts.push(header + inputText);
-      } else {
-        let offset = 0;
-        while (offset < inputText.length) {
-          prompts.push(header + inputText.slice(offset, offset + available));
-          offset += available;
-        }
+    async function walkMemFiles(dir) {
+      let entries;
+      try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        if (e.isDirectory()) await walkMemFiles(join(dir, e.name));
+        else await load(join(dir, e.name), `memfile-${e.name}`);
       }
-
-      // ── Pre-run Brain checksum ─────────────────────────────────────
-      const preBrainSnap = await fileChecksums(BRAIN, '.git');
-
-      // ── Run agent ──────────────────────────────────────────────────
-      if (agent !== 'claude' && agent !== 'gemini') throw new Error(`Unknown agent: ${agent}`);
-      const runAgent = agent === 'claude' ? runClaudeAgent : runGeminiAgent;
-
-      let allStdout = '';
-      for (let i = 0; i < prompts.length; i++) {
-        state.status  = 'running';
-        state.message = `${agentLabel} distilling${prompts.length > 1 ? ` (chunk ${i+1}/${prompts.length})` : ''}…`;
-        allStdout += await runAgent(prompts[i]) + '\n';
-      }
-
-      state.message = 'Checking output…';
-
-      // ── Post-run Brain checksum check ──────────────────────────────
-      const postBrainSnap = await fileChecksums(BRAIN, '.git');
-      const brainChanged = [];
-      for (const k of Object.keys(postBrainSnap)) {
-        if (!preBrainSnap[k])                          brainChanged.push(`appeared: ${k}`);
-        else if (preBrainSnap[k] !== postBrainSnap[k]) brainChanged.push(`modified: ${k}`);
-      }
-      for (const k of Object.keys(preBrainSnap)) {
-        if (!postBrainSnap[k]) brainChanged.push(`deleted: ${k}`);
-      }
-      if (brainChanged.length > 0) {
-        const reason = `~/Brain changed during run: ${brainChanged.join('; ')}`;
-        state.status = 'failed'; state.message = reason;
-        await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${reason}`);
-        return;
-      }
-
-      // ── Parse reply → out/ ─────────────────────────────────────────
-      const nBlocks = await parseAgentReply(allStdout, join(stagDir, 'out'));
-      if (nBlocks === 0) {
-        const reason = 'No === SUGGESTION === blocks in agent reply';
-        state.status = 'failed'; state.message = reason;
-        await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${reason}`);
-        return;
-      }
-
-      // ── Validate out/ contents ─────────────────────────────────────
-      const { ok, errors, mdFiles } = await checkOutFiles(join(stagDir, 'out'));
-      if (!ok) {
-        const reason = errors.join('; ');
-        state.status = 'failed'; state.message = `Checker: ${reason}`;
-        await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${reason}`);
-        return;
-      }
-
-      // ── Move approved files to ~/Brain/inbox/ ──────────────────────
-      await mkdir(join(BRAIN, 'inbox'), { recursive: true });
-      const inboxed = [];
-      for (const f of mdFiles) {
-        let dest = join(BRAIN, 'inbox', f); let n = 0;
-        while (true) {
-          try { await stat(dest); n++; dest = join(BRAIN, 'inbox', `${basename(f, '.md')}-${n}.md`); }
-          catch { break; }
-        }
-        await writeFile(dest, await readFile(join(stagDir, 'out', f), 'utf8'));
-        inboxed.push(basename(dest));
-      }
-
-      // ── Delete staging on success ──────────────────────────────────
-      await rm(stagDir, { recursive: true, force: true });
-
-      state.status = 'done';
-      state.result = { inboxed };
-      state.message = `${inboxed.length} suggestion${inboxed.length !== 1 ? 's' : ''} moved to inbox: ${inboxed.join(', ')}`;
-      await appendDistillLog(`${agent} | ${inputLabel} | OK: ${inboxed.length} → inbox (${inboxed.join(', ')})`);
-
-    } catch (e) {
-      state.status  = 'failed';
-      state.message = `Error: ${e.message}`;
-      await appendDistillLog(`${agent} | ${inputLabel} | ERROR: ${e.message}`);
     }
-  })();
+    await walkMemFiles(join(memDir, 'memory_files'));
+  }
+
+  if (files.length === 0) return res.status(400).json({ error: 'No import content found — parse first' });
+
+  const runId = makeRunId();
+  const state = {
+    runId, status: 'pending', message: 'Preparing…',
+    result: null, agent, inputNames: files.map(f => f.name),
+    startedAt: new Date().toISOString(),
+  };
+  runStore.set(runId, state);
+  res.json({ runId });
+  runDistillPipeline(state, agent, files).catch(() => {});
 });
 
 // Poll run status
@@ -688,6 +783,56 @@ app.get('/api/distill/status/:runId', (req, res) => {
   if (!run) return res.status(404).json({ error: 'Run not found' });
   res.json(run);
 });
+
+// ── IMPORT ROUTES ─────────────────────────────────────────────────────────────
+
+// Parse status + basic stats
+app.get('/api/import/status', (_req, res) => {
+  res.json(importParseState || { status: 'idle' });
+});
+
+// Trigger (re-)parse. Fire-and-forget; poll /api/import/status.
+app.post('/api/import/parse', (_req, res) => {
+  if (importParseState?.status === 'running') {
+    return res.json({ status: 'running', message: 'Parse already in progress' });
+  }
+  importParseState = { status: 'running', startedAt: new Date().toISOString(), result: null, error: null };
+  res.json({ status: 'running' });
+
+  (async () => {
+    try {
+      const result = await Promise.all([parseConversations(), parseMemories()]);
+      importParseState = {
+        status: 'done',
+        startedAt: importParseState.startedAt,
+        finishedAt: new Date().toISOString(),
+        result: { conversations: result[0], memories: result[1] },
+        error: null,
+      };
+    } catch (e) {
+      importParseState = {
+        status: 'failed',
+        startedAt: importParseState.startedAt,
+        finishedAt: new Date().toISOString(),
+        result: null,
+        error: e.message,
+      };
+    }
+  })();
+});
+
+// Return the parsed conversation index
+app.get('/api/import/index', async (_req, res) => {
+  try {
+    const p = join(getConvDir(), 'index.json');
+    const data = JSON.parse(await readFile(p, 'utf8'));
+    res.json(data);
+  } catch {
+    res.status(404).json({ error: 'Not parsed yet — POST /api/import/parse first' });
+  }
+});
+
+// ── STATIC ────────────────────────────────────────────────────────────────────
 
 // Serve the Vite production build; fall through to index.html for SPA
 app.use(express.static(join(__dirname, 'dist')));
