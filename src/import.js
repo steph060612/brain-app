@@ -145,9 +145,19 @@ function renderParseSection(parent) {
   titleRow.appendChild(statusBadge);
   wrap.appendChild(titleRow);
 
-  const desc = el('div', 'font-size:12px; color:#5a6890; margin-bottom:10px;',
+  const desc = el('div', 'font-size:12px; color:#5a6890; margin-bottom:6px;',
     '~/brain-exports/claude/ — Claude conversation and memory export');
   wrap.appendChild(desc);
+
+  if (parseStatus.status === 'done') {
+    const skipped = parseStatus.result?.conversations?.skipped ?? 0;
+    if (skipped > 0) {
+      wrap.appendChild(el('div', 'font-size:12px; color:#5a6890; margin-bottom:10px;',
+        `${skipped} conversation${skipped !== 1 ? 's' : ''} were empty in the export and were skipped.`));
+    }
+  } else {
+    wrap.appendChild(div('margin-bottom:10px;'));
+  }
 
   if (parseStatus.status === 'failed' && parseStatus.error) {
     wrap.appendChild(el('div', 'font-size:12px; color:#c0503a; margin-bottom:8px;', parseStatus.error));
