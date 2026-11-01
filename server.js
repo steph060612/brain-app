@@ -91,42 +91,52 @@ function makeRunId() {
 }
 
 // Walk ~/Brain and return "rel/path.md | title" lines
-async function buildBrainIndex() {
-  const rows = [];
+// Every .md file in ~/Brain except inbox/, .git/ and the top-level README.md, as [{rel, content}]
+async function brainMdFiles() {
+  const files = [];
   async function walk(dir, pfx) {
     let entries;
     try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
       const rel = pfx ? `${pfx}/${e.name}` : e.name;
-      if (e.isDirectory()) { await walk(join(dir, e.name), rel); }
-      else if (e.name.endsWith('.md')) {
-        try {
-          const fm = parseFM(await readFile(join(dir, e.name), 'utf8'));
-          rows.push(`${rel} | ${fm.title || prettify(basename(e.name, '.md'))}`);
-        } catch { /* skip unreadable */ }
+      if (e.isDirectory()) {
+        if (!pfx && (e.name === 'inbox' || e.name === '.git')) continue;
+        await walk(join(dir, e.name), rel);
+      } else if (e.name.endsWith('.md') && rel !== 'README.md') {
+        try { files.push({ rel, content: await readFile(join(dir, e.name), 'utf8') }); }
+        catch { /* skip unreadable */ }
       }
     }
   }
   await walk(BRAIN, '');
-  return rows.join('\n');
+  return files.sort((x, y) => x.rel.localeCompare(y.rel));
 }
 
-// Read every projects/*/state.md and return a formatted block for the distill prompt
-async function buildProjectStates() {
-  const rows = [];
-  const projDir = join(BRAIN, 'projects');
-  let entries;
-  try { entries = await readdir(projDir, { withFileTypes: true }); }
-  catch { return ''; }
-  for (const e of entries) {
-    if (!e.isDirectory()) continue;
-    const statePath = join(projDir, e.name, 'state.md');
-    try {
-      const content = await readFile(statePath, 'utf8');
-      rows.push(`--- projects/${e.name}/state.md ---\n${content.trim()}`);
-    } catch { /* no state.md — skip */ }
-  }
-  return rows.join('\n\n');
+const titleOf = f => parseFM(f.content).title || prettify(basename(f.rel, '.md'));
+
+async function buildBrainIndex() {
+  return (await brainMdFiles()).map(f => `${f.rel} | ${titleOf(f)}`).join('\n');
+}
+
+const BRAIN_CONTENT_LIMIT = 60_000;
+
+// Current Brain content for the distill prompt. Full content of every file when it fits
+// in BRAIN_CONTENT_LIMIT; otherwise every title plus full profile.md, preferences.md and projects/.
+async function buildBrainContent() {
+  const files = await brainMdFiles();
+  const block = f => `--- ${f.rel} ---\n${f.content.trim()}`;
+  const total = files.reduce((n, f) => n + f.content.length, 0);
+  if (total <= BRAIN_CONTENT_LIMIT) return files.map(block).join('\n\n');
+
+  const isCore = f => f.rel === 'profile.md' || f.rel === 'preferences.md' || f.rel.startsWith('projects/');
+  return [
+    'Brain is too large to include in full. Titles of every file:',
+    files.map(f => `${f.rel} | ${titleOf(f)}`).join('\n'),
+    '',
+    'Full content of profile.md, preferences.md and projects/:',
+    '',
+    files.filter(isCore).map(block).join('\n\n'),
+  ].join('\n');
 }
 
 // md5 checksums of every file in dir, skipping one named top-level subdirectory
@@ -595,15 +605,15 @@ async function runDistillPipeline(state, agent, files) {
     const today         = new Date().toISOString().split('T')[0];
     const readme        = await readFile(join(BRAIN, 'README.md'), 'utf8');
     const brainIndex    = await buildBrainIndex();
-    const projectStates = await buildProjectStates();
+    const brainContent  = await buildBrainContent();
     const inputText     = files.map(f => `=== ${f.name} ===\n${f.content}`).join('\n\n');
 
-    const stateSection = projectStates
+    const brainSection = brainContent
       ? [
-          '=== CURRENT PROJECT STATES ===',
+          '=== CURRENT BRAIN CONTENT ===',
           'Compare every candidate fact against these files. Skip anything already recorded; suggest only new or changed facts.',
           '',
-          projectStates,
+          brainContent,
           '',
         ].join('\n')
       : '';
@@ -626,7 +636,11 @@ async function runDistillPipeline(state, agent, files) {
       '- target must be a relative path from the Brain Index, or a new path under projects/ for a brand-new project.',
       '- Body: bullet-point facts only — distilled and organised. No opinions, no raw transcript.',
       '- No permalink line in the output.',
-      '- If CURRENT PROJECT STATES is present, only suggest facts that are new or changed relative to it.',
+      '- The brain (CURRENT BRAIN CONTENT) is the source of truth. When the input conflicts with the brain, the brain wins: do not suggest the older fact.',
+      '- If the input contains something genuinely newer than the brain, suggest it with its date and keep the history in one line in the form "- <new fact> (since YYYY-MM-DD; previously <older fact>)".',
+      '- Suggest only facts that are absent from the brain. No rewording of facts already present.',
+      '- Never suggest sports, training, fitness, body or diet details (decision in projects/brain/decisions.md).',
+      '- Never create a project for something the brain says belongs to someone else.',
       '- If nothing is worth adding, output nothing.',
       '',
       '=== README (Brain format rules) ===',
@@ -635,12 +649,13 @@ async function runDistillPipeline(state, agent, files) {
       '=== BRAIN INDEX ===',
       brainIndex,
       '',
-      stateSection,
+      brainSection,
       '=== INPUT ===',
     ].join('\n') + '\n';
 
-    const CHUNK_SIZE = 50_000;
-    const available  = Math.max(CHUNK_SIZE - header.length, 5_000);
+    // Each chunk carries the full header plus up to CHARS_PER_CALL characters of input,
+    // matching the distill-call estimates shown in the Import window.
+    const available  = CHARS_PER_CALL;
     const prompts    = [];
     if (inputText.length <= available) {
       prompts.push(header + inputText);
