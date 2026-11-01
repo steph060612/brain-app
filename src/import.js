@@ -158,9 +158,8 @@ function renderParseSection(parent) {
     statusBadge.style.cssText += 'background:rgba(159,216,255,0.15); color:#9FD8FF;';
   } else if (parseStatus.status === 'done') {
     const r = parseStatus.result;
-    const ts = parseStatus.finishedAt ? new Date(parseStatus.finishedAt).toLocaleString(undefined, { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' }) : '';
-    const parsed = r.conversations.parsed + (r.chatgpt?.parsed ?? 0);
-    statusBadge.textContent = `${parsed} conversations parsed${ts ? ' · ' + ts : ''}`;
+    const parsed = (r.conversations?.parsed ?? 0) + (r.chatgpt?.parsed ?? 0);
+    statusBadge.textContent = `${parsed} conversations parsed`;
     statusBadge.style.cssText += 'background:rgba(111,227,208,0.12); color:#6FE3D0;';
   } else if (parseStatus.status === 'failed') {
     statusBadge.textContent = 'Parse failed';
@@ -189,7 +188,14 @@ function renderParseSection(parent) {
     parseBtn.style.opacity = '0.5';
   }
   parseBtn.addEventListener('click', () => triggerParse());
-  wrap.appendChild(parseBtn);
+
+  const btnRow = div('display:flex; align-items:center; gap:10px;');
+  btnRow.appendChild(parseBtn);
+  if (parseStatus.status === 'done' && parseStatus.finishedAt) {
+    const ts = new Date(parseStatus.finishedAt).toLocaleString(undefined, { month:'short', day:'numeric', year:'numeric', hour:'2-digit', minute:'2-digit' });
+    btnRow.appendChild(el('div', 'font-size:11px; color:#5a6890;', `Last parsed ${ts}`));
+  }
+  wrap.appendChild(btnRow);
 
   parent.appendChild(wrap);
 }

@@ -82,6 +82,7 @@ const DISTILL_LOG  = resolve(homedir(), '.brain', 'distill.log');
 const runStore     = new Map(); // runId → state
 
 let importParseState = null; // null = never run, or { status, startedAt, finishedAt, result, error }
+const PARSE_STATE_FILE = resolve(homedir(), '.brain', 'imports', 'last-parse.json');
 
 const AGENT_PATH = '/Users/stefanopozzato/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin';
 
@@ -650,21 +651,24 @@ async function runDistillPipeline(state, agent, files) {
       brainIndex,
       '',
       brainSection,
-      '=== INPUT ===',
     ].join('\n') + '\n';
+
+    // Shown to every call after the first, so a split input doesn't produce duplicate suggestions.
+    const earlierSection = earlier => earlier.trim() ? [
+      '=== SUGGESTIONS ALREADY MADE IN THIS RUN ===',
+      'Earlier parts of this same input already produced the suggestions below.',
+      'Do not repeat them or reword them. Suggest only facts that are not already covered here or in the brain.',
+      '',
+      earlier.trim(),
+      '',
+    ].join('\n') + '\n' : '';
 
     // Each chunk carries the full header plus up to CHARS_PER_CALL characters of input,
     // matching the distill-call estimates shown in the Import window.
     const available  = CHARS_PER_CALL;
-    const prompts    = [];
-    if (inputText.length <= available) {
-      prompts.push(header + inputText);
-    } else {
-      let offset = 0;
-      while (offset < inputText.length) {
-        prompts.push(header + inputText.slice(offset, offset + available));
-        offset += available;
-      }
+    const chunks     = [];
+    for (let offset = 0; offset < inputText.length || chunks.length === 0; offset += available) {
+      chunks.push(inputText.slice(offset, offset + available));
     }
 
     // ── Pre-run Brain checksum ─────────────────────────────────────
@@ -675,13 +679,16 @@ async function runDistillPipeline(state, agent, files) {
     const runAgent = agent === 'claude' ? runClaudeAgent : runGeminiAgent;
 
     let allStdout = '';
+    let earlier   = ''; // suggestion blocks from contract-conforming earlier chunks
     let contractError = null;
-    for (let i = 0; i < prompts.length; i++) {
+    for (let i = 0; i < chunks.length; i++) {
       state.status  = 'running';
-      state.message = `${agentLabel} distilling${prompts.length > 1 ? ` (chunk ${i+1}/${prompts.length})` : ''}…`;
-      const reply = await runAgent(prompts[i]);
+      state.message = `${agentLabel} distilling${chunks.length > 1 ? ` (chunk ${i+1}/${chunks.length})` : ''}…`;
+      const prompt = header + earlierSection(earlier) + '=== INPUT ===\n' + chunks[i];
+      const reply = await runAgent(prompt);
       const err = checkReplyContract(reply);
-      if (err && !contractError) contractError = prompts.length > 1 ? `chunk ${i+1}: ${err}` : err;
+      if (err && !contractError) contractError = chunks.length > 1 ? `chunk ${i+1}: ${err}` : err;
+      if (!err && reply.trim()) earlier += reply.trim() + '\n\n';
       allStdout += reply + '\n';
     }
 
@@ -849,6 +856,73 @@ app.get('/api/distill/status/:runId', (req, res) => {
   res.json(run);
 });
 
+// ── IMPORT STATE RESTORE ──────────────────────────────────────────────────────
+
+// Stats for one source rebuilt from its index.json; skipped count is unknown without a parse.
+async function statsFromIndex(convDir) {
+  const p = join(convDir, 'index.json');
+  const [index, st] = await Promise.all([readFile(p, 'utf8').then(JSON.parse), stat(p)]);
+  const totalChars = index.reduce((n, c) => n + (c.charCount || 0), 0);
+  return {
+    mtime: st.mtime,
+    stats: {
+      total: null, parsed: index.length, skipped: null, totalChars,
+      avgChars: index.length ? Math.round(totalChars / index.length) : 0,
+      totalDistillCalls: index.reduce((n, c) => n + (c.distillCalls || 0), 0),
+    },
+  };
+}
+
+// Memory stats rebuilt from the files parseMemories() already wrote.
+async function memStatsFromDisk() {
+  const memDir = getMemDir();
+  let totalChars = 0, convMemoryChars = 0, projectMemCount = 0, fileCount = 0;
+  try { convMemoryChars = (await readFile(join(memDir, 'conversations_memory.txt'), 'utf8')).length; } catch { }
+  totalChars += convMemoryChars;
+  try {
+    for (const f of await readdir(join(memDir, 'project_memories'))) {
+      totalChars += (await readFile(join(memDir, 'project_memories', f), 'utf8')).length;
+      projectMemCount++;
+    }
+  } catch { }
+  async function walk(d) {
+    let entries;
+    try { entries = await readdir(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.isDirectory()) await walk(join(d, e.name));
+      else { totalChars += (await readFile(join(d, e.name), 'utf8')).length; fileCount++; }
+    }
+  }
+  await walk(join(memDir, 'memory_files'));
+  return { convMemoryChars, projectMemCount, fileCount, totalChars, totalDistillCalls: Math.ceil(totalChars / CHARS_PER_CALL) };
+}
+
+// On startup: reuse the saved parse state, or rebuild one from existing index.json files.
+async function restoreParseState() {
+  try {
+    const saved = JSON.parse(await readFile(PARSE_STATE_FILE, 'utf8'));
+    if (saved?.status === 'done') { importParseState = saved; return; }
+  } catch { }
+
+  const empty = { total: 0, parsed: 0, skipped: null, totalChars: 0, avgChars: 0, totalDistillCalls: 0 };
+  const [claude, chatgpt] = await Promise.all([
+    statsFromIndex(getConvDir()).catch(() => null),
+    statsFromIndex(getChatgptConvDir()).catch(() => null),
+  ]);
+  if (!claude && !chatgpt) return;
+
+  const latest = new Date(Math.max(...[claude, chatgpt].filter(Boolean).map(x => x.mtime.getTime())));
+  importParseState = {
+    status: 'done', startedAt: null, finishedAt: latest.toISOString(), error: null,
+    result: {
+      conversations: claude?.stats  || empty,
+      memories:      await memStatsFromDisk(),
+      chatgpt:       chatgpt?.stats || empty,
+    },
+  };
+}
+await restoreParseState();
+
 // ── IMPORT ROUTES ─────────────────────────────────────────────────────────────
 
 // Parse status + basic stats
@@ -874,6 +948,7 @@ app.post('/api/import/parse', (_req, res) => {
         result: { conversations: result[0], memories: result[1], chatgpt: result[2] },
         error: null,
       };
+      await writeFile(PARSE_STATE_FILE, JSON.stringify(importParseState, null, 2), 'utf8').catch(() => {});
     } catch (e) {
       importParseState = {
         status: 'failed',
