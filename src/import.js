@@ -1,17 +1,28 @@
-// Import panel: parse Claude export, select conversations/memories, send to distiller.
+// Import panel: parse Claude and ChatGPT exports, select conversations/memories, send to distiller.
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let backdropEl = null;
 let cardEl     = null;
 let agentList  = [];
 let disabledReasons = {};
-let convIndex  = [];   // [{uuid, title, created, updated, messageCount, charCount, distillCalls}]
 let parseStatus = { status: 'idle' };
 let pollTimer   = null;
 let parsePoll   = null;
 let runTimeout  = null;
 
 const MAX_RUN_MS = 10 * 60 * 1000;
+
+// Conversation sources. index: [{uuid, title, created, updated, messageCount, charCount, distillCalls}]
+const SOURCES = {
+  claude: {
+    label: 'Claude Conversations', resultKey: 'conversations', indexUrl: '/api/import/index',
+    index: [], search: '', sort: 'newest', checked: new Set(),
+  },
+  chatgpt: {
+    label: 'ChatGPT Conversations', resultKey: 'chatgpt', indexUrl: '/api/import/chatgpt-index',
+    index: [], search: '', sort: 'newest', checked: new Set(),
+  },
+};
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 export async function initImport() {
@@ -69,7 +80,17 @@ async function openModal() {
   stopPolls();
   backdropEl.style.display = 'flex';
   await refreshParseStatus();
+  if (parseStatus.status === 'done') await loadIndexes();
   renderMain();
+}
+
+async function loadIndexes() {
+  await Promise.all(Object.values(SOURCES).map(async src => {
+    try {
+      const r = await fetch(src.indexUrl);
+      src.index = r.ok ? await r.json() : [];
+    } catch { /* keep stale */ }
+  }));
 }
 
 function closeModal() {
@@ -112,7 +133,9 @@ function renderMain() {
   // ── Separator ──
   if (parseStatus.status === 'done') {
     body.appendChild(div('height:1px; background:rgba(100,120,200,0.12); margin:16px 0;'));
-    renderConversationsSection(body);
+    renderConversationsSection(body, 'claude');
+    body.appendChild(div('height:1px; background:rgba(100,120,200,0.12); margin:16px 0;'));
+    renderConversationsSection(body, 'chatgpt');
     body.appendChild(div('height:1px; background:rgba(100,120,200,0.12); margin:16px 0;'));
     renderMemoriesSection(body);
   }
@@ -136,7 +159,8 @@ function renderParseSection(parent) {
   } else if (parseStatus.status === 'done') {
     const r = parseStatus.result;
     const ts = parseStatus.finishedAt ? new Date(parseStatus.finishedAt).toLocaleString(undefined, { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' }) : '';
-    statusBadge.textContent = `${r.conversations.parsed} conversations parsed${ts ? ' · ' + ts : ''}`;
+    const parsed = r.conversations.parsed + (r.chatgpt?.parsed ?? 0);
+    statusBadge.textContent = `${parsed} conversations parsed${ts ? ' · ' + ts : ''}`;
     statusBadge.style.cssText += 'background:rgba(111,227,208,0.12); color:#6FE3D0;';
   } else if (parseStatus.status === 'failed') {
     statusBadge.textContent = 'Parse failed';
@@ -148,16 +172,9 @@ function renderParseSection(parent) {
   const desc = el('div', 'font-size:12px; color:#5a6890; margin-bottom:6px;',
     '~/brain-exports/claude/ — Claude conversation and memory export');
   wrap.appendChild(desc);
-
-  if (parseStatus.status === 'done') {
-    const skipped = parseStatus.result?.conversations?.skipped ?? 0;
-    if (skipped > 0) {
-      wrap.appendChild(el('div', 'font-size:12px; color:#5a6890; margin-bottom:10px;',
-        `${skipped} conversation${skipped !== 1 ? 's' : ''} were empty in the export and were skipped.`));
-    }
-  } else {
-    wrap.appendChild(div('margin-bottom:10px;'));
-  }
+  wrap.appendChild(el('div', 'font-size:12px; color:#5a6890; margin-bottom:6px;',
+    '~/brain-exports/ChatGPT_Data-Export/ — ChatGPT conversation export'));
+  wrap.appendChild(div('margin-bottom:4px;'));
 
   if (parseStatus.status === 'failed' && parseStatus.error) {
     wrap.appendChild(el('div', 'font-size:12px; color:#c0503a; margin-bottom:8px;', parseStatus.error));
@@ -190,12 +207,7 @@ async function triggerParse() {
     if (parseStatus.status !== 'running') {
       clearInterval(parsePoll);
       parsePoll = null;
-      if (parseStatus.status === 'done') {
-        try {
-          const r = await fetch('/api/import/index');
-          if (r.ok) convIndex = await r.json();
-        } catch { }
-      }
+      if (parseStatus.status === 'done') await loadIndexes();
       renderMain();
     }
   }, 1500);
@@ -203,14 +215,24 @@ async function triggerParse() {
 
 // ── Conversations section ─────────────────────────────────────────────────────
 
-let convSearch  = '';
-let convSort    = 'newest'; // 'newest' | 'oldest' | 'az'
-let convChecked = new Set();
 let memChecked  = false;
 
-function renderConversationsSection(parent) {
+function renderConversationsSection(parent, key) {
+  const src  = SOURCES[key];
   const wrap = div('');
-  wrap.appendChild(el('div', 'font-size:12px; color:#5a6890; letter-spacing:0.05em; text-transform:uppercase; margin-bottom:10px;', 'Claude Conversations'));
+  wrap.appendChild(el('div', 'font-size:12px; color:#5a6890; letter-spacing:0.05em; text-transform:uppercase; margin-bottom:10px;', src.label));
+
+  const result = parseStatus.result?.[src.resultKey];
+  if (result?.missing) {
+    wrap.appendChild(el('div', 'font-size:12px; color:#5a6890;', 'Export not found.'));
+    parent.appendChild(wrap);
+    return;
+  }
+  const skipped = result?.skipped ?? 0;
+  if (skipped > 0) {
+    wrap.appendChild(el('div', 'font-size:12px; color:#5a6890; margin-bottom:10px;',
+      `${skipped} conversation${skipped !== 1 ? 's' : ''} were empty in the export and were skipped.`));
+  }
 
   // Controls row
   const controls = div('display:flex; align-items:center; gap:8px; margin-bottom:10px;');
@@ -218,15 +240,15 @@ function renderConversationsSection(parent) {
   const searchInput = document.createElement('input');
   searchInput.type = 'text';
   searchInput.placeholder = 'Search…';
-  searchInput.value = convSearch;
+  searchInput.value = src.search;
   searchInput.style.cssText = `
     background:rgba(255,255,255,0.06); border:1px solid rgba(100,120,200,0.22);
     border-radius:5px; color:#c8d0e8; font-size:12px; padding:4px 9px;
     outline:none; font-family:inherit; width:180px;
   `;
   searchInput.addEventListener('input', () => {
-    convSearch = searchInput.value;
-    refreshConvList();
+    src.search = searchInput.value;
+    refreshConvList(key);
   });
   controls.appendChild(searchInput);
 
@@ -238,24 +260,24 @@ function renderConversationsSection(parent) {
   `;
   [['newest', 'Newest first'], ['oldest', 'Oldest first'], ['az', 'A → Z']].forEach(([v, l]) => {
     const o = document.createElement('option');
-    o.value = v; o.textContent = l; if (v === convSort) o.selected = true;
+    o.value = v; o.textContent = l; if (v === src.sort) o.selected = true;
     sortSel.appendChild(o);
   });
-  sortSel.addEventListener('change', () => { convSort = sortSel.value; refreshConvList(); });
+  sortSel.addEventListener('change', () => { src.sort = sortSel.value; refreshConvList(key); });
   controls.appendChild(sortSel);
 
   // Select all / none
   const selAll = mkBtn('All', '#8090b0', 'none', 'rgba(100,120,200,0.22)');
   selAll.style.cssText += 'font-size:11px; padding:3px 8px;';
   selAll.addEventListener('click', () => {
-    visibleUuids().forEach(u => convChecked.add(u));
-    refreshConvList(); updateFooter();
+    filteredSorted(key).forEach(c => src.checked.add(c.uuid));
+    refreshConvList(key); updateFooter();
   });
   const selNone = mkBtn('None', '#8090b0', 'none', 'rgba(100,120,200,0.22)');
   selNone.style.cssText += 'font-size:11px; padding:3px 8px;';
   selNone.addEventListener('click', () => {
-    visibleUuids().forEach(u => convChecked.delete(u));
-    refreshConvList(); updateFooter();
+    filteredSorted(key).forEach(c => src.checked.delete(c.uuid));
+    refreshConvList(key); updateFooter();
   });
   controls.appendChild(selAll);
   controls.appendChild(selNone);
@@ -264,37 +286,35 @@ function renderConversationsSection(parent) {
 
   // List
   const listWrap = div('max-height:260px; overflow-y:auto; border:1px solid rgba(100,120,200,0.12); border-radius:6px; scrollbar-width:thin; scrollbar-color:#2a3050 transparent;');
-  listWrap.id = 'conv-list-wrap';
+  listWrap.id = `conv-list-wrap-${key}`;
   wrap.appendChild(listWrap);
 
-  renderConvList(listWrap);
+  renderConvList(listWrap, key);
   parent.appendChild(wrap);
 
   // Footer / distill row — rendered after memories section
 }
 
-function visibleUuids() {
-  return filteredSorted().map(c => c.uuid);
-}
-
-function filteredSorted() {
-  const q = convSearch.toLowerCase();
+function filteredSorted(key) {
+  const src = SOURCES[key];
+  const q = src.search.toLowerCase();
   let items = q
-    ? convIndex.filter(c => (c.title || '').toLowerCase().includes(q))
-    : convIndex.slice();
+    ? src.index.filter(c => (c.title || '').toLowerCase().includes(q))
+    : src.index.slice();
 
-  if (convSort === 'newest') items.sort((a, b) => (b.created || '').localeCompare(a.created || ''));
-  else if (convSort === 'oldest') items.sort((a, b) => (a.created || '').localeCompare(b.created || ''));
+  if (src.sort === 'newest') items.sort((a, b) => (b.created || '').localeCompare(a.created || ''));
+  else if (src.sort === 'oldest') items.sort((a, b) => (a.created || '').localeCompare(b.created || ''));
   else items.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
   return items;
 }
 
-function renderConvList(container) {
-  const items = filteredSorted();
+function renderConvList(container, key) {
+  const src   = SOURCES[key];
+  const items = filteredSorted(key);
   container.innerHTML = '';
   if (items.length === 0) {
     container.appendChild(el('div', 'padding:20px; text-align:center; color:#5a6890; font-size:12px;',
-      convSearch ? 'No matches.' : 'No conversations.'));
+      src.search ? 'No matches.' : 'No conversations.'));
     return;
   }
 
@@ -305,10 +325,10 @@ function renderConvList(container) {
 
     const cb = document.createElement('input');
     cb.type = 'checkbox';
-    cb.checked = convChecked.has(conv.uuid);
+    cb.checked = src.checked.has(conv.uuid);
     cb.style.cssText = 'accent-color:#9FD8FF; flex-shrink:0;';
     cb.addEventListener('change', () => {
-      if (cb.checked) convChecked.add(conv.uuid); else convChecked.delete(conv.uuid);
+      if (cb.checked) src.checked.add(conv.uuid); else src.checked.delete(conv.uuid);
       updateFooter();
     });
     row.addEventListener('click', e => { if (e.target !== cb) { cb.checked = !cb.checked; cb.dispatchEvent(new Event('change')); } });
@@ -327,9 +347,9 @@ function renderConvList(container) {
   }
 }
 
-function refreshConvList() {
-  const wrap = document.getElementById('conv-list-wrap');
-  if (wrap) renderConvList(wrap);
+function refreshConvList(key) {
+  const wrap = document.getElementById(`conv-list-wrap-${key}`);
+  if (wrap) renderConvList(wrap, key);
 }
 
 // ── Memories section ──────────────────────────────────────────────────────────
@@ -377,18 +397,21 @@ function updateFooter() {
   if (!footerEl) return;
   footerEl.innerHTML = '';
 
-  const selectedConvs  = [...convChecked].filter(u => convIndex.some(c => c.uuid === u));
-  const convCalls      = selectedConvs.reduce((s, u) => {
-    const c = convIndex.find(x => x.uuid === u);
-    return s + (c ? c.distillCalls : 0);
-  }, 0);
+  const selected = {};
+  let convCalls = 0;
+  for (const [key, src] of Object.entries(SOURCES)) {
+    selected[key] = src.index.filter(c => src.checked.has(c.uuid));
+    convCalls += selected[key].reduce((s, c) => s + c.distillCalls, 0);
+  }
+  const selectedCount  = selected.claude.length + selected.chatgpt.length;
   const memCalls       = memChecked ? (parseStatus.result?.memories?.totalDistillCalls || 0) : 0;
   const totalCalls     = convCalls + memCalls;
-  const hasSelection   = selectedConvs.length > 0 || memChecked;
+  const hasSelection   = selectedCount > 0 || memChecked;
 
   // Summary line
   const parts = [];
-  if (selectedConvs.length > 0) parts.push(`${selectedConvs.length} conversation${selectedConvs.length !== 1 ? 's' : ''}`);
+  if (selected.claude.length > 0)  parts.push(`${selected.claude.length} Claude conversation${selected.claude.length !== 1 ? 's' : ''}`);
+  if (selected.chatgpt.length > 0) parts.push(`${selected.chatgpt.length} ChatGPT conversation${selected.chatgpt.length !== 1 ? 's' : ''}`);
   if (memChecked) parts.push('memories');
   if (parts.length > 0) parts.push(`→ ~${totalCalls} distill call${totalCalls !== 1 ? 's' : ''}`);
 
@@ -421,13 +444,13 @@ function updateFooter() {
   if (!hasSelection) { runBtn.disabled = true; runBtn.style.opacity = '0.4'; }
   runBtn.addEventListener('click', () => {
     const agent = cardEl.querySelector('input[name="import-agent"]:checked')?.value || selectedAgent;
-    startRun(agent, selectedConvs, memChecked);
+    startRun(agent, selected.claude.map(c => c.uuid), selected.chatgpt.map(c => c.uuid), memChecked);
   });
   footerEl.appendChild(runBtn);
 }
 
 // ─── RUN ──────────────────────────────────────────────────────────────────────
-async function startRun(agent, uuids, includeMemories) {
+async function startRun(agent, uuids, chatgptIds, includeMemories) {
   renderRunning(`Starting ${agent === 'claude' ? 'Claude' : 'Gemini'}…`);
 
   let runId;
@@ -435,7 +458,7 @@ async function startRun(agent, uuids, includeMemories) {
     const r = await fetch('/api/distill/import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agent, conversationUuids: uuids, includeMemories }),
+      body: JSON.stringify({ agent, conversationUuids: uuids, chatgptIds, includeMemories }),
     });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);

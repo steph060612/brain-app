@@ -9,6 +9,7 @@ import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
 import { homedir } from 'os';
 import { parseConversations, parseMemories, getConvDir, getMemDir, CHARS_PER_CALL } from './src/claude-parser.js';
+import { parseConversations as parseChatgptConversations, getConvDir as getChatgptConvDir } from './src/chatgpt-parser.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -722,9 +723,9 @@ app.post('/api/distill/run', async (req, res) => {
 });
 
 // Start a distill run from parsed import items.
-// Body: { agent, conversationUuids?: string[], includeMemories?: bool }
+// Body: { agent, conversationUuids?: string[], chatgptIds?: string[], includeMemories?: bool }
 app.post('/api/distill/import', async (req, res) => {
-  const { agent, conversationUuids = [], includeMemories = false } = req.body;
+  const { agent, conversationUuids = [], chatgptIds = [], includeMemories = false } = req.body;
   if (!agent) return res.status(400).json({ error: 'agent required' });
 
   const files = [];
@@ -736,6 +737,15 @@ app.post('/api/distill/import', async (req, res) => {
     try {
       const content = await readFile(join(convDir, `${uuid}.txt`), 'utf8');
       files.push({ name: `conv-${uuid.slice(0, 8)}.txt`, content });
+    } catch { /* skip missing */ }
+  }
+
+  const chatgptDir = getChatgptConvDir();
+  for (const id of chatgptIds) {
+    if (!/^[0-9a-f-]{8,}$/i.test(id)) continue;
+    try {
+      const content = await readFile(join(chatgptDir, `${id}.txt`), 'utf8');
+      files.push({ name: `chatgpt-${id.slice(0, 8)}.txt`, content });
     } catch { /* skip missing */ }
   }
 
@@ -801,12 +811,12 @@ app.post('/api/import/parse', (_req, res) => {
 
   (async () => {
     try {
-      const result = await Promise.all([parseConversations(), parseMemories()]);
+      const result = await Promise.all([parseConversations(), parseMemories(), parseChatgptConversations()]);
       importParseState = {
         status: 'done',
         startedAt: importParseState.startedAt,
         finishedAt: new Date().toISOString(),
-        result: { conversations: result[0], memories: result[1] },
+        result: { conversations: result[0], memories: result[1], chatgpt: result[2] },
         error: null,
       };
     } catch (e) {
@@ -825,6 +835,17 @@ app.post('/api/import/parse', (_req, res) => {
 app.get('/api/import/index', async (_req, res) => {
   try {
     const p = join(getConvDir(), 'index.json');
+    const data = JSON.parse(await readFile(p, 'utf8'));
+    res.json(data);
+  } catch {
+    res.status(404).json({ error: 'Not parsed yet — POST /api/import/parse first' });
+  }
+});
+
+// Return the parsed ChatGPT conversation index
+app.get('/api/import/chatgpt-index', async (_req, res) => {
+  try {
+    const p = join(getChatgptConvDir(), 'index.json');
     const data = JSON.parse(await readFile(p, 'utf8'));
     res.json(data);
   } catch {
