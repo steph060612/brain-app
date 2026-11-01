@@ -205,6 +205,17 @@ function renderCard(item, editMode) {
   targetEl.textContent = item.target ? `→ ${item.target}` : '(no target)';
   card.appendChild(targetEl);
 
+  if (item.target === 'preferences.md') {
+    const warnEl = document.createElement('div');
+    warnEl.style.cssText = `
+      font-size:11px; color:#e0a050; background:rgba(224,160,80,0.1);
+      border:1px solid rgba(224,160,80,0.35); border-radius:5px;
+      padding:4px 8px; margin:-4px 0 10px; display:inline-block;
+    `;
+    warnEl.textContent = 'Changes how assistants behave: review carefully.';
+    card.appendChild(warnEl);
+  }
+
   if (editMode) {
     buildEditArea(card, item);
   } else {

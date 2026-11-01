@@ -186,6 +186,12 @@ function renderResult(state) {
       list.textContent = state.result.inboxed.join('\n');
       cardEl.appendChild(list);
     }
+    if (state.result?.dropped?.length) {
+      cardEl.appendChild(el('div', 'font-size:12px; color:#c08050; margin:12px 0 4px;', 'Dropped by checker (staging folder kept):'));
+      const dl = el('div', 'font-size:12px; color:#8090b0; font-family:monospace; white-space:pre-line;');
+      dl.textContent = state.result.dropped.map(d => `${d.file}: ${d.reason}`).join('\n');
+      cardEl.appendChild(dl);
+    }
   } else {
     const fail = el('div', 'font-size:13px; color:#c0503a; margin-bottom:14px;', '✗ ' + state.message);
     cardEl.appendChild(fail);

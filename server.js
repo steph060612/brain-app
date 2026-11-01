@@ -149,39 +149,65 @@ async function fileChecksums(dir, skipSub) {
   return map;
 }
 
-// Validate all files in out/ against checker rules
+const ALLOWED_TARGET_DIRS  = ['projects/', 'archive/', 'people/', 'topics/'];
+const ALLOWED_TARGET_FILES = ['profile.md', 'preferences.md'];
+
+// Per-file checker rules. Returns null if the file passes, else the rejection reason.
+function checkSuggestion(f, content) {
+  if (!f.endsWith('.md')) return 'not a .md file';
+  if (Buffer.byteLength(content, 'utf8') > 20 * 1024) return 'exceeds 20 KB';
+  if (/^permalink:/m.test(content)) return 'has a permalink line';
+  if (!/^---\s*\n[\s\S]*?\n---/.test(content)) return 'missing frontmatter';
+
+  const fm = parseFM(content);
+  const missing = ['title', 'updated', 'target'].filter(k => !fm[k]);
+  if (missing.length) return `frontmatter missing ${missing.join(', ')}`;
+
+  const t = fm.target;
+  if (t.includes('..') || t.startsWith('/') || t.includes('\\') || !t.endsWith('.md'))
+    return `invalid target path "${t}"`;
+  if (!ALLOWED_TARGET_FILES.includes(t) && !ALLOWED_TARGET_DIRS.some(d => t.startsWith(d)))
+    return `target "${t}" not allowed`;
+  return null;
+}
+
+// Validate every file in out/. Failing files are dropped individually, not the whole run.
 async function checkOutFiles(outDir) {
-  const errors = [];
   let names;
   try { names = (await readdir(outDir)).filter(f => !f.startsWith('.')); }
-  catch { return { ok: false, errors: ['out/ directory missing'] }; }
-  if (names.length === 0) return { ok: false, errors: ['No files written to out/'] };
+  catch { return { accepted: [], dropped: [] }; }
 
-  const mdFiles = [];
+  const accepted = [], dropped = [];
   for (const f of names) {
-    if (!f.endsWith('.md')) { errors.push(`Non-.md file in out/: ${f}`); continue; }
-    let content;
-    try { content = await readFile(join(outDir, f), 'utf8'); }
-    catch { errors.push(`Cannot read out/${f}`); continue; }
-
-    if (Buffer.byteLength(content, 'utf8') > 20 * 1024) { errors.push(`out/${f} exceeds 20 KB`); continue; }
-    if (/^permalink:/m.test(content)) { errors.push(`out/${f} has a permalink line`); continue; }
-
-    const fm = parseFM(content);
-    if (!fm.title)   errors.push(`out/${f}: missing title`);
-    if (!fm.updated) errors.push(`out/${f}: missing updated`);
-    if (!fm.target)  { errors.push(`out/${f}: missing target`); continue; }
-
-    const t = fm.target;
-    if (t.includes('..') || t.startsWith('/')) { errors.push(`out/${f}: invalid target path`); continue; }
-    if (!['projects/', 'archive/', 'people/', 'topics/'].some(p => t.startsWith(p))) {
-      errors.push(`out/${f}: target "${t}" outside allowed folders`); continue;
+    let content = '';
+    if (f.endsWith('.md')) {
+      try { content = await readFile(join(outDir, f), 'utf8'); }
+      catch { dropped.push({ file: f, reason: 'cannot read' }); continue; }
     }
-    mdFiles.push(f);
+    const reason = checkSuggestion(f, content);
+    if (reason) dropped.push({ file: f, reason });
+    else accepted.push(f);
   }
-  if (errors.length > 0) return { ok: false, errors };
-  return { ok: true, mdFiles };
+  return { accepted, dropped };
 }
+
+// Copy accepted out/ files into ~/Brain/inbox/ without overwriting existing items.
+async function moveToInbox(outDir, files) {
+  await mkdir(join(BRAIN, 'inbox'), { recursive: true });
+  const inboxed = [];
+  for (const f of files) {
+    let dest = join(BRAIN, 'inbox', f); let n = 0;
+    while (true) {
+      try { await stat(dest); n++; dest = join(BRAIN, 'inbox', `${basename(f, '.md')}-${n}.md`); }
+      catch { break; }
+    }
+    await writeFile(dest, await readFile(join(outDir, f), 'utf8'));
+    inboxed.push(basename(dest));
+  }
+  return inboxed;
+}
+
+const fmtDropped = dropped => dropped.map(d => `${d.file} (${d.reason})`).join('; ');
 
 async function appendDistillLog(line) {
   try {
@@ -270,28 +296,30 @@ async function verifyGeminiHeadless() {
   return geminiDisabledReason;
 }
 
-// Split agent reply on === SUGGESTION === markers; write each block as .md to outDir.
-// Returns count of files written (0 if no valid blocks — writes raw-reply.txt instead).
+// Output contract: an empty reply ("nothing worth adding"), or only === SUGGESTION === blocks
+// with no text before the first marker. Returns an error string, or null if the reply conforms.
+function checkReplyContract(stdout) {
+  if (!stdout.trim()) return null;
+  const first = stdout.search(/===[ \t]*SUGGESTION[ \t]*===/);
+  if (first === -1) return 'No === SUGGESTION === blocks in agent reply';
+  if (stdout.slice(0, first).trim()) return 'Agent reply has text before the first === SUGGESTION === block';
+  return null;
+}
+
+// Split a conforming agent reply on === SUGGESTION === markers; write each block as .md to outDir.
+// Blocks are written even without frontmatter so the per-file checker can drop them with a reason.
 async function parseAgentReply(stdout, outDir) {
   const blocks = stdout.split(/===[ \t]*SUGGESTION[ \t]*===/).map(b => b.trim()).filter(b => b.length > 0);
-  if (blocks.length === 0) {
-    await writeFile(join(outDir, 'raw-reply.txt'), stdout, 'utf8');
-    return 0;
-  }
-  let count = 0;
   const used = new Set();
   for (const block of blocks) {
     const fm = parseFM(block);
-    if (!fm.title && !fm.target) continue;
     const base = (fm.title || 'suggestion').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'suggestion';
     let name = `${base}.md`; let n = 1;
     while (used.has(name)) name = `${base}-${n++}.md`;
     used.add(name);
     await writeFile(join(outDir, name), block + '\n', 'utf8');
-    count++;
   }
-  if (count === 0) await writeFile(join(outDir, 'raw-reply.txt'), stdout, 'utf8');
-  return count;
+  return blocks.length;
 }
 
 async function mdFilesIn(dir) {
@@ -632,10 +660,14 @@ async function runDistillPipeline(state, agent, files) {
     const runAgent = agent === 'claude' ? runClaudeAgent : runGeminiAgent;
 
     let allStdout = '';
+    let contractError = null;
     for (let i = 0; i < prompts.length; i++) {
       state.status  = 'running';
       state.message = `${agentLabel} distilling${prompts.length > 1 ? ` (chunk ${i+1}/${prompts.length})` : ''}…`;
-      allStdout += await runAgent(prompts[i]) + '\n';
+      const reply = await runAgent(prompts[i]);
+      const err = checkReplyContract(reply);
+      if (err && !contractError) contractError = prompts.length > 1 ? `chunk ${i+1}: ${err}` : err;
+      allStdout += reply + '\n';
     }
 
     state.message = 'Checking output…';
@@ -657,44 +689,32 @@ async function runDistillPipeline(state, agent, files) {
       return;
     }
 
-    // ── Parse reply → out/ ─────────────────────────────────────────
-    const nBlocks = await parseAgentReply(allStdout, join(stagDir, 'out'));
-    if (nBlocks === 0) {
-      const reason = 'No === SUGGESTION === blocks in agent reply';
-      state.status = 'failed'; state.message = reason;
-      await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${reason}`);
+    // ── Output contract (run-level) ────────────────────────────────
+    if (contractError) {
+      await writeFile(join(stagDir, 'out', 'raw-reply.txt'), allStdout, 'utf8');
+      state.status = 'failed'; state.message = contractError;
+      await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${contractError}`);
       return;
     }
 
-    // ── Validate out/ contents ─────────────────────────────────────
-    const { ok, errors, mdFiles } = await checkOutFiles(join(stagDir, 'out'));
-    if (!ok) {
-      const reason = errors.join('; ');
-      state.status = 'failed'; state.message = `Checker: ${reason}`;
-      await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${reason}`);
-      return;
-    }
+    // ── Parse reply → out/, then per-file checks ───────────────────
+    const outDir = join(stagDir, 'out');
+    await parseAgentReply(allStdout, outDir);
+    const { accepted, dropped } = await checkOutFiles(outDir);
 
-    // ── Move approved files to ~/Brain/inbox/ ──────────────────────
-    await mkdir(join(BRAIN, 'inbox'), { recursive: true });
-    const inboxed = [];
-    for (const f of mdFiles) {
-      let dest = join(BRAIN, 'inbox', f); let n = 0;
-      while (true) {
-        try { await stat(dest); n++; dest = join(BRAIN, 'inbox', `${basename(f, '.md')}-${n}.md`); }
-        catch { break; }
-      }
-      await writeFile(dest, await readFile(join(stagDir, 'out', f), 'utf8'));
-      inboxed.push(basename(dest));
-    }
+    // ── Move accepted files to ~/Brain/inbox/ ──────────────────────
+    const inboxed = await moveToInbox(outDir, accepted);
 
-    // ── Delete staging on success ──────────────────────────────────
-    await rm(stagDir, { recursive: true, force: true });
+    // Delete staging only when nothing was dropped; keep it for inspection otherwise.
+    if (dropped.length === 0) await rm(stagDir, { recursive: true, force: true });
+    else for (const f of accepted) await rm(join(outDir, f), { force: true }); // don't re-inbox on a recheck
 
     state.status = 'done';
-    state.result = { inboxed };
-    state.message = `${inboxed.length} suggestion${inboxed.length !== 1 ? 's' : ''} moved to inbox: ${inboxed.join(', ')}`;
-    await appendDistillLog(`${agent} | ${inputLabel} | OK: ${inboxed.length} → inbox (${inboxed.join(', ')})`);
+    state.result = { inboxed, dropped };
+    state.message = `${inboxed.length} suggestion${inboxed.length !== 1 ? 's' : ''} moved to inbox` +
+      (dropped.length ? `, ${dropped.length} dropped by checker` : '');
+    await appendDistillLog(`${agent} | ${inputLabel} | OK: ${inboxed.length} → inbox (${inboxed.join(', ')})` +
+      (dropped.length ? ` | DROPPED: ${fmtDropped(dropped)}` : ''));
 
   } catch (e) {
     state.status  = 'failed';
@@ -785,6 +805,26 @@ app.post('/api/distill/import', async (req, res) => {
   runStore.set(runId, state);
   res.json({ runId });
   runDistillPipeline(state, agent, files).catch(() => {});
+});
+
+// Re-run the checker on a kept staging folder (no agent call) and move valid files to the inbox.
+app.post('/api/distill/recheck/:runId', async (req, res) => {
+  const { runId } = req.params;
+  if (!/^[0-9]{8}-[0-9]{6}-[a-z0-9]{4}$/.test(runId)) return res.status(400).json({ error: 'Invalid runId' });
+  const stagDir = join(STAGING_BASE, runId);
+  const outDir  = join(stagDir, 'out');
+  try { await stat(outDir); } catch { return res.status(404).json({ error: 'Staging folder not found' }); }
+  try {
+    const { accepted, dropped } = await checkOutFiles(outDir);
+    const inboxed = await moveToInbox(outDir, accepted);
+    if (dropped.length === 0) await rm(stagDir, { recursive: true, force: true });
+    else for (const f of accepted) await rm(join(outDir, f), { force: true }); // don't re-inbox on a second recheck
+    await appendDistillLog(`recheck | ${runId} | OK: ${inboxed.length} → inbox (${inboxed.join(', ')})` +
+      (dropped.length ? ` | DROPPED: ${fmtDropped(dropped)}` : ''));
+    res.json({ inboxed, dropped });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Poll run status
