@@ -414,7 +414,7 @@ function renderPasteView() {
   listEl.innerHTML = '';
 
   listEl.appendChild(textDiv('font-size:12px; color:#8090b0; margin-bottom:8px; line-height:1.5;',
-    'Paste close-session output. Each ### FILE / ### ACTION block becomes an Inbox suggestion; nothing is written until you approve it.'));
+    'Paste close-session output. Each FILE / ACTION block becomes an Inbox suggestion (with or without ###, bold labels are fine); nothing is written until you approve it.'));
 
   const textarea = document.createElement('textarea');
   textarea.placeholder = '### FILE: projects/…/state.md\n### ACTION: append\n- …';

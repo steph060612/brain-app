@@ -1,18 +1,41 @@
 // Close-session proposals: parse README UPDATE PROTOCOL blocks and apply one approved block to its target.
 // Plain code, no AI. Used by server.js (paste → inbox items, approve → target edit).
 //
-//   ### FILE: [relative path]
+//   ### FILE: [relative path]          (also FILE:, **FILE:**, or a heading of any level)
 //   ### ACTION: create | append | replace-section [section heading] | replace-line | frontmatter
 //   [content]
 
 export const ACTIONS = ['create', 'append', 'replace-section', 'replace-line', 'frontmatter'];
 
-const FILE_RE   = /^[ \t]*#{1,6}[ \t]*\**FILE:\**[ \t]*(.*?)[ \t]*$/i;
-const ACTION_RE = /^[ \t]*#{1,6}[ \t]*\**ACTION:\**[ \t]*(.*?)[ \t]*$/i;
 const PERMALINK = /^[ \t]*permalink[ \t]*:/im;
 
-// "[x]" or "`x`" → "x"
-const unwrap = s => s.trim().replace(/^\[(.*)\]$/, '$1').replace(/^`(.*)`$/, '$1').trim();
+// A label line, tolerant of copied chat output: "### FILE: x", "FILE: x", "**FILE:** x", "**FILE**: x",
+// "**FILE: x**", "## **ACTION:** x", "- OLD: x". Groups: heading, open bold, word, close bold, bold after
+// the colon, value (one space after the colon is dropped, the rest is kept as is).
+const LABEL_RE = /^[ \t]*(#{1,6}[ \t]*)?(?:[-*][ \t]+)?(\*\*|__)?([A-Za-z]+)(?:[ \t]+line)?(\*\*|__)?[ \t]*:(?:[ \t]*(\*\*|__))?[ \t]?(.*)$/;
+
+// Returns { word, value } when line is a label for one of words, else null. A plain label (no heading
+// marker, no bold) must be uppercase, so content such as "File: notes" is not taken for a new block.
+// caseInsensitive: also accept plain lowercase labels (OLD/NEW inside a replace-line block).
+function matchLabel(line, words, caseInsensitive = false) {
+  const m = line.match(LABEL_RE);
+  if (!m) return null;
+  const [, heading, open, word, close, after, raw] = m;
+  const upper = word.toUpperCase();
+  if (!words.includes(upper)) return null;
+  if (!heading && !open && !close && !after && !caseInsensitive && word !== upper) return null;
+  let value = raw;
+  // "**FILE: x**": the bold opened before the label closes at the end of the line.
+  if (open && !close && !after && value.trimEnd().endsWith(open)) value = value.trimEnd().slice(0, -open.length);
+  return { word: upper, value };
+}
+
+const fileLine   = line => matchLabel(line, ['FILE']);
+const actionLine = line => matchLabel(line, ['ACTION']);
+
+// "[x]", "`x`", "**x**" → "x"
+const unwrap = s => s.trim().replace(/^(\*\*|__)(.*)\1$/, '$2').trim()
+  .replace(/^\[(.*)\]$/, '$1').replace(/^`(.*)`$/, '$1').trim();
 
 // Split pasted text into raw blocks. A block starts at a FILE line and its content ends at the next
 // FILE line or at a closing code fence. Text outside blocks is ignored; stray ACTION lines are errors.
@@ -23,21 +46,21 @@ export function splitBlocks(text) {
   const close = () => { if (cur) { blocks.push(cur); cur = null; } };
 
   lines.forEach((line, i) => {
-    const fm = line.match(FILE_RE);
-    if (fm) { close(); cur = { line: i + 1, file: unwrap(fm[1]), action: null, content: [] }; return; }
+    const fm = fileLine(line);
+    if (fm) { close(); cur = { line: i + 1, file: unwrap(fm.value), action: null, content: [] }; return; }
     if (!cur) {
-      if (ACTION_RE.test(line)) errors.push({ line: i + 1, file: null, reason: 'ACTION line without a FILE line before it' });
+      if (actionLine(line)) errors.push({ line: i + 1, file: null, reason: 'ACTION line without a FILE line before it' });
       return;
     }
     if (cur.action === null) {
       if (!line.trim()) return;
-      const am = line.match(ACTION_RE);
-      cur.action = am ? am[1] : '';
+      const am = actionLine(line);
+      cur.action = am ? unwrap(am.value) : '';
       if (!am) cur.content.push(line); // keep it so the error names the problem
       cur.missingAction = !am;
       return;
     }
-    if (ACTION_RE.test(line)) cur.extraAction = true; // one action per FILE block
+    if (actionLine(line)) cur.extraAction = true; // one action per FILE block
     cur.content.push(line);
   });
   close();
@@ -60,23 +83,23 @@ function parseAction(raw) {
   return { action: m[1].toLowerCase(), section: unwrap(m[2] || '') };
 }
 
-// OLD/NEW from "OLD: x" + "NEW: y" (inline) or "OLD:" / x / "NEW:" / y (next line). Bullets and bold allowed.
-// Matches "OLD: x", "**OLD:** x", "- NEW line: x", "OLD:" (value on the next non-empty line).
-const OLDNEW_RE = /^[ \t]*(?:[-*][ \t]+)?\**(OLD|NEW)(?:[ \t]+line)?\**[ \t]*:\**[ \t]?(.*)$/i;
+// OLD/NEW from "OLD: x" + "NEW: y" (inline) or "OLD:" / x / "NEW:" / y (next line). Same label forms as
+// FILE/ACTION (headings, bullets, bold), plus "OLD line:"; any case is accepted inside the block.
+const oldNewLine = line => matchLabel(line, ['OLD', 'NEW'], true);
 // An inline value wrapped whole in single backticks is unwrapped: "OLD: `- x`" → "- x".
 const unBacktick = v => (/^`[^`]*`$/.test(v.trim()) ? v.trim().slice(1, -1) : v);
 
 function parseOldNew(lines) {
   const out = {};
   for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(OLDNEW_RE);
+    const m = oldNewLine(lines[i]);
     if (!m) continue;
-    const key = m[1].toUpperCase();
+    const key = m.word;
     if (key in out) return { error: `more than one ${key} line` };
-    if (m[2].trim() !== '') { out[key] = unBacktick(m[2]); continue; }
+    if (m.value.trim() !== '') { out[key] = unBacktick(m.value); continue; }
     const next = lines.slice(i + 1).findIndex(l => l.trim() !== '');
     const val = next < 0 ? undefined : lines[i + 1 + next];
-    if (val === undefined || OLDNEW_RE.test(val)) return { error: `${key} has no line after it` };
+    if (val === undefined || oldNewLine(val)) return { error: `${key} has no line after it` };
     out[key] = val;
     i += 1 + next;
   }
