@@ -135,6 +135,18 @@ export function initPanel() {
   metaEl.style.cssText = 'font-size:11px; color:#5a6890; margin-top:4px; margin-bottom:12px;';
   header.appendChild(metaEl);
 
+  // Copy pack (projects and archive only)
+  const packBtn = document.createElement('button');
+  packBtn.id = 'pack-btn';
+  packBtn.textContent = 'Copy pack for other assistants';
+  packBtn.style.cssText = `
+    display:none; margin:-4px 0 12px; padding:4px 10px; background:rgba(255,255,255,0.04);
+    border:1px solid rgba(100,120,200,0.25); color:#9FD8FF; border-radius:4px;
+    font-size:12px; cursor:pointer; font-family:inherit;
+  `;
+  packBtn.addEventListener('click', copyPack);
+  header.appendChild(packBtn);
+
   panelEl.appendChild(header);
 
   // Tabs
@@ -185,6 +197,11 @@ export async function openPanel(item) {
   // Populate header
   document.getElementById('panel-path').textContent = item.folder || item.category;
   document.getElementById('panel-title').textContent = item.name;
+  const packBtn = document.getElementById('pack-btn');
+  const isProject = item.type === 'folder' && (item.category === 'projects' || item.category === 'archive');
+  packBtn.style.display = isProject ? '' : 'none';
+  packBtn.disabled = false;
+  packBtn.textContent = 'Copy pack for other assistants';
 
   buildTabs();
   panelEl.style.transform = 'translateX(0)';
@@ -359,6 +376,34 @@ async function doSave(path) {
     const btn = document.getElementById('save-btn');
     if (btn) btn.disabled = false;
   }
+}
+
+// ─── COPY PACK ───────────────────────────────────────────────────────────────
+// The server runs ~/.brain/brainpack.sh, which saves the pack and copies it to the macOS clipboard.
+// The browser copy below is a second path to the same text; it may be refused after the await.
+async function copyPack() {
+  const btn = document.getElementById('pack-btn');
+  const item = currentItem;
+  if (!item) return;
+  const project = (item.path || '').split('/').pop();
+  btn.disabled = true;
+  btn.textContent = 'Building pack…';
+  try {
+    const r = await fetch('/api/pack', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    try { await navigator.clipboard.writeText(data.content); } catch { /* script already copied it */ }
+    btn.textContent = 'Copied';
+    setStatus(`Pack copied: ${data.chars.toLocaleString()} characters (saved as ${data.file}).`, '#6FE3D0');
+  } catch (e) {
+    btn.textContent = 'Copy pack for other assistants';
+    setStatus(`Pack failed: ${e.message}`, '#c0503a');
+  }
+  btn.disabled = false;
+  setTimeout(() => { if (btn.textContent === 'Copied') btn.textContent = 'Copy pack for other assistants'; }, 2500);
 }
 
 function setStatus(msg, color = '#8090b0') {

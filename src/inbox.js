@@ -24,6 +24,15 @@ async function approveInbox(filename, inboxHash, targetHash) {
   return { status: r.status, data: await r.json() };
 }
 
+async function pasteProposals(text) {
+  const r = await fetch('/api/inbox/paste', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ text }),
+  });
+  return { status: r.status, data: await r.json() };
+}
+
 async function discardInbox(filename) {
   const r = await fetch(`/api/inbox/${encodeURIComponent(filename)}`, { method: 'DELETE' });
   return { status: r.status, data: await r.json() };
@@ -100,7 +109,10 @@ export function initInbox() {
   closeBtn.textContent = '✕';
   closeBtn.style.cssText = 'background:none; border:none; color:#8090b0; font-size:16px; cursor:pointer; padding:2px 6px;';
   closeBtn.addEventListener('click', closeInboxPanel);
+  const pasteBtn = mkBtn('Paste proposals', '#9FD8FF', 'rgba(60,108,255,0.12)', 'rgba(60,108,255,0.35)');
+  pasteBtn.addEventListener('click', renderPasteView);
   header.appendChild(titleEl);
+  header.appendChild(pasteBtn);
   header.appendChild(closeBtn);
   panelEl.appendChild(header);
 
@@ -202,7 +214,12 @@ function renderCard(item, editMode) {
 
   const targetEl = document.createElement('div');
   targetEl.style.cssText = 'font-size:11px; color:#5a6890; margin-bottom:10px; font-family:monospace;';
-  targetEl.textContent = item.target ? `→ ${item.target}` : '(no target)';
+  const fmBlock = (item.content.match(/^---\s*\n([\s\S]*?)\n---/) || [])[1] || '';
+  const action  = (fmBlock.match(/^action:[ \t]*(.+)$/m) || [])[1]?.trim();
+  const section = action === 'replace-section' ? (fmBlock.match(/^section:[ \t]*(.+)$/m) || [])[1]?.trim() : '';
+  targetEl.textContent = item.target
+    ? `→ ${item.target}${action ? ` · ${action}${section ? ` ${section}` : ''}` : ''}`
+    : '(no target)';
   card.appendChild(targetEl);
 
   if (item.target === 'preferences.md') {
@@ -271,10 +288,16 @@ function buildReadArea(card, item) {
         updateCount(inboxItems.length);
         card.remove();
         if (inboxItems.length === 0) renderList();
-        setStatus('Approved — appended to target.', '#6FE3D0');
+        const done = { 'replace-line': 'line replaced in', 'replace-section': 'section replaced in',
+          frontmatter: 'frontmatter updated in', create: 'created' }[data.action] || 'appended to';
+        setStatus(`Approved — ${done} ${item.target}.`, '#6FE3D0');
       } else if (status === 409) {
         setStatus(data.message || 'Conflict — refreshing.', '#e08040');
         await openInboxPanel();
+      } else if (status === 422) {
+        setStatus(data.error, '#e08040'); // refused: e.g. OLD line not found exactly once
+        approveBtn.disabled = false;
+        approveBtn.textContent = 'Approve';
       } else {
         setStatus(`Error: ${data.error || 'unknown'}`, '#c0503a');
         approveBtn.disabled = false;
@@ -381,6 +404,87 @@ function buildEditArea(card, item) {
   btnRow.appendChild(saveBtn);
   btnRow.appendChild(cancelBtn);
   card.appendChild(btnRow);
+}
+
+// ─── PASTE PROPOSALS ─────────────────────────────────────────────────────────
+// Paste close-session output from any assistant; the server parses UPDATE PROTOCOL blocks (no AI).
+function renderPasteView() {
+  panelEl.style.transform = 'translateX(0)';
+  setStatus('');
+  listEl.innerHTML = '';
+
+  listEl.appendChild(textDiv('font-size:12px; color:#8090b0; margin-bottom:8px; line-height:1.5;',
+    'Paste close-session output. Each ### FILE / ### ACTION block becomes an Inbox suggestion; nothing is written until you approve it.'));
+
+  const textarea = document.createElement('textarea');
+  textarea.placeholder = '### FILE: projects/…/state.md\n### ACTION: append\n- …';
+  textarea.style.cssText = `
+    width:100%; height:300px; resize:vertical; background:#0d1020;
+    color:#c8d0e8; border:1px solid rgba(100,120,200,0.25); border-radius:4px;
+    padding:10px; font-family:monospace; font-size:12px; line-height:1.5;
+    outline:none; box-sizing:border-box; margin-bottom:8px;
+  `;
+  listEl.appendChild(textarea);
+
+  const btnRow = document.createElement('div');
+  btnRow.style.cssText = 'display:flex; gap:8px; margin-bottom:12px;';
+  const addBtn    = mkBtn('Add to Inbox', '#9FD8FF', 'rgba(60,108,255,0.25)', 'rgba(60,108,255,0.5)');
+  const cancelBtn = mkBtn('Cancel', '#8090b0', 'none', 'rgba(100,120,200,0.25)');
+  btnRow.appendChild(addBtn);
+  btnRow.appendChild(cancelBtn);
+  listEl.appendChild(btnRow);
+
+  const resultEl = document.createElement('div');
+  listEl.appendChild(resultEl);
+  cancelBtn.addEventListener('click', openInboxPanel);
+
+  addBtn.addEventListener('click', async () => {
+    if (!textarea.value.trim()) { setStatus('Nothing pasted.', '#e08040'); return; }
+    addBtn.disabled = true;
+    addBtn.textContent = 'Parsing…';
+    try {
+      const { status, data } = await pasteProposals(textarea.value);
+      if (status !== 200) throw new Error(data.error || `HTTP ${status}`);
+      renderPasteResult(resultEl, data);
+      if (data.created.length) {
+        inboxItems = await loadInbox();
+        updateCount(inboxItems.length);
+      }
+      setStatus(`${data.created.length} suggestion${data.created.length !== 1 ? 's' : ''} added` +
+        (data.errors.length ? `, ${data.errors.length} block${data.errors.length !== 1 ? 's' : ''} not parsed.` : '.'),
+        data.errors.length ? '#e08040' : '#6FE3D0');
+    } catch (e) {
+      setStatus(`Paste failed: ${e.message}`, '#c0503a');
+    }
+    addBtn.disabled = false;
+    addBtn.textContent = 'Add to Inbox';
+  });
+
+  textarea.focus();
+}
+
+function renderPasteResult(el, { created, errors }) {
+  el.innerHTML = '';
+  if (errors.length) {
+    el.appendChild(textDiv('font-size:12px; color:#e08040; margin-bottom:4px;', 'Not parsed (fix and paste again):'));
+    const list = textDiv('font-size:12px; color:#c8d0e8; font-family:monospace; white-space:pre-wrap; margin-bottom:10px;',
+      errors.map(e => `${e.line ? `line ${e.line}` : '—'}${e.file ? ` ${e.file}` : ''}: ${e.reason}`).join('\n'));
+    el.appendChild(list);
+  }
+  if (created.length) {
+    el.appendChild(textDiv('font-size:12px; color:#6FE3D0; margin-bottom:8px;',
+      `Added ${created.length} suggestion${created.length !== 1 ? 's' : ''} to the Inbox.`));
+    const view = mkBtn('Review in Inbox', '#6FE3D0', 'rgba(111,227,208,0.12)', 'rgba(111,227,208,0.35)');
+    view.addEventListener('click', openInboxPanel);
+    el.appendChild(view);
+  }
+}
+
+function textDiv(css, text) {
+  const d = document.createElement('div');
+  d.style.cssText = css;
+  d.textContent = text;
+  return d;
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────

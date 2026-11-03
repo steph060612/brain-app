@@ -5,12 +5,13 @@ import { readdir, readFile, writeFile, stat, access, unlink, mkdir, rm } from 'f
 import { resolve, join, sep, extname, basename, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
-import { exec, spawn } from 'child_process';
+import { exec, execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import { homedir } from 'os';
 import { parseConversations, parseMemories, getConvDir, getMemDir, CHARS_PER_CALL } from './src/claude-parser.js';
 import { parseConversations as parseChatgptConversations, getConvDir as getChatgptConvDir } from './src/chatgpt-parser.js';
 import { parseConversations as parseGeminiConversations, getConvDir as getGeminiConvDir } from './src/gemini-parser.js';
+import { parseProposals, toInboxFile, readInboxBody, applyProposal, ACTIONS } from './src/proposals.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -35,6 +36,12 @@ function err403(m) { const e = new Error(m); e.status = 403; return e; }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 const md5 = s => createHash('md5').update(s).digest('hex');
+
+// YYYY-MM-DD in local time (toISOString() is UTC and gives tomorrow's date in the evening).
+function localToday() {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
 
 // Extract the permalink line from frontmatter (we must never alter it)
 function pickPermalink(content) {
@@ -163,6 +170,7 @@ async function fileChecksums(dir, skipSub) {
 
 const ALLOWED_TARGET_DIRS  = ['projects/', 'archive/', 'people/', 'topics/'];
 const ALLOWED_TARGET_FILES = ['profile.md', 'preferences.md'];
+const isAllowedTarget = t => ALLOWED_TARGET_FILES.includes(t) || ALLOWED_TARGET_DIRS.some(d => t.startsWith(d));
 
 // Per-file checker rules. Returns null if the file passes, else the rejection reason.
 function checkSuggestion(f, content) {
@@ -178,8 +186,7 @@ function checkSuggestion(f, content) {
   const t = fm.target;
   if (t.includes('..') || t.startsWith('/') || t.includes('\\') || !t.endsWith('.md'))
     return `invalid target path "${t}"`;
-  if (!ALLOWED_TARGET_FILES.includes(t) && !ALLOWED_TARGET_DIRS.some(d => t.startsWith(d)))
-    return `target "${t}" not allowed`;
+  if (!isAllowedTarget(t)) return `target "${t}" not allowed`;
   return null;
 }
 
@@ -457,6 +464,32 @@ app.get('/api/gitlog', async (_req, res) => {
   }
 });
 
+// ─── PACK ────────────────────────────────────────────────────────────────────
+
+// Build a project's pack for other assistants by running ~/.brain/brainpack.sh (the single source of the
+// pack format). The script saves the pack and copies it to the clipboard; the saved file is returned too.
+const BRAINPACK = resolve(homedir(), '.brain', 'brainpack.sh');
+const PACKS_DIR = resolve(homedir(), '.brain', 'packs');
+
+app.post('/api/pack', async (req, res) => {
+  const project = String(req.body?.project || '');
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(project)) return res.status(400).json({ error: 'Invalid project name' });
+  // LaunchAgents start without a locale; pbcopy then re-encodes non-ASCII text, so force UTF-8.
+  const env = { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' };
+  execFile(BRAINPACK, [project], { timeout: 15000, env }, async (err, stdout, stderr) => {
+    if (err) return res.status(500).json({ error: (stdout || stderr || err.message).trim().split('\n')[0] });
+    const m = stdout.match(/^Saved to: (.+)$/m);
+    const packPath = m && resolve(m[1].trim());
+    if (!packPath || !packPath.startsWith(PACKS_DIR + sep)) return res.status(500).json({ error: 'brainpack.sh did not report a pack file' });
+    try {
+      const content = await readFile(packPath, 'utf8');
+      res.json({ ok: true, content, chars: content.length, file: basename(packPath) });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+});
+
 // ─── INBOX ROUTES ────────────────────────────────────────────────────────────
 
 // List inbox items with parsed frontmatter and hashes
@@ -517,7 +550,10 @@ app.post('/api/inbox/approve', async (req, res) => {
     const targetAbs = safe(fm.target);
     const bodyRaw = inboxContent.replace(/^---[\s\S]*?---\s*\n?/, '').trimStart();
     const body = bodyRaw.trimEnd() + '\n';
-    const today = new Date().toISOString().split('T')[0];
+    const today = localToday();
+
+    // Pasted close-session proposals carry an action; distiller items have none and append as before.
+    if (fm.action) return approveAction(res, { fm, inboxAbs, targetAbs, body: bodyRaw.replace(/\s+$/, ''), targetHash, today });
 
     let targetContent;
     let targetExists = true;
@@ -543,6 +579,72 @@ app.post('/api/inbox/approve', async (req, res) => {
     await writeFile(targetAbs, newTargetContent, 'utf8');
     await unlink(inboxAbs);
     res.json({ ok: true });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+async function approveAction(res, { fm, inboxAbs, targetAbs, body, targetHash, today }) {
+  if (!ACTIONS.includes(fm.action)) return res.status(400).json({ error: `Unknown action "${fm.action}"` });
+  if (!isAllowedTarget(fm.target)) return res.status(400).json({ error: `Target "${fm.target}" not allowed` });
+
+  const data = readInboxBody(fm.action, body);
+  if (data.error) return res.status(400).json({ error: data.error });
+  if (fm.action === 'replace-section') data.section = fm.section || '';
+
+  let current = null;
+  try { current = await readFile(targetAbs, 'utf8'); } catch { }
+  if (current !== null && targetHash && md5(current) !== targetHash) {
+    return res.status(409).json({ error: 'conflict', message: 'Target file changed since it was opened.' });
+  }
+
+  const result = applyProposal(fm.action, data, current, {
+    today, titleFor: () => basename(fm.target, '.md').replace(/-/g, ' '),
+  });
+  if (result.error) return res.status(422).json({ error: result.error });
+
+  // Permalink lines are never touched: restore the original one if anything moved it.
+  const out = current !== null ? guardPermalink(current, result.content) : result.content;
+  if (current === null) await mkdir(dirname(targetAbs), { recursive: true });
+  await writeFile(targetAbs, out, 'utf8');
+  await unlink(inboxAbs);
+  res.json({ ok: true, action: fm.action });
+}
+
+// Paste close-session output: parse UPDATE PROTOCOL blocks into inbox items. Plain code, no AI.
+// Body: { text } → { created: [filename], errors: [{ line, file, reason }] }
+app.post('/api/inbox/paste', async (req, res) => {
+  try {
+    const { text } = req.body || {};
+    if (typeof text !== 'string' || !text.trim()) return res.status(400).json({ error: 'Nothing pasted' });
+
+    const { proposals, errors } = parseProposals(text, { isAllowedTarget });
+    const today = localToday();
+    const created = [];
+    await mkdir(join(BRAIN, 'inbox'), { recursive: true });
+
+    for (const p of proposals) {
+      const fail = reason => errors.push({ line: p.line, file: p.file, reason });
+      let exists = true;
+      try { await stat(safe(p.file)); } catch (e) { if (e.status) { fail(e.message); continue; } exists = false; }
+      if (p.action === 'create' && exists) { fail('create: target already exists (use append or replace-section)'); continue; }
+      if (!exists && !['create', 'append'].includes(p.action)) { fail(`${p.action}: target does not exist`); continue; }
+
+      const content = toInboxFile(p, today);
+      const slug = `paste-${p.file.replace(/\.md$/, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}-${p.action}`.slice(0, 80);
+      const reason = checkSuggestion(`${slug}.md`, content);
+      if (reason) { fail(reason); continue; }
+
+      let name = `${slug}.md`, n = 0;
+      while (true) {
+        try { await stat(join(BRAIN, 'inbox', name)); name = `${slug}-${++n}.md`; } catch { break; }
+      }
+      await writeFile(join(BRAIN, 'inbox', name), content, 'utf8');
+      created.push(name);
+    }
+
+    errors.sort((a, b) => (a.line || 0) - (b.line || 0));
+    res.json({ created, errors });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
   }
@@ -604,7 +706,7 @@ async function runDistillPipeline(state, agent, files) {
     }
 
     // ── Build prompt ───────────────────────────────────────────────
-    const today         = new Date().toISOString().split('T')[0];
+    const today         = localToday();
     const readme        = await readFile(join(BRAIN, 'README.md'), 'utf8');
     const brainIndex    = await buildBrainIndex();
     const brainContent  = await buildBrainContent();
