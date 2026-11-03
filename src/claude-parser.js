@@ -91,6 +91,16 @@ function cleanMessage(msg) {
 
 // ── Conversations ─────────────────────────────────────────────────────────────
 
+const TITLE_LEN = 60;
+
+// Name, else summary, else the first TITLE_LEN characters of the first human message.
+// The index stays local and is shown only in the brain app.
+export function fallbackTitle(name, summary, firstHumanText) {
+  const clean = s => (typeof s === 'string' ? s.replace(/\s+/g, ' ').trim() : '');
+  const first = clean(firstHumanText);
+  return clean(name) || clean(summary) || (first ? [...first].slice(0, TITLE_LEN).join('') : '(untitled)');
+}
+
 export async function parseConversations() {
   const src = join(EXPORTS_DIR, 'conversations', 'conversations.json');
   const raw = JSON.parse(await readFile(src, 'utf8'));
@@ -106,11 +116,13 @@ export async function parseConversations() {
 
     const branch = getActiveBranch(msgs);
     const lines  = [];
+    let firstHuman = '';
 
     for (const msg of branch) {
       const role = msg.sender === 'human' ? 'human' : 'assistant';
       const text = cleanMessage(msg);
       if (text.trim()) lines.push(`=== ${role} ===\n${text}`);
+      if (role === 'human' && !firstHuman && text.trim()) firstHuman = text;
     }
 
     if (lines.length === 0) { skipped++; continue; }
@@ -122,7 +134,7 @@ export async function parseConversations() {
     totalChars += charCount;
     index.push({
       uuid:         conv.uuid,
-      title:        conv.name || '(untitled)',
+      title:        fallbackTitle(conv.name, conv.summary, firstHuman),
       created:      conv.created_at  || null,
       updated:      conv.updated_at  || null,
       messageCount: branch.length,

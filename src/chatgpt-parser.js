@@ -3,7 +3,7 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
-import { CHARS_PER_CALL } from './claude-parser.js';
+import { CHARS_PER_CALL, fallbackTitle } from './claude-parser.js';
 
 const EXPORT_FILE = join(homedir(), 'brain-exports', 'ChatGPT_Data-Export', 'conversations.json');
 const IMPORT_BASE = join(homedir(), '.brain', 'imports', 'chatgpt');
@@ -76,11 +76,13 @@ export async function parseConversations() {
     if (branch.length === 0) { skip('current_node missing or not in mapping'); continue; }
 
     const lines = [];
+    let firstHuman = '';
     for (const msg of branch) {
       const role = msg.author?.role;
       if (!KEEP_ROLES.has(role)) continue;
       const text = cleanMessage(msg);
       if (text.trim()) lines.push(`=== ${role === 'user' ? 'human' : 'assistant'} ===\n${text}`);
+      if (role === 'user' && !firstHuman && text.trim()) firstHuman = text;
     }
 
     if (lines.length === 0) { skip('no user/assistant text on active branch'); continue; }
@@ -92,7 +94,7 @@ export async function parseConversations() {
     totalChars += charCount;
     index.push({
       uuid:         id,
-      title:        conv.title || '(untitled)',
+      title:        fallbackTitle(conv.title, conv.summary, firstHuman),
       created:      toIso(conv.create_time),
       updated:      toIso(conv.update_time),
       messageCount: lines.length,
