@@ -89,12 +89,47 @@ async function openModal() {
 }
 
 async function loadIndexes() {
-  await Promise.all(Object.values(SOURCES).map(async src => {
-    try {
-      const r = await fetch(src.indexUrl);
-      src.index = r.ok ? await r.json() : [];
-    } catch { /* keep stale */ }
-  }));
+  await Promise.all([
+    ...Object.values(SOURCES).map(async src => {
+      try {
+        const r = await fetch(src.indexUrl);
+        src.index = r.ok ? await r.json() : [];
+      } catch { /* keep stale */ }
+    }),
+    (async () => {
+      try {
+        const r = await fetch('/api/import/distilled');
+        if (r.ok) distilled = await r.json();
+      } catch { /* keep stale */ }
+    })(),
+  ]);
+}
+
+// ─── DISTILLED ────────────────────────────────────────────────────────────────
+// Records keyed "<source>:<id>"; source is the SOURCES key, or 'memories'.
+let distilled = {};
+
+const fmtDay = d => new Date(`${d}T12:00:00`).toLocaleDateString(undefined, { month:'short', day:'numeric', year:'numeric' });
+
+// null, or { label, changed } for a conversation that was distilled before.
+function distilledInfo(key, conv) {
+  const rec = distilled[`${key}:${conv.uuid}`];
+  if (!rec) return null;
+  const changed = rec.messageCount != null && conv.messageCount > rec.messageCount;
+  return { changed, label: `Distilled ${fmtDay(rec.date)}${changed ? ', has new messages' : ''}` };
+}
+
+function memoriesDistilledInfo(stats) {
+  const rec = distilled['memories:claude-memories'];
+  if (!rec) return null;
+  const changed = rec.totalChars != null && stats?.totalChars != null && stats.totalChars !== rec.totalChars;
+  return { changed, label: `Distilled ${fmtDay(rec.date)}${changed ? ', has new content' : ''}` };
+}
+
+function distilledTag(info) {
+  return el('div', `font-size:11px; flex-shrink:0; white-space:nowrap; padding:1px 7px; border-radius:9px;
+    ${info.changed ? 'color:#e0a050; background:rgba(224,160,80,0.1);' : 'color:#6FE3D0; background:rgba(111,227,208,0.08);'}`,
+    info.label);
 }
 
 function closeModal() {
@@ -242,6 +277,11 @@ function renderConversationsSection(parent, key) {
     parent.appendChild(wrap);
     return;
   }
+  const nDistilled = src.index.filter(c => distilledInfo(key, c)).length;
+  if (nDistilled > 0) {
+    wrap.appendChild(el('div', 'font-size:12px; color:#5a6890; margin-bottom:10px;',
+      `${nDistilled} already distilled: left unticked, and "All" skips them. Tick one to distill it again.`));
+  }
   const skipped = result?.skipped ?? 0;
   if (skipped > 0 && key === 'gemini') {
     // Gemini skips individual activity entries, not conversations.
@@ -289,7 +329,7 @@ function renderConversationsSection(parent, key) {
   const selAll = mkBtn('All', '#8090b0', 'none', 'rgba(100,120,200,0.22)');
   selAll.style.cssText += 'font-size:11px; padding:3px 8px;';
   selAll.addEventListener('click', () => {
-    filteredSorted(key).forEach(c => src.checked.add(c.uuid));
+    filteredSorted(key).filter(c => !distilledInfo(key, c)).forEach(c => src.checked.add(c.uuid)); // distilled stay unticked
     refreshConvList(key); updateFooter();
   });
   const selNone = mkBtn('None', '#8090b0', 'none', 'rgba(100,120,200,0.22)');
@@ -360,6 +400,8 @@ function renderConvList(container, key) {
 
     row.appendChild(cb);
     row.appendChild(title);
+    const info = distilledInfo(key, conv);
+    if (info) row.appendChild(distilledTag(info));
     row.appendChild(date);
     row.appendChild(calls);
     container.appendChild(row);
@@ -394,6 +436,8 @@ function renderMemoriesSection(parent) {
 
   row.appendChild(cb);
   row.appendChild(desc);
+  const memInfo = memoriesDistilledInfo(r);
+  if (memInfo) row.appendChild(distilledTag(memInfo));
   row.appendChild(calls);
   wrap.appendChild(row);
   parent.appendChild(wrap);
@@ -539,6 +583,9 @@ function renderResult(state) {
   const body = div('padding:20px;');
 
   if (state.status === 'done') {
+    // The distilled items are now recorded; start the next selection from nothing ticked.
+    for (const src of Object.values(SOURCES)) src.checked.clear();
+    memChecked = false;
     body.appendChild(el('div', 'font-size:14px; color:#6FE3D0; margin-bottom:12px;', '✓ ' + state.message));
     if (state.result?.inboxed?.length) {
       const list = el('div', 'font-size:12px; color:#8090b0; font-family:monospace;');

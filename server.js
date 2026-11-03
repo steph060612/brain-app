@@ -1,7 +1,7 @@
 // Local API server — reads and writes ~/Brain .md files.
 // Listens only on localhost:3001. Never touches anything outside ~/Brain.
 import express from 'express';
-import { readdir, readFile, writeFile, stat, access, unlink, mkdir, rm } from 'fs/promises';
+import { readdir, readFile, writeFile, stat, access, unlink, mkdir, rm, rename } from 'fs/promises';
 import { resolve, join, sep, extname, basename, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
@@ -692,6 +692,66 @@ app.get('/api/distill/agents', async (_req, res) => {
 
 // ── Shared distill pipeline ───────────────────────────────────────────────────
 
+// ── DISTILLED RECORDS ────────────────────────────────────────────────────────
+// ~/.brain/imports/distilled.json: { items: { "<source>:<id>": record } }. Lives outside the per-source
+// import folders, so re-parsing a new export keeps it; records are matched by conversation ID.
+// record: { source, id, date, messageCount | totalChars, suggestions, runItems, runId, agent, runs: [...] }
+// One run distills all its items together, so suggestions is the run's total, shared by its runItems.
+const DISTILLED_FILE = resolve(homedir(), '.brain', 'imports', 'distilled.json');
+
+async function loadDistilled() {
+  try {
+    const d = JSON.parse(await readFile(DISTILLED_FILE, 'utf8'));
+    return d && typeof d.items === 'object' ? d : { items: {} };
+  } catch { return { items: {} }; }
+}
+
+async function saveDistilled(d) {
+  await mkdir(dirname(DISTILLED_FILE), { recursive: true });
+  const tmp = DISTILLED_FILE + '.tmp';
+  await writeFile(tmp, JSON.stringify(d, null, 2), 'utf8');
+  await rename(tmp, DISTILLED_FILE);
+}
+
+let distilledLock = Promise.resolve(); // serialize read-modify-write
+function updateDistilled(fn) {
+  const next = distilledLock.then(async () => { const d = await loadDistilled(); fn(d); await saveDistilled(d); });
+  distilledLock = next.catch(() => {});
+  return next;
+}
+
+// tracked: [{ source, id, messageCount? , totalChars? }]
+function recordDistilled(tracked, { runId, agent, suggestions }) {
+  const date = localToday();
+  return updateDistilled(d => {
+    for (const t of tracked) {
+      const key = `${t.source}:${t.id}`;
+      const run = { date, runId, agent, suggestions, runItems: tracked.length,
+        ...(t.messageCount !== undefined ? { messageCount: t.messageCount } : {}),
+        ...(t.totalChars   !== undefined ? { totalChars:   t.totalChars }   : {}) };
+      const prev = d.items[key];
+      d.items[key] = { source: t.source, id: t.id, ...run, runs: [...(prev?.runs || []), run] };
+    }
+  });
+}
+
+// A recheck moves more of a run's suggestions to the inbox; add them to that run's records.
+function addRecheckSuggestions(runId, n) {
+  if (!n) return Promise.resolve();
+  return updateDistilled(d => {
+    for (const rec of Object.values(d.items)) {
+      const run = (rec.runs || []).find(r => r.runId === runId);
+      if (!run) continue;
+      run.suggestions += n;
+      if (rec.runId === runId) rec.suggestions = run.suggestions;
+    }
+  });
+}
+
+async function readIndex(dir) {
+  try { return JSON.parse(await readFile(join(dir, 'index.json'), 'utf8')); } catch { return []; }
+}
+
 async function runDistillPipeline(state, agent, files) {
   const stagDir    = join(STAGING_BASE, state.runId);
   const inputLabel = files.map(f => f.name).join(', ');
@@ -840,6 +900,10 @@ async function runDistillPipeline(state, agent, files) {
       (dropped.length ? `, ${dropped.length} dropped by checker` : '');
     await appendDistillLog(`${agent} | ${inputLabel} | OK: ${inboxed.length} → inbox (${inboxed.join(', ')})` +
       (dropped.length ? ` | DROPPED: ${fmtDropped(dropped)}` : ''));
+    if (state.tracked?.length) {
+      await recordDistilled(state.tracked, { runId: state.runId, agent, suggestions: inboxed.length })
+        .catch(e => appendDistillLog(`${agent} | ${state.runId} | WARN: could not record distilled items: ${e.message}`));
+    }
 
   } catch (e) {
     state.status  = 'failed';
@@ -874,14 +938,22 @@ app.post('/api/distill/import', async (req, res) => {
   if (!agent) return res.status(400).json({ error: 'agent required' });
 
   const files = [];
+  const tracked = []; // recorded in distilled.json if the run succeeds
   const convDir = getConvDir();
   const memDir  = getMemDir();
+
+  // messageCount at distill time, so a later export with more messages can be flagged
+  const counts = async dir => new Map((await readIndex(dir)).map(c => [c.uuid, c.messageCount]));
+  const [claudeCounts, chatgptCounts, geminiCounts] = await Promise.all(
+    [convDir, getChatgptConvDir(), getGeminiConvDir()].map(counts));
+  const track = (source, id, map) => tracked.push({ source, id, messageCount: map.get(id) ?? null });
 
   for (const uuid of conversationUuids) {
     if (!/^[0-9a-f-]{8,}$/i.test(uuid)) continue;
     try {
       const content = await readFile(join(convDir, `${uuid}.txt`), 'utf8');
       files.push({ name: `conv-${uuid.slice(0, 8)}.txt`, content });
+      track('claude', uuid, claudeCounts);
     } catch { /* skip missing */ }
   }
 
@@ -891,6 +963,7 @@ app.post('/api/distill/import', async (req, res) => {
     try {
       const content = await readFile(join(chatgptDir, `${id}.txt`), 'utf8');
       files.push({ name: `chatgpt-${id.slice(0, 8)}.txt`, content });
+      track('chatgpt', id, chatgptCounts);
     } catch { /* skip missing */ }
   }
 
@@ -900,6 +973,7 @@ app.post('/api/distill/import', async (req, res) => {
     try {
       const content = await readFile(join(geminiDir, `${id}.txt`), 'utf8');
       files.push({ name: `${id.slice(0, 15)}.txt`, content });
+      track('gemini', id, geminiCounts);
     } catch { /* skip missing */ }
   }
 
@@ -926,6 +1000,10 @@ app.post('/api/distill/import', async (req, res) => {
       }
     }
     await walkMemFiles(join(memDir, 'memory_files'));
+    // Claude memories are one item; totalChars flags a later export with changed memories.
+    if (files.some(f => f.name.startsWith('memory-') || f.name.startsWith('memfile-'))) {
+      tracked.push({ source: 'memories', id: 'claude-memories', totalChars: (await memStatsFromDisk()).totalChars });
+    }
   }
 
   if (files.length === 0) return res.status(400).json({ error: 'No import content found — parse first' });
@@ -933,12 +1011,17 @@ app.post('/api/distill/import', async (req, res) => {
   const runId = makeRunId();
   const state = {
     runId, status: 'pending', message: 'Preparing…',
-    result: null, agent, inputNames: files.map(f => f.name),
+    result: null, agent, inputNames: files.map(f => f.name), tracked,
     startedAt: new Date().toISOString(),
   };
   runStore.set(runId, state);
   res.json({ runId });
   runDistillPipeline(state, agent, files).catch(() => {});
+});
+
+// Distilled records, keyed "<source>:<id>" (source: claude | chatgpt | gemini | memories)
+app.get('/api/import/distilled', async (_req, res) => {
+  res.json((await loadDistilled()).items);
 });
 
 // Re-run the checker on a kept staging folder (no agent call) and move valid files to the inbox.
@@ -955,6 +1038,7 @@ app.post('/api/distill/recheck/:runId', async (req, res) => {
     else for (const f of accepted) await rm(join(outDir, f), { force: true }); // don't re-inbox on a second recheck
     await appendDistillLog(`recheck | ${runId} | OK: ${inboxed.length} → inbox (${inboxed.join(', ')})` +
       (dropped.length ? ` | DROPPED: ${fmtDropped(dropped)}` : ''));
+    await addRecheckSuggestions(runId, inboxed.length).catch(() => {});
     res.json({ inboxed, dropped });
   } catch (e) {
     res.status(500).json({ error: e.message });
