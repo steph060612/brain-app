@@ -1,4 +1,4 @@
-// Import panel: parse Claude and ChatGPT exports, select conversations/memories, send to distiller.
+// Import panel: parse Claude, ChatGPT and Gemini exports, select conversations/memories, send to distiller.
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let backdropEl = null;
@@ -20,6 +20,10 @@ const SOURCES = {
   },
   chatgpt: {
     label: 'ChatGPT Conversations', resultKey: 'chatgpt', indexUrl: '/api/import/chatgpt-index',
+    index: [], search: '', sort: 'newest', checked: new Set(),
+  },
+  gemini: {
+    label: 'Gemini Conversations', resultKey: 'gemini', indexUrl: '/api/import/gemini-index',
     index: [], search: '', sort: 'newest', checked: new Set(),
   },
 };
@@ -137,6 +141,8 @@ function renderMain() {
     body.appendChild(div('height:1px; background:rgba(100,120,200,0.12); margin:16px 0;'));
     renderConversationsSection(body, 'chatgpt');
     body.appendChild(div('height:1px; background:rgba(100,120,200,0.12); margin:16px 0;'));
+    renderConversationsSection(body, 'gemini');
+    body.appendChild(div('height:1px; background:rgba(100,120,200,0.12); margin:16px 0;'));
     renderMemoriesSection(body);
   }
 }
@@ -158,7 +164,7 @@ function renderParseSection(parent) {
     statusBadge.style.cssText += 'background:rgba(159,216,255,0.15); color:#9FD8FF;';
   } else if (parseStatus.status === 'done') {
     const r = parseStatus.result;
-    const parsed = (r.conversations?.parsed ?? 0) + (r.chatgpt?.parsed ?? 0);
+    const parsed = (r.conversations?.parsed ?? 0) + (r.chatgpt?.parsed ?? 0) + (r.gemini?.parsed ?? 0);
     statusBadge.textContent = `${parsed} conversations parsed`;
     statusBadge.style.cssText += 'background:rgba(111,227,208,0.12); color:#6FE3D0;';
   } else if (parseStatus.status === 'failed') {
@@ -173,6 +179,8 @@ function renderParseSection(parent) {
   wrap.appendChild(desc);
   wrap.appendChild(el('div', 'font-size:12px; color:#5a6890; margin-bottom:6px;',
     '~/brain-exports/ChatGPT_Data-Export/ — ChatGPT conversation export'));
+  wrap.appendChild(el('div', 'font-size:12px; color:#5a6890; margin-bottom:6px;',
+    '~/brain-exports/gemini/ — Google Takeout Gemini Apps activity'));
   wrap.appendChild(div('margin-bottom:4px;'));
 
   if (parseStatus.status === 'failed' && parseStatus.error) {
@@ -235,7 +243,12 @@ function renderConversationsSection(parent, key) {
     return;
   }
   const skipped = result?.skipped ?? 0;
-  if (skipped > 0) {
+  if (skipped > 0 && key === 'gemini') {
+    // Gemini skips individual activity entries, not conversations.
+    const reasons = Object.entries(result.skippedReasons || {}).map(([r, n]) => `${r} (${n})`).join(', ');
+    wrap.appendChild(el('div', 'font-size:12px; color:#5a6890; margin-bottom:10px;',
+      `${skipped} activit${skipped !== 1 ? 'y entries were' : 'y entry was'} skipped${reasons ? `: ${reasons}` : ''}.`));
+  } else if (skipped > 0) {
     wrap.appendChild(el('div', 'font-size:12px; color:#5a6890; margin-bottom:10px;',
       `${skipped} conversation${skipped !== 1 ? 's' : ''} were empty in the export and were skipped.`));
   }
@@ -409,7 +422,7 @@ function updateFooter() {
     selected[key] = src.index.filter(c => src.checked.has(c.uuid));
     convCalls += selected[key].reduce((s, c) => s + c.distillCalls, 0);
   }
-  const selectedCount  = selected.claude.length + selected.chatgpt.length;
+  const selectedCount  = selected.claude.length + selected.chatgpt.length + selected.gemini.length;
   const memCalls       = memChecked ? (parseStatus.result?.memories?.totalDistillCalls || 0) : 0;
   const totalCalls     = convCalls + memCalls;
   const hasSelection   = selectedCount > 0 || memChecked;
@@ -418,6 +431,7 @@ function updateFooter() {
   const parts = [];
   if (selected.claude.length > 0)  parts.push(`${selected.claude.length} Claude conversation${selected.claude.length !== 1 ? 's' : ''}`);
   if (selected.chatgpt.length > 0) parts.push(`${selected.chatgpt.length} ChatGPT conversation${selected.chatgpt.length !== 1 ? 's' : ''}`);
+  if (selected.gemini.length > 0)  parts.push(`${selected.gemini.length} Gemini conversation${selected.gemini.length !== 1 ? 's' : ''}`);
   if (memChecked) parts.push('memories');
   if (parts.length > 0) parts.push(`→ ~${totalCalls} distill call${totalCalls !== 1 ? 's' : ''}`);
 
@@ -450,13 +464,13 @@ function updateFooter() {
   if (!hasSelection) { runBtn.disabled = true; runBtn.style.opacity = '0.4'; }
   runBtn.addEventListener('click', () => {
     const agent = cardEl.querySelector('input[name="import-agent"]:checked')?.value || selectedAgent;
-    startRun(agent, selected.claude.map(c => c.uuid), selected.chatgpt.map(c => c.uuid), memChecked);
+    startRun(agent, selected.claude.map(c => c.uuid), selected.chatgpt.map(c => c.uuid), selected.gemini.map(c => c.uuid), memChecked);
   });
   footerEl.appendChild(runBtn);
 }
 
 // ─── RUN ──────────────────────────────────────────────────────────────────────
-async function startRun(agent, uuids, chatgptIds, includeMemories) {
+async function startRun(agent, uuids, chatgptIds, geminiIds, includeMemories) {
   renderRunning(`Starting ${agent === 'claude' ? 'Claude' : 'Gemini'}…`);
 
   let runId;
@@ -464,7 +478,7 @@ async function startRun(agent, uuids, chatgptIds, includeMemories) {
     const r = await fetch('/api/distill/import', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agent, conversationUuids: uuids, chatgptIds, includeMemories }),
+      body: JSON.stringify({ agent, conversationUuids: uuids, chatgptIds, geminiIds, includeMemories }),
     });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);

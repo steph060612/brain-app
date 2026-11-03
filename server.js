@@ -10,6 +10,7 @@ import { promisify } from 'util';
 import { homedir } from 'os';
 import { parseConversations, parseMemories, getConvDir, getMemDir, CHARS_PER_CALL } from './src/claude-parser.js';
 import { parseConversations as parseChatgptConversations, getConvDir as getChatgptConvDir } from './src/chatgpt-parser.js';
+import { parseConversations as parseGeminiConversations, getConvDir as getGeminiConvDir } from './src/gemini-parser.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -765,9 +766,9 @@ app.post('/api/distill/run', async (req, res) => {
 });
 
 // Start a distill run from parsed import items.
-// Body: { agent, conversationUuids?: string[], chatgptIds?: string[], includeMemories?: bool }
+// Body: { agent, conversationUuids?: string[], chatgptIds?: string[], geminiIds?: string[], includeMemories?: bool }
 app.post('/api/distill/import', async (req, res) => {
-  const { agent, conversationUuids = [], chatgptIds = [], includeMemories = false } = req.body;
+  const { agent, conversationUuids = [], chatgptIds = [], geminiIds = [], includeMemories = false } = req.body;
   if (!agent) return res.status(400).json({ error: 'agent required' });
 
   const files = [];
@@ -788,6 +789,15 @@ app.post('/api/distill/import', async (req, res) => {
     try {
       const content = await readFile(join(chatgptDir, `${id}.txt`), 'utf8');
       files.push({ name: `chatgpt-${id.slice(0, 8)}.txt`, content });
+    } catch { /* skip missing */ }
+  }
+
+  const geminiDir = getGeminiConvDir();
+  for (const id of geminiIds) {
+    if (!/^gemini-[0-9a-f]{8,}$/i.test(id)) continue;
+    try {
+      const content = await readFile(join(geminiDir, `${id}.txt`), 'utf8');
+      files.push({ name: `${id.slice(0, 15)}.txt`, content });
     } catch { /* skip missing */ }
   }
 
@@ -901,23 +911,33 @@ async function memStatsFromDisk() {
 async function restoreParseState() {
   try {
     const saved = JSON.parse(await readFile(PARSE_STATE_FILE, 'utf8'));
-    if (saved?.status === 'done') { importParseState = saved; return; }
+    if (saved?.status === 'done') {
+      // A state saved before a source existed lacks its key; fill it from that source's index.json.
+      if (saved.result && !saved.result.gemini) {
+        const gemini = await statsFromIndex(getGeminiConvDir()).catch(() => null);
+        if (gemini) saved.result.gemini = gemini.stats;
+      }
+      importParseState = saved;
+      return;
+    }
   } catch { }
 
   const empty = { total: 0, parsed: 0, skipped: null, totalChars: 0, avgChars: 0, totalDistillCalls: 0 };
-  const [claude, chatgpt] = await Promise.all([
+  const [claude, chatgpt, gemini] = await Promise.all([
     statsFromIndex(getConvDir()).catch(() => null),
     statsFromIndex(getChatgptConvDir()).catch(() => null),
+    statsFromIndex(getGeminiConvDir()).catch(() => null),
   ]);
-  if (!claude && !chatgpt) return;
+  if (!claude && !chatgpt && !gemini) return;
 
-  const latest = new Date(Math.max(...[claude, chatgpt].filter(Boolean).map(x => x.mtime.getTime())));
+  const latest = new Date(Math.max(...[claude, chatgpt, gemini].filter(Boolean).map(x => x.mtime.getTime())));
   importParseState = {
     status: 'done', startedAt: null, finishedAt: latest.toISOString(), error: null,
     result: {
       conversations: claude?.stats  || empty,
       memories:      await memStatsFromDisk(),
       chatgpt:       chatgpt?.stats || empty,
+      gemini:        gemini?.stats  || empty,
     },
   };
 }
@@ -940,12 +960,12 @@ app.post('/api/import/parse', (_req, res) => {
 
   (async () => {
     try {
-      const result = await Promise.all([parseConversations(), parseMemories(), parseChatgptConversations()]);
+      const result = await Promise.all([parseConversations(), parseMemories(), parseChatgptConversations(), parseGeminiConversations()]);
       importParseState = {
         status: 'done',
         startedAt: importParseState.startedAt,
         finishedAt: new Date().toISOString(),
-        result: { conversations: result[0], memories: result[1], chatgpt: result[2] },
+        result: { conversations: result[0], memories: result[1], chatgpt: result[2], gemini: result[3] },
         error: null,
       };
       await writeFile(PARSE_STATE_FILE, JSON.stringify(importParseState, null, 2), 'utf8').catch(() => {});
@@ -976,6 +996,17 @@ app.get('/api/import/index', async (_req, res) => {
 app.get('/api/import/chatgpt-index', async (_req, res) => {
   try {
     const p = join(getChatgptConvDir(), 'index.json');
+    const data = JSON.parse(await readFile(p, 'utf8'));
+    res.json(data);
+  } catch {
+    res.status(404).json({ error: 'Not parsed yet — POST /api/import/parse first' });
+  }
+});
+
+// Return the parsed Gemini conversation index
+app.get('/api/import/gemini-index', async (_req, res) => {
+  try {
+    const p = join(getGeminiConvDir(), 'index.json');
     const data = JSON.parse(await readFile(p, 'utf8'));
     res.json(data);
   } catch {
