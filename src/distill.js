@@ -1,4 +1,6 @@
 // Distill runner: pick files, pick agent, run, show result.
+import { CONFIRM_ABOVE_CALLS, callEstimate, callsForFiles, cancelRun, fetchRuns, progressText } from './run-progress.js';
+
 // ─── STATE ───────────────────────────────────────────────────────────────────
 let backdropEl  = null;
 let cardEl      = null;
@@ -59,10 +61,13 @@ function createBackdrop() {
 }
 
 // ─── OPEN / CLOSE ────────────────────────────────────────────────────────────
-function openModal() {
+async function openModal() {
   stopPoll();
   backdropEl.style.display = 'flex';
-  renderIdle(null, []);
+  // Closing the window doesn't stop a run, so come back to it and to its Cancel button.
+  const active = (await fetchRuns().catch(() => null))?.active;
+  if (active) watchRun(active.runId);
+  else renderIdle(null, []);
 }
 
 function closeModal() {
@@ -150,19 +155,60 @@ function renderIdle(selectedAgent, selectedFiles) {
   }
 }
 
-function renderRunning(message) {
-  cardEl.innerHTML = '';
+function cardHeader() {
   const hdr = row('space-between', 'align-items:center; margin-bottom:20px;');
   hdr.appendChild(el('div', 'font-size:16px; font-weight:700; color:#fff;', 'Distill to Inbox'));
   const close = el('button', 'background:none; border:none; color:#8090b0; font-size:18px; cursor:pointer; padding:0 4px;', '✕');
   close.addEventListener('click', closeModal);
   hdr.appendChild(close);
-  cardEl.appendChild(hdr);
+  return hdr;
+}
 
-  const spinner = el('div', 'font-size:13px; color:#9FD8FF; margin-bottom:8px;', '⏳ ' + message);
-  cardEl.appendChild(spinner);
-  const hint = el('div', 'font-size:11px; color:#5a6890;', 'Each call has a 5-minute limit. A run has no total limit.');
-  cardEl.appendChild(hint);
+let runningLine = null;
+
+function renderRunning(message, runId) {
+  cardEl.innerHTML = '';
+  cardEl.appendChild(cardHeader());
+
+  runningLine = el('div', 'font-size:13px; color:#9FD8FF; margin-bottom:8px;', '⏳ ' + message);
+  cardEl.appendChild(runningLine);
+  cardEl.appendChild(el('div', 'font-size:11px; color:#5a6890;',
+    'Each call has a 5-minute limit. You can close this window; the run continues.'));
+
+  if (runId) {
+    const cancel = mkBtn('Cancel', '#e0a050', 'rgba(224,160,80,0.1)', 'rgba(224,160,80,0.4)');
+    cancel.style.cssText += 'margin-top:16px; width:100%; padding:7px 0; font-size:13px;';
+    cancel.addEventListener('click', async () => {
+      cancel.disabled = true;
+      cancel.style.opacity = '0.5';
+      cancel.textContent = 'Cancelling…';
+      await cancelRun(runId);
+    });
+    cardEl.appendChild(cancel);
+  }
+}
+
+async function confirmCalls(calls, onConfirm, onBack) {
+  if (calls <= CONFIRM_ABOVE_CALLS) { onConfirm(); return; }
+  const { estimate, basis } = await callEstimate(calls);
+
+  cardEl.innerHTML = '';
+  cardEl.appendChild(cardHeader());
+  cardEl.appendChild(el('div', 'font-size:14px; color:#fff; margin-bottom:8px;', `This needs ${calls} calls.`));
+  cardEl.appendChild(el('div', 'font-size:13px; color:#c8d0e8; margin-bottom:4px;', `Estimated time: about ${estimate}.`));
+  cardEl.appendChild(el('div', 'font-size:11px; color:#5a6890; margin-bottom:16px;',
+    `Estimate ${basis}. You can cancel at any time, keep what finished, and resume later.`));
+
+  const btns = row('flex-start', 'gap:10px;');
+  const go = mkBtn('Start', '#9FD8FF', 'rgba(60,108,255,0.2)', 'rgba(60,108,255,0.5)');
+  go.style.cssText += 'flex:1; padding:8px 0;';
+  go.addEventListener('click', onConfirm);
+  const back = mkBtn('Back', '#8090b0', 'none', 'rgba(100,120,200,0.22)');
+  back.style.cssText += 'flex:1; padding:8px 0;';
+  back.addEventListener('click', onBack);
+  btns.appendChild(go);
+  btns.appendChild(back);
+  cardEl.appendChild(btns);
 }
 
 function renderResult(state) {
@@ -191,9 +237,16 @@ function renderResult(state) {
   } else {
     const fail = el('div', 'font-size:13px; color:#c0503a; margin-bottom:14px;', '✗ ' + state.message);
     cardEl.appendChild(fail);
-    const hint = el('div', 'font-size:11px; color:#5a6890;',
-      state.status === 'stopped' ? 'Open Import to resume the remaining chunks.' : 'Staging folder kept for inspection.');
-    cardEl.appendChild(hint);
+    if (state.result?.remaining > 0) {
+      const resume = mkBtn('Resume', '#9FD8FF', 'rgba(60,108,255,0.2)', 'rgba(60,108,255,0.5)');
+      resume.style.cssText += 'width:100%; padding:7px 0; font-size:13px;';
+      resume.addEventListener('click', () => confirmCalls(state.result.remaining,
+        () => postRun(`/api/distill/resume/${state.runId}`, {}, 'Resuming…'), () => renderResult(state)));
+      cardEl.appendChild(resume);
+    } else {
+      cardEl.appendChild(el('div', 'font-size:11px; color:#5a6890;',
+        state.status === 'stopped' ? 'Open Import to resume the remaining chunks.' : 'Staging folder kept for inspection.'));
+    }
   }
 
   const again = mkBtn('Run again', '#9FD8FF', 'rgba(60,108,255,0.15)', 'rgba(60,108,255,0.4)');
@@ -214,25 +267,31 @@ async function startRun(agent, fileObjects) {
     return;
   }
 
-  renderRunning(`Starting ${agent === 'claude' ? 'Claude' : 'Gemini'}…`);
+  await confirmCalls(callsForFiles(files),
+    () => postRun('/api/distill/run', { agent, files }, `Starting ${agent === 'claude' ? 'Claude' : 'Gemini'}…`),
+    () => renderIdle(agent, fileObjects));
+}
 
-  let runId;
+async function postRun(url, body, startingLabel) {
+  renderRunning(startingLabel);
   try {
-    const r = await fetch('/api/distill/run', {
+    const r = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agent, files }),
+      body: JSON.stringify(body),
     });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
-    runId = d.runId;
+    watchRun(d.runId);
   } catch (e) {
     renderResult({ status: 'failed', message: `Failed to start: ${e.message}` });
-    return;
   }
+}
 
-  // Poll every 3 seconds
-  pollTimer = setInterval(async () => {
+function watchRun(runId) {
+  stopPoll();
+  renderRunning('Working…', runId);
+  const poll = async () => {
     try {
       const r = await fetch(`/api/distill/status/${runId}`);
       if (r.status === 404) {
@@ -243,13 +302,15 @@ async function startRun(agent, fileObjects) {
       if (!r.ok) return;
       const state = await r.json();
       if (state.status === 'running' || state.status === 'pending') {
-        renderRunning(state.message || 'Working…');
+        if (runningLine) runningLine.textContent = '⏳ ' + progressText(state);
       } else {
         stopPoll();
         renderResult(state);
       }
     } catch { /* transient — keep polling */ }
-  }, 3000);
+  };
+  poll();
+  pollTimer = setInterval(poll, 1000);
 }
 
 function readFileAsText(file) {

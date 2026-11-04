@@ -1,4 +1,5 @@
 // Import panel: parse Claude, ChatGPT and Gemini exports, select conversations/memories, send to distiller.
+import { CONFIRM_ABOVE_CALLS, callEstimate, cancelRun, progressText } from './run-progress.js';
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let backdropEl = null;
@@ -9,8 +10,6 @@ let parseStatus = { status: 'idle' };
 let pollTimer   = null;
 let parsePoll   = null;
 let runsInfo    = { active: null, stopped: [], avgCallMs: 90000, callSamples: 0 };
-
-const CONFIRM_ABOVE_CALLS = 10;
 
 // Conversation sources. index: [{uuid, title, created, updated, messageCount, charCount, distillCalls}]
 const SOURCES = {
@@ -561,20 +560,10 @@ function updateFooter() {
 // ─── RUN ──────────────────────────────────────────────────────────────────────
 const agentName = agent => agent === 'claude' ? 'Claude' : 'Gemini';
 
-function fmtDuration(ms) {
-  const totalSec = Math.round(ms / 1000);
-  const h = Math.floor(totalSec / 3600), m = Math.floor(totalSec / 60) % 60, s = totalSec % 60;
-  return h ? `${h}h ${m}m` : m ? `${m}m ${s}s` : `${s}s`;
-}
-
 // Runs above CONFIRM_ABOVE_CALLS spend real usage and take a while, so ask first.
 async function confirmCalls(calls, onConfirm, onBack) {
   if (calls <= CONFIRM_ABOVE_CALLS) { onConfirm(); return; }
-  await refreshRuns();
-  const estimate = fmtDuration(calls * runsInfo.avgCallMs);
-  const basis = runsInfo.callSamples
-    ? `from the average of your last ${runsInfo.callSamples} call${runsInfo.callSamples !== 1 ? 's' : ''}`
-    : 'a rough guess of 90 seconds per call, until there are real timings';
+  const { estimate, basis } = await callEstimate(calls);
 
   cardEl.innerHTML = '';
   cardEl.appendChild(modalHeader());
@@ -672,7 +661,7 @@ function renderRunning({ message, runId }) {
       cancel.disabled = true;
       cancel.style.opacity = '0.5';
       cancel.textContent = 'Cancelling…';
-      await fetch(`/api/distill/cancel/${runId}`, { method: 'POST' }).catch(() => {});
+      await cancelRun(runId);
     });
     body.appendChild(cancel);
   }
@@ -682,10 +671,7 @@ function renderRunning({ message, runId }) {
 // In place, so the Cancel button isn't rebuilt under the pointer on every poll.
 function updateRunning(state) {
   if (!runningLine) return;
-  const elapsed = fmtDuration(Date.now() - new Date(state.startedAt).getTime());
-  runningLine.textContent = state.callNumber && state.message !== 'Cancelling…'
-    ? `⏳ Call ${state.callNumber} of ${state.totalCalls}, ${elapsed} elapsed`
-    : `⏳ ${state.message || 'Working…'} (${elapsed} elapsed)`;
+  runningLine.textContent = '⏳ ' + progressText(state);
 }
 
 function renderResult(state) {

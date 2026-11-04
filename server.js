@@ -241,6 +241,15 @@ async function appendDistillLog(line) {
   } catch { /* non-fatal */ }
 }
 
+// What a failed agent said, for the log and the window. claude can report errors on stdout and leave
+// stderr empty, but stdout can also be a partial reply, so only a short text with no suggestions is used.
+function errorOutput(stderr, stdout) {
+  const err = stderr.trim(), out = stdout.trim();
+  if (err) return err.slice(0, 400);
+  if (!out) return '';
+  return out.length <= 400 && !/===[ \t]*SUGGESTION[ \t]*===/.test(out) ? out : `stdout withheld, ${out.length} characters`;
+}
+
 // Run one agent process; resolves with stdout. Any exit other than 0, including being killed, rejects.
 function runAgentProcess(label, cmd, args, { stdin, onAbort } = {}) {
   return new Promise((resolve, reject) => {
@@ -248,8 +257,11 @@ function runAgentProcess(label, cmd, args, { stdin, onAbort } = {}) {
       stdio: [stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       env: { ...process.env, PATH: AGENT_PATH },
     });
-    // Rejects at once: a leftover child process can hold stdout open long after the kill.
-    const abort = message => { child.kill('SIGKILL'); reject(new Error(message)); };
+    // Kills the agent and any process it started. Rejects at once: a leftover child can hold stdout open.
+    const abort = (message, exit) => {
+      execFile('pkill', ['-KILL', '-P', String(child.pid)], () => child.kill('SIGKILL'));
+      reject(Object.assign(new Error(message), { exit }));
+    };
     onAbort?.(abort);
     if (stdin !== undefined) {
       child.stdin.on('error', () => {}); // a killed child closes the pipe mid-write
@@ -260,13 +272,13 @@ function runAgentProcess(label, cmd, args, { stdin, onAbort } = {}) {
     child.stdout.on('data', d => { stdout += d; });
     child.stderr.on('data', d => { stderr += d; });
 
-    const timer = setTimeout(() => abort(`${label} timed out after 5 minutes`), CALL_TIMEOUT_MS);
+    const timer = setTimeout(() => abort(`${label} timed out after 5 minutes`, 'timeout'), CALL_TIMEOUT_MS);
     child.on('close', (code, signal) => {
       clearTimeout(timer);
       if (code === 0) return resolve(stdout);
-      // claude can report errors on stdout and leave stderr empty
-      const detail = (stderr.trim() || stdout.trim()).slice(0, 400);
-      reject(new Error(`${cmd} ${signal ? `killed by ${signal}` : `exited ${code}`}${detail ? `: ${detail}` : ''}`));
+      const exit = signal || code;
+      const detail = errorOutput(stderr, stdout);
+      reject(Object.assign(new Error(`${cmd} ${signal ? `killed by ${signal}` : `exited ${code}`}${detail ? `: ${detail}` : ''}`), { exit }));
     });
     child.on('error', e => { clearTimeout(timer); reject(e); });
   });
@@ -994,7 +1006,8 @@ async function executeRun(state, run) {
       state.status = 'running';
       state.callNumber = i + 1;
       state.message = `Call ${i + 1} of ${chunks.length}`;
-      const callLabel = `${run.agent} | ${run.runId} | call ${i + 1}/${chunks.length}`;
+      const callLabel = `${run.agent} | ${run.runId} | chunk ${i + 1}/${chunks.length}`;
+      const seconds = ms => `${Math.round(ms / 1000)}s`;
 
       const preBrain = await fileChecksums(BRAIN, '.git');
       const started  = Date.now();
@@ -1002,7 +1015,7 @@ async function executeRun(state, run) {
       try {
         reply = await runAgent(header + earlierSection(earlier) + '=== INPUT ===\n' + chunks[i], abort => { agentRun.abort = abort; });
       } catch (e) {
-        await appendDistillLog(`${callLabel} | ${Math.round((Date.now() - started) / 1000)}s | FAIL: ${e.message}`);
+        await appendDistillLog(`${callLabel} | ${seconds(Date.now() - started)} | exit ${e.exit ?? 'none'} | FAIL: ${e.message}`);
         return await stopRun(state, run, agentRun.cancelled ? 'Cancelled.' : `Call ${i + 1} failed: ${e.message}.`);
       } finally {
         agentRun.abort = null;
@@ -1013,14 +1026,14 @@ async function executeRun(state, run) {
       const changed = brainDiff(preBrain, await fileChecksums(BRAIN, '.git'));
       if (changed.length > 0) {
         const reason = `~/Brain changed during call ${i + 1}: ${changed.join('; ')}.`;
-        await appendDistillLog(`${callLabel} | FAIL: ${reason}`);
+        await appendDistillLog(`${callLabel} | ${seconds(durationMs)} | exit 0 | FAIL: ${reason}`);
         return await stopRun(state, run, reason);
       }
 
       const contractError = checkReplyContract(reply);
       if (contractError) {
         await writeFile(join(stagDir, 'replies', `chunk-${i + 1}.rejected.txt`), reply, 'utf8');
-        await appendDistillLog(`${callLabel} | FAIL: ${contractError}`);
+        await appendDistillLog(`${callLabel} | ${seconds(durationMs)} | exit 0 | FAIL: ${contractError}`);
         return await stopRun(state, run, `Call ${i + 1} failed: ${contractError}.`);
       }
 
@@ -1031,7 +1044,7 @@ async function executeRun(state, run) {
       await saveRun(run);
       if (reply.trim()) earlier += reply.trim() + '\n\n';
       await noteCallDuration(durationMs);
-      await appendDistillLog(`${callLabel} | ${Math.round(durationMs / 1000)}s | ${countOf(suggestions, 'suggestion')}`);
+      await appendDistillLog(`${callLabel} | ${seconds(durationMs)} | exit 0 | ${countOf(suggestions, 'suggestion')}`);
     }
 
     await finishRun(state, run);
@@ -1242,7 +1255,7 @@ app.get('/api/distill/runs', async (_req, res) => {
 app.post('/api/distill/cancel/:runId', (req, res) => {
   if (activeRun?.runId !== req.params.runId) return res.status(409).json({ error: 'Run is not in progress' });
   activeRun.cancelled = true;
-  activeRun.abort?.('Cancelled');
+  activeRun.abort?.('Cancelled', 'cancelled');
   const state = runStore.get(req.params.runId);
   if (state) state.message = 'Cancelling…';
   res.json({ ok: true });
