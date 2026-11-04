@@ -38,10 +38,12 @@ const unwrap = s => s.trim().replace(/^(\*\*|__)(.*)\1$/, '$2').trim()
   .replace(/^\[(.*)\]$/, '$1').replace(/^`(.*)`$/, '$1').trim();
 
 // Split pasted text into raw blocks. A block starts at a FILE line and its content ends at the next
-// FILE line or at a closing code fence. Text outside blocks is ignored; stray ACTION lines are errors.
+// FILE line or at a closing code fence. Text outside blocks is returned as remainder (free prose that can
+// be converted separately); code fence lines are dropped from it; stray ACTION lines are errors.
 export function splitBlocks(text) {
   const lines = String(text || '').replace(/\r\n?/g, '\n').split('\n');
   const blocks = [], errors = [];
+  const outside = new Set(); // line indexes outside any block
   let cur = null;
   const close = () => { if (cur) { blocks.push(cur); cur = null; } };
 
@@ -50,6 +52,7 @@ export function splitBlocks(text) {
     if (fm) { close(); cur = { line: i + 1, file: unwrap(fm.value), action: null, content: [] }; return; }
     if (!cur) {
       if (actionLine(line)) errors.push({ line: i + 1, file: null, reason: 'ACTION line without a FILE line before it' });
+      else outside.add(i);
       return;
     }
     if (cur.action === null) {
@@ -62,17 +65,23 @@ export function splitBlocks(text) {
     }
     if (actionLine(line)) cur.extraAction = true; // one action per FILE block
     cur.content.push(line);
+    (cur.lineIndexes ??= new Map()).set(cur.content.length - 1, i);
   });
   close();
 
   // A bare closing fence ends the content; anything after it is outside the block.
   for (const b of blocks) {
     const at = b.content.findIndex(l => /^[ \t]*(```|~~~)[ \t]*$/.test(l));
-    if (at >= 0) b.content = b.content.slice(0, at);
+    if (at >= 0) {
+      for (let c = at + 1; c < b.content.length; c++) outside.add(b.lineIndexes.get(c));
+      b.content = b.content.slice(0, at);
+    }
     while (b.content.length && !b.content[0].trim()) b.content.shift();
     while (b.content.length && !b.content.at(-1).trim()) b.content.pop();
   }
-  return { blocks, errors };
+  const remainder = [...outside].sort((a, b) => a - b).map(i => lines[i])
+    .filter(l => !/^[ \t]*(```|~~~)/.test(l)).join('\n').trim();
+  return { blocks, errors, remainder };
 }
 
 // Parse "replace-section ## Heading" etc. → { action, section }
@@ -157,17 +166,16 @@ export function normalizeBlock(b, { isAllowedTarget }) {
   return { file, action, content };
 }
 
-// Parse a whole paste → { proposals: [...], errors: [{ line, file, reason }] }
+// Parse a whole paste → { proposals: [...], errors: [{ line, file, reason }], remainder, noBlocks }
 export function parseProposals(text, opts) {
-  const { blocks, errors } = splitBlocks(text);
+  const { blocks, errors, remainder } = splitBlocks(text);
   const proposals = [];
   for (const b of blocks) {
     const p = normalizeBlock(b, opts);
     if (p.error) errors.push({ line: b.line, file: b.file || null, reason: p.error });
     else proposals.push({ ...p, line: b.line });
   }
-  if (!blocks.length && !errors.length) errors.push({ line: null, file: null, reason: 'no ### FILE blocks found' });
-  return { proposals, errors: errors.sort((a, b) => (a.line || 0) - (b.line || 0)) };
+  return { proposals, errors: errors.sort((a, b) => (a.line || 0) - (b.line || 0)), remainder, noBlocks: blocks.length === 0 };
 }
 
 // ── Inbox file format ─────────────────────────────────────────────────────────
@@ -176,10 +184,15 @@ export function parseProposals(text, opts) {
 
 const oneLine = s => String(s).replace(/[\r\n]+/g, ' ').trim();
 
-export function toInboxFile(p, today) {
+// Batch lines group the cards of one paste or conversion in the Inbox, in order.
+export function batchLines({ id, source, at }, order) {
+  return [`batch: ${id}`, `batch_source: ${source}`, `batch_at: ${at}`, `batch_order: ${order}`];
+}
+
+export function toInboxFile(p, today, batch, order) {
   const fm = [`title: ${p.action} ${p.file}`, `updated: ${today}`, `target: ${p.file}`, `action: ${p.action}`];
   if (p.section) fm.push(`section: ${oneLine(p.section)}`);
-  fm.push('source: pasted proposal');
+  fm.push('source: pasted proposal', ...batchLines(batch, order));
   let body;
   if (p.action === 'replace-line')      body = `=== OLD ===\n${p.old}\n=== NEW ===\n${p.new}`;
   else if (p.action === 'frontmatter')  body = p.fields.map(([k, v]) => `${k}: ${v}`).join('\n');

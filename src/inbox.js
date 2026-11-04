@@ -1,5 +1,6 @@
 // Inbox review panel: list, approve, edit, discard inbox .md files.
 import { saveFile } from './api.js';
+import { CONFIRM_ABOVE_CALLS, callEstimate, callsForFiles, cancelRun, progressText } from './run-progress.js';
 
 // ─── STATE ───────────────────────────────────────────────────────────────────
 let panelEl    = null;
@@ -7,6 +8,8 @@ let listEl     = null;
 let statusEl   = null;
 let countBadge = null;
 let inboxItems = [];
+const groupEls    = new Map(); // batch id → { el, titleEl, batch }
+const batchErrors = new Map(); // batch id → why Approve all stopped
 
 // ─── API ─────────────────────────────────────────────────────────────────────
 async function loadInbox() {
@@ -31,6 +34,17 @@ async function pasteProposals(text) {
     body:    JSON.stringify({ text }),
   });
   return { status: r.status, data: await r.json() };
+}
+
+async function approveBatch(items) {
+  const r = await fetch('/api/inbox/approve-batch', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ items: items.map(({ filename, inboxHash, targetHash }) => ({ filename, inboxHash, targetHash })) }),
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  return data;
 }
 
 async function discardInbox(filename) {
@@ -197,7 +211,117 @@ function renderList() {
     return;
   }
   listEl.innerHTML = '';
-  inboxItems.forEach(item => listEl.appendChild(renderCard(item, false)));
+  groupEls.clear();
+
+  const batches = new Map();
+  for (const item of inboxItems) {
+    if (item.batch && !batches.has(item.batch.id)) batches.set(item.batch.id, item.batch);
+  }
+  const newestFirst = (a, b) => (b.at || '').localeCompare(a.at || '');
+  for (const batch of [...batches.values()].sort(newestFirst)) listEl.appendChild(renderGroup(batch));
+  inboxItems.filter(i => !i.batch).forEach(item => listEl.appendChild(renderCard(item, false)));
+}
+
+const batchItems = id => inboxItems.filter(i => i.batch?.id === id).sort((a, b) => a.batch.order - b.batch.order);
+
+function batchTitle(batch, count) {
+  const d = batch.at ? new Date(batch.at) : null;
+  const day = d && d.toDateString() !== new Date().toDateString()
+    ? d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' : '';
+  const time = d ? d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false }) : '';
+  return `${batch.source}${d ? ` ${day}${time}` : ''}, ${count} suggestion${count !== 1 ? 's' : ''}`;
+}
+
+function renderGroup(batch) {
+  const group = document.createElement('div');
+  group.style.cssText = 'margin-bottom:18px;';
+
+  const header = document.createElement('div');
+  header.style.cssText = 'display:flex; align-items:center; gap:8px; margin-bottom:8px;';
+  const titleEl = textDiv('flex:1; font-size:12px; font-weight:600; color:#c8d0e8;', '');
+  const approveAll = mkBtn('Approve all', '#6FE3D0', 'rgba(111,227,208,0.12)', 'rgba(111,227,208,0.35)');
+  const discardAll = mkBtn('Discard all', '#c08090', 'rgba(192,80,58,0.08)', 'rgba(192,80,58,0.3)');
+  header.appendChild(titleEl);
+  header.appendChild(approveAll);
+  header.appendChild(discardAll);
+  group.appendChild(header);
+
+  const why = batchErrors.get(batch.id);
+  if (why) group.appendChild(textDiv('font-size:12px; color:#e08040; margin-bottom:8px; line-height:1.5;', why));
+
+  groupEls.set(batch.id, { el: group, titleEl, batch });
+  syncGroupTitle(batch.id);
+  for (const item of batchItems(batch.id)) group.appendChild(renderCard(item, false));
+
+  approveAll.addEventListener('click', () => approveAllInBatch(batch, approveAll));
+  discardAll.addEventListener('click', () => discardAllInBatch(batch, discardAll));
+  return group;
+}
+
+function syncGroupTitle(id) {
+  const g = groupEls.get(id);
+  if (g) g.titleEl.textContent = batchTitle(g.batch, batchItems(id).length);
+}
+
+// After a card leaves the list: update its group's count, or the list if nothing is left.
+function afterCardRemoved() {
+  updateCount(inboxItems.length);
+  if (inboxItems.length === 0) { renderList(); return; }
+  for (const [id, g] of groupEls) {
+    if (batchItems(id).length === 0) { g.el.remove(); groupEls.delete(id); batchErrors.delete(id); }
+    else syncGroupTitle(id);
+  }
+}
+
+async function reloadList() {
+  inboxItems = await loadInbox();
+  updateCount(inboxItems.length);
+  renderList();
+}
+
+async function approveAllInBatch(batch, btn) {
+  const items = batchItems(batch.id);
+  btn.disabled = true;
+  btn.textContent = '…';
+  setStatus(`Approving ${items.length}…`, '#8090b0');
+  try {
+    const { approved, failed } = await approveBatch(items);
+    batchErrors.delete(batch.id);
+    if (failed) {
+      const item = items.find(i => i.filename === failed.filename);
+      const left = items.length - approved.length;
+      batchErrors.set(batch.id, `Stopped at "${item?.title || failed.filename}": ${failed.error}. ` +
+        `${approved.length} approved, ${left} left in the Inbox.`);
+      setStatus(`Approved ${approved.length} of ${items.length}, then stopped.`, '#e08040');
+    } else {
+      setStatus(`Approved ${approved.length} suggestion${approved.length !== 1 ? 's' : ''}.`, '#6FE3D0');
+    }
+    await reloadList();
+  } catch (e) {
+    setStatus(`Approve all failed: ${e.message}`, '#c0503a');
+    btn.disabled = false;
+    btn.textContent = 'Approve all';
+  }
+}
+
+async function discardAllInBatch(batch, btn) {
+  const items = batchItems(batch.id);
+  if (!confirm(`Discard all ${items.length} suggestions in "${batchTitle(batch, items.length)}"? This cannot be undone.`)) return;
+  btn.disabled = true;
+  btn.textContent = '…';
+  let discarded = 0;
+  try {
+    for (const item of items) {
+      const { status } = await discardInbox(item.filename);
+      if (status !== 200) throw new Error(`could not discard "${item.title}"`);
+      discarded++;
+    }
+    batchErrors.delete(batch.id);
+    setStatus(`Discarded ${discarded} suggestion${discarded !== 1 ? 's' : ''}.`, '#8090b0');
+  } catch (e) {
+    setStatus(`Discarded ${discarded} of ${items.length}, then stopped: ${e.message}.`, '#c0503a');
+  }
+  await reloadList().catch(() => {});
 }
 
 function renderCard(item, editMode) {
@@ -285,9 +409,8 @@ function buildReadArea(card, item) {
       const { status, data } = await approveInbox(item.filename, item.inboxHash, item.targetHash);
       if (status === 200) {
         inboxItems = inboxItems.filter(x => x.filename !== item.filename);
-        updateCount(inboxItems.length);
         card.remove();
-        if (inboxItems.length === 0) renderList();
+        afterCardRemoved();
         const done = { 'replace-line': 'line replaced in', 'replace-section': 'section replaced in',
           frontmatter: 'frontmatter updated in', create: 'created' }[data.action] || 'appended to';
         setStatus(`Approved — ${done} ${item.target}.`, '#6FE3D0');
@@ -323,9 +446,8 @@ function buildReadArea(card, item) {
       const { status } = await discardInbox(item.filename);
       if (status === 200) {
         inboxItems = inboxItems.filter(x => x.filename !== item.filename);
-        updateCount(inboxItems.length);
         card.remove();
-        if (inboxItems.length === 0) renderList();
+        afterCardRemoved();
         setStatus('Discarded.', '#8090b0');
       } else {
         setStatus('Discard failed.', '#c0503a');
@@ -414,7 +536,7 @@ function renderPasteView() {
   listEl.innerHTML = '';
 
   listEl.appendChild(textDiv('font-size:12px; color:#8090b0; margin-bottom:8px; line-height:1.5;',
-    'Paste close-session output. Each FILE / ACTION block becomes an Inbox suggestion (with or without ###, bold labels are fine); nothing is written until you approve it.'));
+    'Paste close-session output. Each FILE / ACTION block becomes an Inbox suggestion (with or without ###, bold labels are fine); nothing is written until you approve it. Free text can be converted by an assistant.'));
 
   const textarea = document.createElement('textarea');
   textarea.placeholder = '### FILE: projects/…/state.md\n### ACTION: append\n- …';
@@ -450,7 +572,8 @@ function renderPasteView() {
         inboxItems = await loadInbox();
         updateCount(inboxItems.length);
       }
-      setStatus(`${data.created.length} suggestion${data.created.length !== 1 ? 's' : ''} added` +
+      if (data.noBlocks) setStatus('');
+      else setStatus(`${data.created.length} suggestion${data.created.length !== 1 ? 's' : ''} added` +
         (data.errors.length ? `, ${data.errors.length} block${data.errors.length !== 1 ? 's' : ''} not parsed.` : '.'),
         data.errors.length ? '#e08040' : '#6FE3D0');
     } catch (e) {
@@ -463,7 +586,7 @@ function renderPasteView() {
   textarea.focus();
 }
 
-function renderPasteResult(el, { created, errors }) {
+function renderPasteResult(el, { created, errors, remainder, noBlocks }) {
   el.innerHTML = '';
   if (errors.length) {
     el.appendChild(textDiv('font-size:12px; color:#e08040; margin-bottom:4px;', 'Not parsed (fix and paste again):'));
@@ -478,6 +601,126 @@ function renderPasteResult(el, { created, errors }) {
     view.addEventListener('click', openInboxPanel);
     el.appendChild(view);
   }
+  if (remainder) {
+    const convertEl = document.createElement('div');
+    convertEl.style.cssText = 'margin-top:14px;';
+    el.appendChild(convertEl);
+    renderConvertOffer(convertEl, remainder, noBlocks
+      ? 'No proposal blocks found. Convert with an assistant?'
+      : `${remainder.length.toLocaleString()} characters were outside any block. Convert them with an assistant?`);
+  }
+}
+
+// ─── CONVERT FREE TEXT ───────────────────────────────────────────────────────
+// A distill run on the pasted text; its suggestions arrive in the Inbox as one batch.
+async function renderConvertOffer(el, text, question) {
+  el.innerHTML = '';
+  el.appendChild(textDiv('font-size:12px; color:#c8d0e8; margin-bottom:8px;', question));
+
+  let agents = [], reasons = {};
+  try {
+    ({ agents = [], reasons = {} } = await (await fetch('/api/distill/agents')).json());
+  } catch { /* shown below */ }
+  if (agents.length === 0) {
+    el.appendChild(textDiv('font-size:12px; color:#c08050;',
+      `No assistant available. ${Object.entries(reasons).map(([k, v]) => `${k}: ${v}`).join(' | ')}`));
+    return;
+  }
+
+  let agent = agents[0];
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex; gap:12px; align-items:center;';
+  for (const a of agents) {
+    const lbl = document.createElement('label');
+    lbl.style.cssText = 'display:flex; align-items:center; gap:5px; cursor:pointer; font-size:12px; color:#c8d0e8;';
+    const inp = document.createElement('input');
+    inp.type = 'radio'; inp.name = 'convert-agent'; inp.value = a; inp.checked = a === agent;
+    inp.addEventListener('change', () => { if (inp.checked) agent = a; });
+    lbl.appendChild(inp);
+    lbl.appendChild(document.createTextNode(a.charAt(0).toUpperCase() + a.slice(1)));
+    row.appendChild(lbl);
+  }
+  const go = mkBtn('Convert', '#9FD8FF', 'rgba(60,108,255,0.25)', 'rgba(60,108,255,0.5)');
+  row.appendChild(go);
+  el.appendChild(row);
+
+  go.addEventListener('click', async () => {
+    const calls = callsForFiles([{ name: 'pasted-text.txt', content: text }]);
+    if (calls <= CONFIRM_ABOVE_CALLS) { startConvert(el, agent, text); return; }
+
+    const { estimate, basis } = await callEstimate(calls);
+    el.innerHTML = '';
+    el.appendChild(textDiv('font-size:13px; color:#ffffff; margin-bottom:6px;', `This needs ${calls} calls. Estimated time: about ${estimate}.`));
+    el.appendChild(textDiv('font-size:11px; color:#5a6890; margin-bottom:10px;', `Estimate ${basis}.`));
+    const start = mkBtn('Start', '#9FD8FF', 'rgba(60,108,255,0.25)', 'rgba(60,108,255,0.5)');
+    const back  = mkBtn('Back', '#8090b0', 'none', 'rgba(100,120,200,0.25)');
+    start.style.marginRight = '8px';
+    start.addEventListener('click', () => startConvert(el, agent, text));
+    back.addEventListener('click', () => renderConvertOffer(el, text, question));
+    el.appendChild(start);
+    el.appendChild(back);
+  });
+}
+
+async function startConvert(el, agent, text) {
+  el.innerHTML = '';
+  const line = textDiv('font-size:13px; color:#9FD8FF; margin-bottom:8px;', '⏳ Starting…');
+  el.appendChild(line);
+
+  let runId;
+  try {
+    const r = await fetch('/api/inbox/convert', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ agent, text }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+    runId = d.runId;
+  } catch (e) {
+    line.textContent = `Convert failed: ${e.message}`;
+    line.style.color = '#c0503a';
+    return;
+  }
+
+  const cancel = mkBtn('Cancel', '#e0a050', 'rgba(224,160,80,0.1)', 'rgba(224,160,80,0.4)');
+  cancel.addEventListener('click', async () => {
+    cancel.disabled = true;
+    cancel.textContent = 'Cancelling…';
+    await cancelRun(runId);
+  });
+  el.appendChild(cancel);
+
+  const finish = async (message, color, note) => {
+    clearInterval(poll);
+    cancel.remove();
+    line.textContent = message;
+    line.style.color = color;
+    if (note) el.appendChild(textDiv('font-size:11px; color:#5a6890; margin-bottom:8px;', note));
+    if (el.isConnected) {
+      inboxItems = await loadInbox().catch(() => inboxItems);
+      updateCount(inboxItems.length);
+      const view = mkBtn('Review in Inbox', '#6FE3D0', 'rgba(111,227,208,0.12)', 'rgba(111,227,208,0.35)');
+      view.addEventListener('click', openInboxPanel);
+      el.appendChild(view);
+    } else {
+      await openInboxPanel(); // the list is showing, and it just changed
+    }
+    setStatus(message, color);
+  };
+
+  const poll = setInterval(async () => {
+    try {
+      const r = await fetch(`/api/distill/status/${runId}`);
+      if (r.status === 404) { finish('The server restarted during the conversion.', '#e0a050', 'Open Import to resume it.'); return; }
+      if (!r.ok) return;
+      const state = await r.json();
+      if (state.status === 'running' || state.status === 'pending') line.textContent = '⏳ ' + progressText(state);
+      else if (state.status === 'done') finish(`✓ ${state.message}`, '#6FE3D0');
+      else if (state.status === 'stopped') finish(state.message, '#e0a050', 'Open Import to resume the remaining chunks.');
+      else finish(`✗ ${state.message}`, '#c0503a');
+    } catch { /* transient */ }
+  }, 1000);
 }
 
 function textDiv(css, text) {

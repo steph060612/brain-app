@@ -11,7 +11,7 @@ import { homedir } from 'os';
 import { parseConversations, parseMemories, getConvDir, getMemDir, CHARS_PER_CALL } from './src/claude-parser.js';
 import { parseConversations as parseChatgptConversations, getConvDir as getChatgptConvDir } from './src/chatgpt-parser.js';
 import { parseConversations as parseGeminiConversations, getConvDir as getGeminiConvDir } from './src/gemini-parser.js';
-import { parseProposals, toInboxFile, readInboxBody, applyProposal, ACTIONS } from './src/proposals.js';
+import { parseProposals, toInboxFile, batchLines, readInboxBody, applyProposal, ACTIONS } from './src/proposals.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -216,16 +216,20 @@ async function checkOutFiles(outDir) {
 }
 
 // Copy accepted out/ files into ~/Brain/inbox/ without overwriting existing items.
-async function moveToInbox(outDir, files) {
+// batch: { id, source, at }, whose cards are numbered from firstOrder (later calls of a run continue the count).
+async function moveToInbox(outDir, files, batch = null, firstOrder = 0) {
   await mkdir(join(BRAIN, 'inbox'), { recursive: true });
   const inboxed = [];
-  for (const f of files) {
+  for (const [i, f] of files.entries()) {
     let dest = join(BRAIN, 'inbox', f); let n = 0;
     while (true) {
       try { await stat(dest); n++; dest = join(BRAIN, 'inbox', `${basename(f, '.md')}-${n}.md`); }
       catch { break; }
     }
-    await writeFile(dest, await readFile(join(outDir, f), 'utf8'));
+    const content = await readFile(join(outDir, f), 'utf8');
+    await writeFile(dest, batch
+      ? content.replace(/^---\s*\n/, `---\n${batchLines(batch, firstOrder + i).join('\n')}\n`)
+      : content);
     inboxed.push(basename(dest));
   }
   return inboxed;
@@ -539,6 +543,7 @@ app.get('/api/inbox', async (_req, res) => {
         path: `inbox/${filename}`,
         title: fm.title || prettify(basename(filename, '.md')),
         target: fm.target || null,
+        batch: fm.batch ? { id: fm.batch, source: fm.batch_source || 'Pasted', at: fm.batch_at || null, order: Number(fm.batch_order) || 0 } : null,
         content,
         inboxHash: md5(content),
         targetHash,
@@ -551,97 +556,131 @@ app.get('/api/inbox', async (_req, res) => {
   }
 });
 
-// Approve: append bullet lines to target, update target's updated date, delete inbox file
-app.post('/api/inbox/approve', async (req, res) => {
-  try {
-    const { filename, inboxHash, targetHash } = req.body;
-    const inboxAbs = safeInbox(filename);
+// Approve one inbox item: append bullet lines to its target, update the target's updated date, delete the
+// inbox file. Returns { status, body }. seenTargets: targets this batch has already changed, whose hash is
+// expected to differ from the one the page loaded.
+async function approveItem({ filename, inboxHash, targetHash }, seenTargets) {
+  const inboxAbs = safeInbox(filename);
 
-    let inboxContent;
-    try { inboxContent = await readFile(inboxAbs, 'utf8'); }
-    catch { return res.status(404).json({ error: 'Inbox file not found' }); }
+  let inboxContent;
+  try { inboxContent = await readFile(inboxAbs, 'utf8'); }
+  catch { return { status: 404, body: { error: 'Inbox file not found' } }; }
 
-    if (inboxHash && md5(inboxContent) !== inboxHash) {
-      return res.status(409).json({ error: 'conflict', message: 'Inbox file changed since it was opened.' });
-    }
-
-    const fm = parseFM(inboxContent);
-    if (!fm.target) return res.status(400).json({ error: 'No target field in inbox file' });
-
-    const targetAbs = safe(fm.target);
-    const bodyRaw = inboxContent.replace(/^---[\s\S]*?---\s*\n?/, '').trimStart();
-    const body = bodyRaw.trimEnd() + '\n';
-    const today = localToday();
-
-    // Pasted close-session proposals carry an action; distiller items have none and append as before.
-    if (fm.action) return approveAction(res, { fm, inboxAbs, targetAbs, body: bodyRaw.replace(/\s+$/, ''), targetHash, today });
-
-    let targetContent;
-    let targetExists = true;
-    try { targetContent = await readFile(targetAbs, 'utf8'); }
-    catch { targetExists = false; }
-
-    let newTargetContent;
-    if (targetExists) {
-      if (targetHash && md5(targetContent) !== targetHash) {
-        return res.status(409).json({ error: 'conflict', message: 'Target file changed since it was opened.' });
-      }
-      let updated = targetContent.replace(/^(updated:[ \t]*).*$/m, `$1${today}`);
-      if (updated === targetContent) {
-        updated = targetContent.replace(/^(---[ \t]*\r?\n)/, `$1updated: ${today}\n`);
-      }
-      newTargetContent = guardPermalink(targetContent, updated.trimEnd() + '\n' + body);
-    } else {
-      const titleStem = basename(fm.target, '.md').replace(/-/g, ' ');
-      newTargetContent = `---\ntitle: ${titleStem}\nupdated: ${today}\n---\n\n${body}`;
-      await mkdir(dirname(targetAbs), { recursive: true });
-    }
-
-    await writeFile(targetAbs, newTargetContent, 'utf8');
-    await unlink(inboxAbs);
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(e.status || 500).json({ error: e.message });
+  if (inboxHash && md5(inboxContent) !== inboxHash) {
+    return { status: 409, body: { error: 'conflict', message: 'Inbox file changed since it was opened.' } };
   }
-});
 
-async function approveAction(res, { fm, inboxAbs, targetAbs, body, targetHash, today }) {
-  if (!ACTIONS.includes(fm.action)) return res.status(400).json({ error: `Unknown action "${fm.action}"` });
-  if (!isAllowedTarget(fm.target)) return res.status(400).json({ error: `Target "${fm.target}" not allowed` });
+  const fm = parseFM(inboxContent);
+  if (!fm.target) return { status: 400, body: { error: 'No target field in inbox file' } };
+
+  const expectedHash = seenTargets?.has(fm.target) ? null : targetHash;
+  const targetAbs = safe(fm.target);
+  const bodyRaw = inboxContent.replace(/^---[\s\S]*?---\s*\n?/, '').trimStart();
+  const body = bodyRaw.trimEnd() + '\n';
+  const today = localToday();
+
+  // Pasted close-session proposals carry an action; distiller items have none and append as before.
+  const result = fm.action
+    ? await approveAction({ fm, inboxAbs, targetAbs, body: bodyRaw.replace(/\s+$/, ''), targetHash: expectedHash, today })
+    : await approveAppend({ fm, inboxAbs, targetAbs, body, targetHash: expectedHash, today });
+  if (result.status === 200) seenTargets?.add(fm.target);
+  return result;
+}
+
+async function approveAppend({ fm, inboxAbs, targetAbs, body, targetHash, today }) {
+  let targetContent;
+  let targetExists = true;
+  try { targetContent = await readFile(targetAbs, 'utf8'); }
+  catch { targetExists = false; }
+
+  let newTargetContent;
+  if (targetExists) {
+    if (targetHash && md5(targetContent) !== targetHash) {
+      return { status: 409, body: { error: 'conflict', message: 'Target file changed since it was opened.' } };
+    }
+    let updated = targetContent.replace(/^(updated:[ \t]*).*$/m, `$1${today}`);
+    if (updated === targetContent) {
+      updated = targetContent.replace(/^(---[ \t]*\r?\n)/, `$1updated: ${today}\n`);
+    }
+    newTargetContent = guardPermalink(targetContent, updated.trimEnd() + '\n' + body);
+  } else {
+    const titleStem = basename(fm.target, '.md').replace(/-/g, ' ');
+    newTargetContent = `---\ntitle: ${titleStem}\nupdated: ${today}\n---\n\n${body}`;
+    await mkdir(dirname(targetAbs), { recursive: true });
+  }
+
+  await writeFile(targetAbs, newTargetContent, 'utf8');
+  await unlink(inboxAbs);
+  return { status: 200, body: { ok: true } };
+}
+
+async function approveAction({ fm, inboxAbs, targetAbs, body, targetHash, today }) {
+  if (!ACTIONS.includes(fm.action)) return { status: 400, body: { error: `Unknown action "${fm.action}"` } };
+  if (!isAllowedTarget(fm.target)) return { status: 400, body: { error: `Target "${fm.target}" not allowed` } };
 
   const data = readInboxBody(fm.action, body);
-  if (data.error) return res.status(400).json({ error: data.error });
+  if (data.error) return { status: 400, body: { error: data.error } };
   if (fm.action === 'replace-section') data.section = fm.section || '';
 
   let current = null;
   try { current = await readFile(targetAbs, 'utf8'); } catch { }
   if (current !== null && targetHash && md5(current) !== targetHash) {
-    return res.status(409).json({ error: 'conflict', message: 'Target file changed since it was opened.' });
+    return { status: 409, body: { error: 'conflict', message: 'Target file changed since it was opened.' } };
   }
 
   const result = applyProposal(fm.action, data, current, {
     today, titleFor: () => basename(fm.target, '.md').replace(/-/g, ' '),
   });
-  if (result.error) return res.status(422).json({ error: result.error });
+  if (result.error) return { status: 422, body: { error: result.error } };
 
   // Permalink lines are never touched: restore the original one if anything moved it.
   const out = current !== null ? guardPermalink(current, result.content) : result.content;
   if (current === null) await mkdir(dirname(targetAbs), { recursive: true });
   await writeFile(targetAbs, out, 'utf8');
   await unlink(inboxAbs);
-  res.json({ ok: true, action: fm.action });
+  return { status: 200, body: { ok: true, action: fm.action } };
 }
 
+app.post('/api/inbox/approve', async (req, res) => {
+  try {
+    const { status, body } = await approveItem(req.body);
+    res.status(status).json(body);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// Approve all: apply the items in the order given and stop at the first failure; the rest stay in the inbox.
+// Body: { items: [{ filename, inboxHash, targetHash }] } → { approved: [filename], failed: { filename, error } | null }
+app.post('/api/inbox/approve-batch', async (req, res) => {
+  const { items } = req.body || {};
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items[] required' });
+
+  const approved = [], seenTargets = new Set();
+  for (const item of items) {
+    let result;
+    try { result = await approveItem(item, seenTargets); }
+    catch (e) { result = { status: e.status || 500, body: { error: e.message } }; }
+    if (result.status !== 200) {
+      return res.json({ approved, failed: { filename: item.filename, error: result.body.message || result.body.error } });
+    }
+    approved.push(item.filename);
+  }
+  res.json({ approved, failed: null });
+});
+
 // Paste close-session output: parse UPDATE PROTOCOL blocks into inbox items. Plain code, no AI.
-// Body: { text } → { created: [filename], errors: [{ line, file, reason }] }
+// Body: { text } → { created: [filename], errors: [{ line, file, reason }], batch, remainder, noBlocks }
+// remainder is the text outside any block, which the page offers to convert.
 app.post('/api/inbox/paste', async (req, res) => {
   try {
     const { text } = req.body || {};
     if (typeof text !== 'string' || !text.trim()) return res.status(400).json({ error: 'Nothing pasted' });
 
-    const { proposals, errors } = parseProposals(text, { isAllowedTarget });
+    const { proposals, errors, remainder, noBlocks } = parseProposals(text, { isAllowedTarget });
     const today = localToday();
     const created = [];
+    const batch = { id: `paste-${makeRunId()}`, source: 'Pasted', at: new Date().toISOString() };
     await mkdir(join(BRAIN, 'inbox'), { recursive: true });
 
     for (const p of proposals) {
@@ -651,7 +690,7 @@ app.post('/api/inbox/paste', async (req, res) => {
       if (p.action === 'create' && exists) { fail('create: target already exists (use append or replace-section)'); continue; }
       if (!exists && !['create', 'append'].includes(p.action)) { fail(`${p.action}: target does not exist`); continue; }
 
-      const content = toInboxFile(p, today);
+      const content = toInboxFile(p, today, batch, created.length);
       const slug = `paste-${p.file.replace(/\.md$/, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}-${p.action}`.slice(0, 80);
       const reason = checkSuggestion(`${slug}.md`, content);
       if (reason) { fail(reason); continue; }
@@ -665,10 +704,32 @@ app.post('/api/inbox/paste', async (req, res) => {
     }
 
     errors.sort((a, b) => (a.line || 0) - (b.line || 0));
-    res.json({ created, errors });
+    res.json({ created, errors, batch: created.length ? batch.id : null, remainder, noBlocks });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
   }
+});
+
+// Convert free text with an assistant: a normal distill run (no tools, full brain in the prompt, same
+// checker) whose suggestions land in the inbox as one batch. Body: { agent, text } → { runId }
+const CONVERT_INSTRUCTION = '- The input is a session summary, not a raw conversation. Turn it into brain suggestions.';
+
+app.post('/api/inbox/convert', (req, res) => {
+  const { agent, text } = req.body || {};
+  if (agent !== 'claude' && agent !== 'gemini') return res.status(400).json({ error: 'agent required' });
+  if (typeof text !== 'string' || !text.trim()) return res.status(400).json({ error: 'Nothing to convert' });
+  if (activeRun) return res.status(409).json({ error: 'Another distill run is in progress' });
+
+  const runId = makeRunId();
+  const files = [{ name: 'pasted-text.txt', content: text.trim() }];
+  const state = newRunState(runId, agent, files.map(f => f.name), []);
+  activeRun = { runId, abort: null, cancelled: false };
+  runStore.set(runId, state);
+  res.json({ runId });
+  runDistillPipeline(state, agent, files, {
+    instruction: CONVERT_INSTRUCTION,
+    batch: { id: `convert-${runId}`, source: 'Converted', at: state.startedAt },
+  }).catch(() => {});
 });
 
 // Discard: delete inbox file
@@ -865,7 +926,7 @@ const earlierSection = earlier => earlier.trim() ? [
 
 // Every chunk carries this header plus up to CHARS_PER_CALL characters of input,
 // matching the distill-call estimates shown in the Import window.
-async function buildDistillHeader() {
+async function buildDistillHeader(instruction) {
   const today        = localToday();
   const readme       = await readFile(join(BRAIN, 'README.md'), 'utf8');
   const brainIndex   = await buildBrainIndex();
@@ -904,6 +965,7 @@ async function buildDistillHeader() {
     '- Suggest only facts that are absent from the brain. No rewording of facts already present.',
     '- Never suggest sports, training, fitness, body or diet details (decision in projects/brain/decisions.md).',
     '- Never create a project for something the brain says belongs to someone else.',
+    ...(instruction ? [instruction] : []),
     '- If nothing is worth adding, output nothing.',
     '',
     '=== README (Brain format rules) ===',
@@ -931,7 +993,7 @@ function brainDiff(pre, post) {
 async function collectFinished(run) {
   const outDir = join(runDir(run.runId), 'out');
   const { accepted, dropped } = await checkOutFiles(outDir);
-  const inboxed = await moveToInbox(outDir, accepted);
+  const inboxed = await moveToInbox(outDir, accepted, run.batch, run.suggestions);
   for (const f of accepted) await rm(join(outDir, f), { force: true });
   run.suggestions += inboxed.length;
 
@@ -992,7 +1054,7 @@ async function executeRun(state, run) {
     await saveRun(run);
 
     const chunks = splitChunks(await readFile(join(stagDir, 'input.txt'), 'utf8'));
-    const header = await buildDistillHeader();
+    const header = await buildDistillHeader(run.instruction);
     await mkdir(join(stagDir, 'replies'), { recursive: true });
     const replyFile = i => join(stagDir, 'replies', `chunk-${i + 1}.txt`);
 
@@ -1066,7 +1128,8 @@ function newRunState(runId, agent, inputNames, tracked) {
 }
 
 // Start a new run: write its staging folder, then execute it.
-async function runDistillPipeline(state, agent, files) {
+// options: { instruction, batch } for a conversion; both are kept in run.json so a Resume uses them too.
+async function runDistillPipeline(state, agent, files, { instruction = null, batch = null } = {}) {
   const stagDir = runDir(state.runId);
   try {
     await mkdir(join(stagDir, 'input'), { recursive: true });
@@ -1080,7 +1143,7 @@ async function runDistillPipeline(state, agent, files) {
       runId: state.runId, agent, status: 'running', reason: null, createdAt: state.startedAt,
       inputNames: state.inputNames, tracked: state.tracked || [], ranges,
       chunks: splitChunks(text).map(() => ({ status: 'pending' })),
-      suggestions: 0, recorded: [],
+      suggestions: 0, recorded: [], instruction, batch,
     };
     await saveRun(run);
     await executeRun(state, run);
@@ -1224,8 +1287,9 @@ app.post('/api/distill/recheck/:runId', async (req, res) => {
   try {
     if (activeRun?.runId === runId) return res.status(409).json({ error: 'Run is in progress' });
     const { accepted, dropped } = await checkOutFiles(outDir);
-    const inboxed = await moveToInbox(outDir, accepted);
-    const stopped = (await loadRun(runId))?.status === 'stopped'; // a stopped run still needs its folder for Resume
+    const run = await loadRun(runId);
+    const inboxed = await moveToInbox(outDir, accepted, run?.batch, run?.suggestions);
+    const stopped = run?.status === 'stopped'; // a stopped run still needs its folder for Resume
     if (dropped.length === 0 && !stopped) await rm(stagDir, { recursive: true, force: true });
     else for (const f of accepted) await rm(join(outDir, f), { force: true }); // don't re-inbox on a second recheck
     await appendDistillLog(`recheck | ${runId} | OK: ${inboxed.length} → inbox (${inboxed.join(', ')})` +
