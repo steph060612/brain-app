@@ -1,9 +1,8 @@
-// Copy-pack button, used by the project panel and the top bar.
+// Copy buttons: packs for the project panel and the top bar, and the close-session prompt.
 // The server runs ~/.brain/brainpack.sh, which saves the pack and copies it to the macOS clipboard.
 // The browser copy below is a second path to the same text; it may be refused after the await.
 
-// body() returns { mode, project? } for /api/pack. onResult(error, data) reports the outcome.
-export function packButton({ label, hint, body, onResult }) {
+function copyButton(label, hint) {
   const btn = document.createElement('button');
   btn.style.cssText = `
     padding:4px 10px; background:rgba(255,255,255,0.04); border:1px solid rgba(100,120,200,0.25);
@@ -16,7 +15,29 @@ export function packButton({ label, hint, body, onResult }) {
   hintEl.textContent = ` · ${hint}`;
   hintEl.style.color = '#5a6890';
   btn.appendChild(labelEl);
-  btn.appendChild(hintEl);
+  if (hint) btn.appendChild(hintEl);
+  return { btn, labelEl };
+}
+
+// Copies fixed text; there's no await before the copy, so the browser allows it as part of the click.
+export function textCopyButton({ label, hint, text }) {
+  const { btn, labelEl } = copyButton(label, hint);
+  btn.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      labelEl.textContent = 'Copied';
+    } catch (e) {
+      labelEl.textContent = 'Copy failed';
+      btn.title = e.message;
+    }
+    setTimeout(() => { labelEl.textContent = label; }, 2500);
+  });
+  return btn;
+}
+
+// body() returns { mode, project? } for /api/pack. onResult(error, data) reports the outcome.
+export function packButton({ label, hint, body, onResult }) {
+  const { btn, labelEl } = copyButton(label, hint);
 
   btn.addEventListener('click', async () => {
     btn.disabled = true;

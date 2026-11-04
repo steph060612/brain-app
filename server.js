@@ -2,7 +2,7 @@
 // Listens only on localhost:3001. Never touches anything outside ~/Brain.
 import express from 'express';
 import { readdir, readFile, writeFile, stat, access, unlink, mkdir, rm, rename } from 'fs/promises';
-import { resolve, join, sep, extname, basename, dirname } from 'path';
+import { resolve, join, sep, extname, basename, dirname, relative } from 'path';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
 import { exec, execFile, spawn } from 'child_process';
@@ -153,6 +153,22 @@ async function buildBrainContent() {
   ].join('\n');
 }
 
+// Every change the app itself makes to ~/Brain goes through these two, which record the file and its
+// resulting checksum (null once deleted). The distill safety check ignores a change that matches the
+// record, so an outside edit, even to a file the app wrote earlier, still counts as tampering.
+// Recorded before the write, so a check running at the same moment can't miss it.
+const appWrites = new Map(); // path relative to ~/Brain → latest checksum the app left there
+
+async function writeBrainFile(abs, content) {
+  appWrites.set(relative(BRAIN, abs), md5(content));
+  await writeFile(abs, content, 'utf8');
+}
+
+async function deleteBrainFile(abs) {
+  appWrites.set(relative(BRAIN, abs), null);
+  await unlink(abs);
+}
+
 // md5 checksums of every file in dir, skipping one named top-level subdirectory
 async function fileChecksums(dir, skipSub) {
   const map = {};
@@ -227,7 +243,7 @@ async function moveToInbox(outDir, files, batch = null, firstOrder = 0) {
       catch { break; }
     }
     const content = await readFile(join(outDir, f), 'utf8');
-    await writeFile(dest, batch
+    await writeBrainFile(dest, batch
       ? content.replace(/^---\s*\n/, `---\n${batchLines(batch, firstOrder + i).join('\n')}\n`)
       : content);
     inboxed.push(basename(dest));
@@ -468,7 +484,7 @@ app.post('/api/file', async (req, res) => {
     }
 
     const safe_content = guardPermalink(current, content);
-    await writeFile(abs, safe_content, 'utf8');
+    await writeBrainFile(abs, safe_content);
     res.json({ ok: true, hash: md5(safe_content) });
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
@@ -609,8 +625,8 @@ async function approveAppend({ fm, inboxAbs, targetAbs, body, targetHash, today 
     await mkdir(dirname(targetAbs), { recursive: true });
   }
 
-  await writeFile(targetAbs, newTargetContent, 'utf8');
-  await unlink(inboxAbs);
+  await writeBrainFile(targetAbs, newTargetContent);
+  await deleteBrainFile(inboxAbs);
   return { status: 200, body: { ok: true } };
 }
 
@@ -636,8 +652,8 @@ async function approveAction({ fm, inboxAbs, targetAbs, body, targetHash, today 
   // Permalink lines are never touched: restore the original one if anything moved it.
   const out = current !== null ? guardPermalink(current, result.content) : result.content;
   if (current === null) await mkdir(dirname(targetAbs), { recursive: true });
-  await writeFile(targetAbs, out, 'utf8');
-  await unlink(inboxAbs);
+  await writeBrainFile(targetAbs, out);
+  await deleteBrainFile(inboxAbs);
   return { status: 200, body: { ok: true, action: fm.action } };
 }
 
@@ -699,7 +715,7 @@ app.post('/api/inbox/paste', async (req, res) => {
       while (true) {
         try { await stat(join(BRAIN, 'inbox', name)); name = `${slug}-${++n}.md`; } catch { break; }
       }
-      await writeFile(join(BRAIN, 'inbox', name), content, 'utf8');
+      await writeBrainFile(join(BRAIN, 'inbox', name), content);
       created.push(name);
     }
 
@@ -737,7 +753,7 @@ app.delete('/api/inbox/:filename', async (req, res) => {
   try {
     const inboxAbs = safeInbox(req.params.filename);
     try {
-      await unlink(inboxAbs);
+      await deleteBrainFile(inboxAbs);
       res.json({ ok: true });
     } catch {
       res.status(404).json({ error: 'File not found' });
@@ -978,14 +994,24 @@ async function buildDistillHeader(instruction) {
   ].join('\n') + '\n';
 }
 
+// Changes between two checksum maps, leaving out those the app itself made.
 function brainDiff(pre, post) {
+  const byApp = k => appWrites.has(k) && appWrites.get(k) === (post[k] ?? null);
   const changed = [];
   for (const k of Object.keys(post)) {
+    if (byApp(k)) continue;
     if (!pre[k])                 changed.push(`appeared: ${k}`);
     else if (pre[k] !== post[k]) changed.push(`modified: ${k}`);
   }
-  for (const k of Object.keys(pre)) if (!post[k]) changed.push(`deleted: ${k}`);
+  for (const k of Object.keys(pre)) if (!post[k] && !byApp(k)) changed.push(`deleted: ${k}`);
   return changed;
+}
+
+// A second look before stopping a run: the first one may have read a file while the app was writing it.
+async function outsideChanges(pre) {
+  if (brainDiff(pre, await fileChecksums(BRAIN, '.git')).length === 0) return [];
+  await new Promise(r => setTimeout(r, 250));
+  return brainDiff(pre, await fileChecksums(BRAIN, '.git'));
 }
 
 // Checker on everything parsed so far: valid suggestions go to the inbox, and leave out/ so
@@ -1052,6 +1078,7 @@ async function executeRun(state, run) {
     run.status = 'running';
     run.reason = null;
     await saveRun(run);
+    appWrites.clear();
 
     const chunks = splitChunks(await readFile(join(stagDir, 'input.txt'), 'utf8'));
     const header = await buildDistillHeader(run.instruction);
@@ -1087,8 +1114,8 @@ async function executeRun(state, run) {
       }
       const durationMs = Date.now() - started;
 
-      // The agent has no tools, so a changed brain means something is wrong: don't trust this reply.
-      const changed = brainDiff(preBrain, await fileChecksums(BRAIN, '.git'));
+      // The agent has no tools, so a change the app didn't make means something is wrong: don't trust this reply.
+      const changed = await outsideChanges(preBrain);
       if (changed.length > 0) {
         const reason = `~/Brain changed during call ${i + 1}: ${changed.join('; ')}.`;
         await appendDistillLog(`${callLabel} | ${seconds(durationMs)} | exit 0 | FAIL: ${reason}`);
@@ -1181,7 +1208,7 @@ app.post('/api/distill/run', async (req, res) => {
   activeRun = { runId, abort: null, cancelled: false };
   runStore.set(runId, state);
   res.json({ runId });
-  runDistillPipeline(state, agent, files).catch(() => {});
+  runDistillPipeline(state, agent, files, { batch: { id: `distill-${runId}`, source: 'Distilled', at: state.startedAt } }).catch(() => {});
 });
 
 // Start a distill run from parsed import items.
@@ -1269,7 +1296,7 @@ app.post('/api/distill/import', async (req, res) => {
   activeRun = { runId, abort: null, cancelled: false };
   runStore.set(runId, state);
   res.json({ runId });
-  runDistillPipeline(state, agent, files).catch(() => {});
+  runDistillPipeline(state, agent, files, { batch: { id: `import-${runId}`, source: 'Imported', at: state.startedAt } }).catch(() => {});
 });
 
 // Distilled records, keyed "<source>:<id>" (source: claude | chatgpt | gemini | memories)

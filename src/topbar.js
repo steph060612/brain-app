@@ -2,7 +2,9 @@
 import { fetchGitLog } from './api.js';
 import { setSearchQuery } from './labels.js';
 import { setListQuery } from './list.js';
-import { packButton } from './pack.js';
+import { packButton, textCopyButton } from './pack.js';
+
+const CLOSE_SESSION_PROMPT = 'Close session: output proposed changes for my brain in the UPDATE PROTOCOL format from README.md (### FILE, ### ACTION, content; OLD and NEW lines for replace-line), all inside one code block. Include only facts I stated or confirmed in this chat. Nothing is saved until I approve.';
 
 export function initTopbar() {
   const bar = document.getElementById('topbar');
@@ -18,6 +20,10 @@ export function initTopbar() {
     label: 'Copy general pack',
     hint: 'new chat, no project yet',
     body: () => ({ mode: 'general' }),
+  }), gitTime);
+  gitTime?.parentNode.insertBefore(textCopyButton({
+    label: 'Copy close-session prompt',
+    text: CLOSE_SESSION_PROMPT,
   }), gitTime);
 
   // Fetch git log once and display
