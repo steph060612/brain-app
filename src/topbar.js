@@ -2,6 +2,7 @@
 import { fetchGitLog } from './api.js';
 import { setSearchQuery } from './labels.js';
 import { setListQuery } from './list.js';
+import { packButton } from './pack.js';
 
 export function initTopbar() {
   const bar = document.getElementById('topbar');
@@ -11,6 +12,13 @@ export function initTopbar() {
   if (input) {
     input.addEventListener('input', () => { setSearchQuery(input.value); setListQuery(input.value); });
   }
+
+  const gitTime = document.getElementById('git-time');
+  gitTime?.parentNode.insertBefore(packButton({
+    label: 'Copy general pack',
+    hint: 'new chat, no project yet',
+    body: () => ({ mode: 'general' }),
+  }), gitTime);
 
   // Fetch git log once and display
   fetchGitLog().then(({ lastCommit }) => {
