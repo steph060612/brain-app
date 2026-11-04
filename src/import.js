@@ -8,9 +8,9 @@ let disabledReasons = {};
 let parseStatus = { status: 'idle' };
 let pollTimer   = null;
 let parsePoll   = null;
-let runTimeout  = null;
+let runsInfo    = { active: null, stopped: [], avgCallMs: 90000, callSamples: 0 };
 
-const MAX_RUN_MS = 10 * 60 * 1000;
+const CONFIRM_ABOVE_CALLS = 10;
 
 // Conversation sources. index: [{uuid, title, created, updated, messageCount, charCount, distillCalls}]
 const SOURCES = {
@@ -83,6 +83,8 @@ function createBackdrop() {
 async function openModal() {
   stopPolls();
   backdropEl.style.display = 'flex';
+  await refreshRuns();
+  if (runsInfo.active) { watchRun(runsInfo.active.runId); return; } // closing the window doesn't stop a run
   await refreshParseStatus();
   if (parseStatus.status === 'done') await loadIndexes();
   renderMain();
@@ -140,7 +142,13 @@ function closeModal() {
 function stopPolls() {
   if (pollTimer)  { clearInterval(pollTimer);  pollTimer  = null; }
   if (parsePoll)  { clearInterval(parsePoll);  parsePoll  = null; }
-  if (runTimeout) { clearTimeout(runTimeout);  runTimeout = null; }
+}
+
+async function refreshRuns() {
+  try {
+    const r = await fetch('/api/distill/runs');
+    if (r.ok) runsInfo = await r.json();
+  } catch { /* keep stale */ }
 }
 
 async function refreshParseStatus() {
@@ -166,6 +174,8 @@ function renderMain() {
   const body = div('flex:1; overflow-y:auto; padding:16px 20px; scrollbar-width:thin; scrollbar-color:#2a3050 transparent;');
   cardEl.appendChild(body);
 
+  renderStoppedRuns(body);
+
   // ── Parse section ──
   renderParseSection(body);
 
@@ -180,6 +190,39 @@ function renderMain() {
     body.appendChild(div('height:1px; background:rgba(100,120,200,0.12); margin:16px 0;'));
     renderMemoriesSection(body);
   }
+}
+
+// ── Stopped runs ─────────────────────────────────────────────────────────────
+
+function runItemTitle(t) {
+  if (t.source === 'memories') return 'Claude memories';
+  return SOURCES[t.source]?.index.find(c => c.uuid === t.id)?.title || t.names[0];
+}
+
+function renderStoppedRuns(parent) {
+  if (runsInfo.stopped.length === 0) return;
+  const wrap = div('margin-bottom:14px;');
+  wrap.appendChild(el('div', 'font-size:12px; color:#5a6890; letter-spacing:0.05em; text-transform:uppercase; margin-bottom:8px;', 'Stopped runs'));
+
+  for (const run of runsInfo.stopped) {
+    const remaining = run.total - run.done;
+    const row = div('display:flex; align-items:center; gap:12px; padding:8px 10px; margin-bottom:6px; border:1px solid rgba(224,160,80,0.25); border-radius:6px;');
+    const info = div('flex:1; min-width:0;');
+    const names = run.tracked?.length ? run.tracked.map(runItemTitle).join(', ') : run.inputNames.join(', ');
+    info.appendChild(el('div', 'font-size:12px; color:#c8d0e8; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;', names));
+    info.appendChild(el('div', 'font-size:11px; color:#8090b0; margin-top:2px;',
+      `${run.done} of ${run.total} calls finished, ${remaining} remaining, ${run.suggestions} in Inbox`));
+    if (run.reason) info.appendChild(el('div', 'font-size:11px; color:#5a6890; margin-top:2px; word-break:break-word;', run.reason));
+    row.appendChild(info);
+
+    const resume = mkBtn('Resume', '#9FD8FF', 'rgba(60,108,255,0.15)', 'rgba(60,108,255,0.4)');
+    resume.style.cssText += 'flex-shrink:0; font-size:12px;';
+    resume.addEventListener('click', () => confirmCalls(remaining, () => resumeRun(run.runId, run.agent), renderMain));
+    row.appendChild(resume);
+    wrap.appendChild(row);
+  }
+  parent.appendChild(wrap);
+  parent.appendChild(div('height:1px; background:rgba(100,120,200,0.12); margin:16px 0;'));
 }
 
 // ── Parse section ────────────────────────────────────────────────────────────
@@ -508,85 +551,156 @@ function updateFooter() {
   if (!hasSelection) { runBtn.disabled = true; runBtn.style.opacity = '0.4'; }
   runBtn.addEventListener('click', () => {
     const agent = cardEl.querySelector('input[name="import-agent"]:checked')?.value || selectedAgent;
-    startRun(agent, selected.claude.map(c => c.uuid), selected.chatgpt.map(c => c.uuid), selected.gemini.map(c => c.uuid), memChecked);
+    confirmCalls(totalCalls, () =>
+      startRun(agent, selected.claude.map(c => c.uuid), selected.chatgpt.map(c => c.uuid), selected.gemini.map(c => c.uuid), memChecked),
+      renderMain);
   });
   footerEl.appendChild(runBtn);
 }
 
 // ─── RUN ──────────────────────────────────────────────────────────────────────
-async function startRun(agent, uuids, chatgptIds, geminiIds, includeMemories) {
-  renderRunning(`Starting ${agent === 'claude' ? 'Claude' : 'Gemini'}…`);
+const agentName = agent => agent === 'claude' ? 'Claude' : 'Gemini';
 
-  let runId;
+function fmtDuration(ms) {
+  const totalSec = Math.round(ms / 1000);
+  const h = Math.floor(totalSec / 3600), m = Math.floor(totalSec / 60) % 60, s = totalSec % 60;
+  return h ? `${h}h ${m}m` : m ? `${m}m ${s}s` : `${s}s`;
+}
+
+// Runs above CONFIRM_ABOVE_CALLS spend real usage and take a while, so ask first.
+async function confirmCalls(calls, onConfirm, onBack) {
+  if (calls <= CONFIRM_ABOVE_CALLS) { onConfirm(); return; }
+  await refreshRuns();
+  const estimate = fmtDuration(calls * runsInfo.avgCallMs);
+  const basis = runsInfo.callSamples
+    ? `from the average of your last ${runsInfo.callSamples} call${runsInfo.callSamples !== 1 ? 's' : ''}`
+    : 'a rough guess of 90 seconds per call, until there are real timings';
+
+  cardEl.innerHTML = '';
+  cardEl.appendChild(modalHeader());
+  const body = div('padding:20px;');
+  body.appendChild(el('div', 'font-size:14px; color:#fff; margin-bottom:8px;', `This needs ${calls} calls.`));
+  body.appendChild(el('div', 'font-size:13px; color:#c8d0e8; margin-bottom:4px;', `Estimated time: about ${estimate}.`));
+  body.appendChild(el('div', 'font-size:11px; color:#5a6890; margin-bottom:16px;',
+    `Estimate ${basis}. You can cancel at any time, keep what finished, and resume later.`));
+
+  const btns = div('display:flex; gap:10px;');
+  const go = mkBtn('Start', '#9FD8FF', 'rgba(60,108,255,0.2)', 'rgba(60,108,255,0.5)');
+  go.style.cssText += 'flex:1; padding:8px 0;';
+  go.addEventListener('click', onConfirm);
+  const back = mkBtn('Back', '#8090b0', 'none', 'rgba(100,120,200,0.22)');
+  back.style.cssText += 'flex:1; padding:8px 0;';
+  back.addEventListener('click', onBack);
+  btns.appendChild(go);
+  btns.appendChild(back);
+  body.appendChild(btns);
+  cardEl.appendChild(body);
+}
+
+async function postRun(url, body, startingLabel) {
+  renderRunning({ message: startingLabel });
   try {
-    const r = await fetch('/api/distill/import', {
+    const r = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agent, conversationUuids: uuids, chatgptIds, geminiIds, includeMemories }),
+      body: JSON.stringify(body),
     });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
-    runId = d.runId;
+    watchRun(d.runId);
   } catch (e) {
     renderResult({ status: 'failed', message: `Failed to start: ${e.message}` });
-    return;
   }
+}
 
-  const deadline = Date.now() + MAX_RUN_MS;
-  pollTimer = setInterval(async () => {
-    if (Date.now() > deadline) {
-      stopPolls();
-      renderResult({ status: 'failed', message: 'Timed out after 10 minutes.' });
-      return;
-    }
+function startRun(agent, uuids, chatgptIds, geminiIds, includeMemories) {
+  return postRun('/api/distill/import', { agent, conversationUuids: uuids, chatgptIds, geminiIds, includeMemories },
+    `Starting ${agentName(agent)}…`);
+}
+
+function resumeRun(runId, agent) {
+  return postRun(`/api/distill/resume/${runId}`, {}, `Resuming with ${agentName(agent)}…`);
+}
+
+function watchRun(runId) {
+  stopPolls();
+  renderRunning({ message: 'Working…', runId });
+  const poll = async () => {
     try {
       const r = await fetch(`/api/distill/status/${runId}`);
+      if (r.status === 404) { stopPolls(); openModal(); return; } // the server restarted; the run is under Stopped runs
       if (!r.ok) return;
       const state = await r.json();
       if (state.status === 'running' || state.status === 'pending') {
-        renderRunning(state.message || 'Working…');
+        updateRunning(state);
       } else {
         stopPolls();
         renderResult(state);
       }
     } catch { /* transient */ }
-  }, 3000);
+  };
+  poll();
+  pollTimer = setInterval(poll, 1000);
 }
 
 // ─── RUNNING / RESULT RENDERS ─────────────────────────────────────────────────
-function renderRunning(message) {
-  cardEl.innerHTML = '';
-
+function modalHeader() {
   const hdr = div('display:flex; justify-content:space-between; align-items:center; padding:18px 20px 14px; border-bottom:1px solid rgba(100,120,200,0.15);');
   hdr.appendChild(el('div', 'font-size:16px; font-weight:700; color:#fff;', 'Import'));
   const c = el('button', 'background:none; border:none; color:#8090b0; font-size:18px; cursor:pointer; padding:0 4px;', '✕');
   c.addEventListener('click', closeModal);
   hdr.appendChild(c);
-  cardEl.appendChild(hdr);
+  return hdr;
+}
+
+let runningLine = null;
+
+function renderRunning({ message, runId }) {
+  cardEl.innerHTML = '';
+  cardEl.appendChild(modalHeader());
 
   const body = div('padding:20px;');
-  body.appendChild(el('div', 'font-size:13px; color:#9FD8FF; margin-bottom:6px;', '⏳ ' + message));
-  body.appendChild(el('div', 'font-size:11px; color:#5a6890;', 'Timeout after 10 minutes.'));
+  runningLine = el('div', 'font-size:13px; color:#9FD8FF; margin-bottom:6px;', '⏳ ' + message);
+  body.appendChild(runningLine);
+  body.appendChild(el('div', 'font-size:11px; color:#5a6890;',
+    'Each call has a 5-minute limit. You can close this window; the run continues.'));
+
+  if (runId) {
+    const cancel = mkBtn('Cancel', '#e0a050', 'rgba(224,160,80,0.1)', 'rgba(224,160,80,0.4)');
+    cancel.style.cssText += 'margin-top:16px; width:100%; padding:7px 0; font-size:13px;';
+    cancel.addEventListener('click', async () => {
+      cancel.disabled = true;
+      cancel.style.opacity = '0.5';
+      cancel.textContent = 'Cancelling…';
+      await fetch(`/api/distill/cancel/${runId}`, { method: 'POST' }).catch(() => {});
+    });
+    body.appendChild(cancel);
+  }
   cardEl.appendChild(body);
+}
+
+// In place, so the Cancel button isn't rebuilt under the pointer on every poll.
+function updateRunning(state) {
+  if (!runningLine) return;
+  const elapsed = fmtDuration(Date.now() - new Date(state.startedAt).getTime());
+  runningLine.textContent = state.callNumber && state.message !== 'Cancelling…'
+    ? `⏳ Call ${state.callNumber} of ${state.totalCalls}, ${elapsed} elapsed`
+    : `⏳ ${state.message || 'Working…'} (${elapsed} elapsed)`;
 }
 
 function renderResult(state) {
   cardEl.innerHTML = '';
-
-  const hdr = div('display:flex; justify-content:space-between; align-items:center; padding:18px 20px 14px; border-bottom:1px solid rgba(100,120,200,0.15);');
-  hdr.appendChild(el('div', 'font-size:16px; font-weight:700; color:#fff;', 'Import'));
-  const c = el('button', 'background:none; border:none; color:#8090b0; font-size:18px; cursor:pointer; padding:0 4px;', '✕');
-  c.addEventListener('click', closeModal);
-  hdr.appendChild(c);
-  cardEl.appendChild(hdr);
+  cardEl.appendChild(modalHeader());
 
   const body = div('padding:20px;');
 
-  if (state.status === 'done') {
-    // The distilled items are now recorded; start the next selection from nothing ticked.
+  if (state.status === 'done' || state.status === 'stopped') {
+    // Done items are recorded and stopped ones are under Stopped runs; start the next selection from nothing ticked.
     for (const src of Object.values(SOURCES)) src.checked.clear();
     memChecked = false;
-    body.appendChild(el('div', 'font-size:14px; color:#6FE3D0; margin-bottom:12px;', '✓ ' + state.message));
+    body.appendChild(state.status === 'done'
+      ? el('div', 'font-size:14px; color:#6FE3D0; margin-bottom:12px;', '✓ ' + state.message)
+      : el('div', 'font-size:13px; color:#e0a050; margin-bottom:12px; word-break:break-word;', state.message));
     if (state.result?.inboxed?.length) {
       const list = el('div', 'font-size:12px; color:#8090b0; font-family:monospace;');
       list.textContent = state.result.inboxed.join('\n');
@@ -601,6 +715,14 @@ function renderResult(state) {
   } else {
     body.appendChild(el('div', 'font-size:13px; color:#c0503a; margin-bottom:12px;', '✗ ' + state.message));
     body.appendChild(el('div', 'font-size:11px; color:#5a6890;', 'Staging folder kept for inspection.'));
+  }
+
+  if (state.status === 'stopped' && state.result?.remaining > 0) {
+    const resume = mkBtn('Resume', '#9FD8FF', 'rgba(60,108,255,0.2)', 'rgba(60,108,255,0.5)');
+    resume.style.cssText += 'margin-top:16px; width:100%; padding:7px 0; font-size:13px;';
+    resume.addEventListener('click', () => confirmCalls(state.result.remaining,
+      () => resumeRun(state.runId, state.agent), () => renderResult(state)));
+    body.appendChild(resume);
   }
 
   const again = mkBtn('Back to Import', '#9FD8FF', 'rgba(60,108,255,0.15)', 'rgba(60,108,255,0.4)');

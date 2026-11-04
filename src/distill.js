@@ -5,9 +5,6 @@ let cardEl      = null;
 let agentList   = [];
 let disabledReasons = {};
 let pollTimer   = null;
-let runTimeout  = null;
-
-const MAX_RUN_MS = 5 * 60 * 1000;
 
 // ─── INIT ────────────────────────────────────────────────────────────────────
 export async function initDistill() {
@@ -75,7 +72,6 @@ function closeModal() {
 
 function stopPoll() {
   if (pollTimer)  { clearInterval(pollTimer);  pollTimer  = null; }
-  if (runTimeout) { clearTimeout(runTimeout);  runTimeout = null; }
 }
 
 // ─── RENDERS ─────────────────────────────────────────────────────────────────
@@ -165,7 +161,7 @@ function renderRunning(message) {
 
   const spinner = el('div', 'font-size:13px; color:#9FD8FF; margin-bottom:8px;', '⏳ ' + message);
   cardEl.appendChild(spinner);
-  const hint = el('div', 'font-size:11px; color:#5a6890;', 'Timeout after 5 minutes.');
+  const hint = el('div', 'font-size:11px; color:#5a6890;', 'Each call has a 5-minute limit. A run has no total limit.');
   cardEl.appendChild(hint);
 }
 
@@ -195,7 +191,8 @@ function renderResult(state) {
   } else {
     const fail = el('div', 'font-size:13px; color:#c0503a; margin-bottom:14px;', '✗ ' + state.message);
     cardEl.appendChild(fail);
-    const hint = el('div', 'font-size:11px; color:#5a6890;', 'Staging folder kept for inspection.');
+    const hint = el('div', 'font-size:11px; color:#5a6890;',
+      state.status === 'stopped' ? 'Open Import to resume the remaining chunks.' : 'Staging folder kept for inspection.');
     cardEl.appendChild(hint);
   }
 
@@ -235,15 +232,14 @@ async function startRun(agent, fileObjects) {
   }
 
   // Poll every 3 seconds
-  const deadline = Date.now() + MAX_RUN_MS;
   pollTimer = setInterval(async () => {
-    if (Date.now() > deadline) {
-      stopPoll();
-      renderResult({ status: 'failed', message: 'Timed out after 5 minutes.' });
-      return;
-    }
     try {
       const r = await fetch(`/api/distill/status/${runId}`);
+      if (r.status === 404) {
+        stopPoll();
+        renderResult({ status: 'stopped', message: 'The server restarted during the run.' });
+        return;
+      }
       if (!r.ok) return;
       const state = await r.json();
       if (state.status === 'running' || state.status === 'pending') {

@@ -88,6 +88,9 @@ function safeInbox(filename) {
 const STAGING_BASE = resolve(homedir(), '.brain', 'staging');
 const DISTILL_LOG  = resolve(homedir(), '.brain', 'distill.log');
 const runStore     = new Map(); // runId → state
+const CALL_TIMEOUT_MS = 5 * 60 * 1000; // per agent call; a run has no total limit
+const RUN_ID_RE = /^[0-9]{8}-[0-9]{6}-[a-z0-9]{4}$/;
+let activeRun = null; // { runId, abort, cancelled }: one run at a time, so two runs never spend calls at once
 
 let importParseState = null; // null = never run, or { status, startedAt, finishedAt, result, error }
 const PARSE_STATE_FILE = resolve(homedir(), '.brain', 'imports', 'last-parse.json');
@@ -236,61 +239,46 @@ async function appendDistillLog(line) {
   } catch { /* non-fatal */ }
 }
 
-// Run claude -p with no tools; returns captured stdout.
-async function runClaudeAgent(prompt) {
+// Run one agent process; resolves with stdout. Any exit other than 0, including being killed, rejects.
+function runAgentProcess(label, cmd, args, { stdin, onAbort } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn('claude', [
-      '-p',
-      '--tools', '',
-      '--output-format', 'text',
-      '--no-session-persistence',
-    ], {
-      stdio: ['pipe', 'pipe', 'pipe'],
+    const child = spawn(cmd, args, {
+      stdio: [stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       env: { ...process.env, PATH: AGENT_PATH },
     });
-
-    child.stdin.write(prompt, 'utf8');
-    child.stdin.end();
+    // Rejects at once: a leftover child process can hold stdout open long after the kill.
+    const abort = message => { child.kill('SIGKILL'); reject(new Error(message)); };
+    onAbort?.(abort);
+    if (stdin !== undefined) {
+      child.stdin.on('error', () => {}); // a killed child closes the pipe mid-write
+      child.stdin.end(stdin, 'utf8');
+    }
 
     let stdout = '', stderr = '';
     child.stdout.on('data', d => { stdout += d; });
     child.stderr.on('data', d => { stderr += d; });
 
-    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Claude timed out after 5 minutes')); }, 5 * 60 * 1000);
-    child.on('close', code => {
+    const timer = setTimeout(() => abort(`${label} timed out after 5 minutes`), CALL_TIMEOUT_MS);
+    child.on('close', (code, signal) => {
       clearTimeout(timer);
-      if (code === 0 || code === null) resolve(stdout);
-      else reject(new Error(`claude exited ${code}: ${stderr.slice(0, 400)}`));
+      if (code === 0) return resolve(stdout);
+      // claude can report errors on stdout and leave stderr empty
+      const detail = (stderr.trim() || stdout.trim()).slice(0, 400);
+      reject(new Error(`${cmd} ${signal ? `killed by ${signal}` : `exited ${code}`}${detail ? `: ${detail}` : ''}`));
     });
     child.on('error', e => { clearTimeout(timer); reject(e); });
   });
 }
+
+// Run claude -p with no tools; returns captured stdout.
+const runClaudeAgent = (prompt, onAbort) => runAgentProcess('Claude', 'claude', [
+  '-p', '--tools', '', '--output-format', 'text', '--no-session-persistence',
+], { stdin: prompt, onAbort });
 
 // Run agy --sandbox with no file access; returns captured stdout.
-async function runGeminiAgent(prompt) {
-  return new Promise((resolve, reject) => {
-    const child = spawn('agy', [
-      '--sandbox',
-      '--print-timeout', '300s',
-      '--print', prompt,
-    ], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, PATH: AGENT_PATH },
-    });
-
-    let stdout = '', stderr = '';
-    child.stdout.on('data', d => { stdout += d; });
-    child.stderr.on('data', d => { stderr += d; });
-
-    const timer = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Gemini timed out after 5 minutes')); }, 5 * 60 * 1000);
-    child.on('close', code => {
-      clearTimeout(timer);
-      if (code === 0 || code === null) resolve(stdout);
-      else reject(new Error(`agy exited ${code}: ${stderr.slice(0, 400)}`));
-    });
-    child.on('error', e => { clearTimeout(timer); reject(e); });
-  });
-}
+const runGeminiAgent = (prompt, onAbort) => runAgentProcess('Gemini', 'agy', [
+  '--sandbox', '--print-timeout', '300s', '--print', prompt,
+], { onAbort });
 
 // Confirm agy is reachable and produces text output in headless mode (no file tools needed).
 let geminiDisabledReason = undefined; // undefined=unchecked, null=ok, string=reason
@@ -329,7 +317,7 @@ function checkReplyContract(stdout) {
 // Blocks are written even without frontmatter so the per-file checker can drop them with a reason.
 async function parseAgentReply(stdout, outDir) {
   const blocks = stdout.split(/===[ \t]*SUGGESTION[ \t]*===/).map(b => b.trim()).filter(b => b.length > 0);
-  const used = new Set();
+  const used = new Set(await readdir(outDir)); // later calls of a run must not overwrite earlier ones
   for (const block of blocks) {
     const fm = parseFM(block);
     const base = (fm.title || 'suggestion').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'suggestion';
@@ -752,163 +740,332 @@ async function readIndex(dir) {
   try { return JSON.parse(await readFile(join(dir, 'index.json'), 'utf8')); } catch { return []; }
 }
 
-async function runDistillPipeline(state, agent, files) {
-  const stagDir    = join(STAGING_BASE, state.runId);
-  const inputLabel = files.map(f => f.name).join(', ');
-  const agentLabel = agent === 'claude' ? 'Claude' : 'Gemini';
+// ── RUN RECORDS ──────────────────────────────────────────────────────────────
+// Each run keeps its progress in staging, so it survives a failure, a cancel or a server restart:
+//   input.txt          the combined input, cut into chunks at fixed offsets
+//   run.json           { runId, agent, status, reason, tracked, ranges, chunks: [{ status, ... }], suggestions, recorded }
+//   replies/chunk-N.txt  raw reply of each finished call (chunk-N.rejected.txt if it broke the output contract)
+//   out/               parsed suggestions waiting for the checker
+// status: running | stopped (chunks remain, can be resumed) | done (kept only for dropped files).
+const CALLS_FILE = resolve(homedir(), '.brain', 'distill-calls.json'); // recent call durations, for time estimates
+const DEFAULT_CALL_MS = 90_000;
 
+const runDir = runId => join(STAGING_BASE, runId);
+
+async function saveRun(run) {
+  const file = join(runDir(run.runId), 'run.json');
+  await writeFile(file + '.tmp', JSON.stringify(run, null, 2), 'utf8');
+  await rename(file + '.tmp', file);
+}
+
+// null for a missing folder, or for one left by an older version (no chunk list)
+async function loadRun(runId) {
   try {
-    // ── Setup staging ──────────────────────────────────────────────
+    const run = JSON.parse(await readFile(join(runDir(runId), 'run.json'), 'utf8'));
+    return Array.isArray(run?.chunks) ? run : null;
+  } catch { return null; }
+}
+
+async function listRuns() {
+  let ids = [];
+  try { ids = (await readdir(STAGING_BASE)).filter(id => RUN_ID_RE.test(id)); } catch { /* none yet */ }
+  return (await Promise.all(ids.map(loadRun))).filter(Boolean);
+}
+
+const doneChunks = run => run.chunks.filter(c => c.status === 'done').length;
+
+function splitChunks(text) {
+  const chunks = [];
+  for (let offset = 0; offset < text.length || chunks.length === 0; offset += CHARS_PER_CALL) {
+    chunks.push(text.slice(offset, offset + CHARS_PER_CALL));
+  }
+  return chunks;
+}
+
+// Inputs are combined before chunking, so one chunk can hold the end of one item and the start of the next.
+function combineInput(files) {
+  const ranges = [];
+  let pos = 0;
+  const parts = files.map(f => {
+    const part = `=== ${f.name} ===\n${f.content}`;
+    ranges.push({ name: f.name, start: pos, end: pos + part.length });
+    pos += part.length + 2;
+    return part;
+  });
+  return { text: parts.join('\n\n'), ranges };
+}
+
+// Tracked items whose every chunk is done and that aren't recorded yet.
+function newlyCompleteItems(run) {
+  const allDone = r => {
+    const first = Math.floor(r.start / CHARS_PER_CALL);
+    const last  = Math.floor((r.end - 1) / CHARS_PER_CALL);
+    for (let i = first; i <= last; i++) if (run.chunks[i]?.status !== 'done') return false;
+    return true;
+  };
+  return (run.tracked || []).filter(t => {
+    if (run.recorded.includes(`${t.source}:${t.id}`)) return false;
+    const ranges = run.ranges.filter(r => t.names.includes(r.name));
+    return ranges.length > 0 && ranges.every(allDone);
+  });
+}
+
+async function loadCallDurations() {
+  try { const d = JSON.parse(await readFile(CALLS_FILE, 'utf8')); return Array.isArray(d) ? d : []; }
+  catch { return []; }
+}
+
+async function noteCallDuration(ms) {
+  const d = [...await loadCallDurations(), ms].slice(-50);
+  await writeFile(CALLS_FILE, JSON.stringify(d), 'utf8').catch(() => {});
+}
+
+// Shown to every call after the first, so a split input doesn't produce duplicate suggestions.
+const earlierSection = earlier => earlier.trim() ? [
+  '=== SUGGESTIONS ALREADY MADE IN THIS RUN ===',
+  'Earlier parts of this same input already produced the suggestions below.',
+  'Do not repeat them or reword them. Suggest only facts that are not already covered here or in the brain.',
+  '',
+  earlier.trim(),
+  '',
+].join('\n') + '\n' : '';
+
+// Every chunk carries this header plus up to CHARS_PER_CALL characters of input,
+// matching the distill-call estimates shown in the Import window.
+async function buildDistillHeader() {
+  const today        = localToday();
+  const readme       = await readFile(join(BRAIN, 'README.md'), 'utf8');
+  const brainIndex   = await buildBrainIndex();
+  const brainContent = await buildBrainContent();
+
+  const brainSection = brainContent
+    ? [
+        '=== CURRENT BRAIN CONTENT ===',
+        'Compare every candidate fact against these files. Skip anything already recorded; suggest only new or changed facts.',
+        '',
+        brainContent,
+        '',
+      ].join('\n')
+    : '';
+
+  return [
+    'Respond ONLY with === SUGGESTION === blocks — no other text before, between, or after them.',
+    'Each block is a complete Markdown file with YAML frontmatter:',
+    '',
+    '=== SUGGESTION ===',
+    '---',
+    'title: Short descriptive title',
+    `updated: ${today}`,
+    'target: projects/foo/state.md',
+    '---',
+    '',
+    '- Bullet point fact distilled from the input',
+    '',
+    'Rules:',
+    '- One block per target file.',
+    '- target must be a relative path from the Brain Index, or a new path under projects/ for a brand-new project.',
+    '- Body: bullet-point facts only — distilled and organised. No opinions, no raw transcript.',
+    '- No permalink line in the output.',
+    '- The brain (CURRENT BRAIN CONTENT) is the source of truth. When the input conflicts with the brain, the brain wins: do not suggest the older fact.',
+    '- If the input contains something genuinely newer than the brain, suggest it with its date and keep the history in one line in the form "- <new fact> (since YYYY-MM-DD; previously <older fact>)".',
+    '- Suggest only facts that are absent from the brain. No rewording of facts already present.',
+    '- Never suggest sports, training, fitness, body or diet details (decision in projects/brain/decisions.md).',
+    '- Never create a project for something the brain says belongs to someone else.',
+    '- If nothing is worth adding, output nothing.',
+    '',
+    '=== README (Brain format rules) ===',
+    readme.trim(),
+    '',
+    '=== BRAIN INDEX ===',
+    brainIndex,
+    '',
+    brainSection,
+  ].join('\n') + '\n';
+}
+
+function brainDiff(pre, post) {
+  const changed = [];
+  for (const k of Object.keys(post)) {
+    if (!pre[k])                 changed.push(`appeared: ${k}`);
+    else if (pre[k] !== post[k]) changed.push(`modified: ${k}`);
+  }
+  for (const k of Object.keys(pre)) if (!post[k]) changed.push(`deleted: ${k}`);
+  return changed;
+}
+
+// Checker on everything parsed so far: valid suggestions go to the inbox, and leave out/ so
+// they can't be inboxed twice. Conversations whose chunks are all done are recorded as distilled.
+async function collectFinished(run) {
+  const outDir = join(runDir(run.runId), 'out');
+  const { accepted, dropped } = await checkOutFiles(outDir);
+  const inboxed = await moveToInbox(outDir, accepted);
+  for (const f of accepted) await rm(join(outDir, f), { force: true });
+  run.suggestions += inboxed.length;
+
+  const complete = newlyCompleteItems(run);
+  if (complete.length) {
+    await recordDistilled(complete, { runId: run.runId, agent: run.agent, suggestions: run.suggestions })
+      .then(() => run.recorded.push(...complete.map(t => `${t.source}:${t.id}`)))
+      .catch(e => appendDistillLog(`${run.agent} | ${run.runId} | WARN: could not record distilled items: ${e.message}`));
+  }
+  return { inboxed, dropped };
+}
+
+const countOf = (n, word) => `${n} ${word}${n !== 1 ? 's' : ''}`;
+
+// A call failed, the run was cancelled, or the server restarted: keep what finished and record what remains.
+async function stopRun(state, run, reason) {
+  const { inboxed, dropped } = await collectFinished(run);
+  run.status = 'stopped';
+  run.reason = reason;
+  await saveRun(run);
+
+  const done = doneChunks(run), total = run.chunks.length;
+  state.status = 'stopped';
+  state.result = { inboxed, dropped, done, total, remaining: total - done };
+  state.message = `${reason} ${done} of ${total} calls finished, ${countOf(inboxed.length, 'suggestion')} moved to inbox` +
+    (dropped.length ? `, ${dropped.length} dropped by checker` : '') + `, ${countOf(total - done, 'chunk')} remaining.`;
+  await appendDistillLog(`${run.agent} | ${run.runId} | STOPPED: ${reason} | ${done}/${total} calls done, ` +
+    `${total - done} remaining | ${inboxed.length} → inbox (${inboxed.join(', ')})` +
+    (dropped.length ? ` | DROPPED: ${fmtDropped(dropped)}` : ''));
+}
+
+async function finishRun(state, run) {
+  state.message = 'Checking output…';
+  const { inboxed, dropped } = await collectFinished(run);
+
+  // Delete staging only when nothing was dropped; keep it for inspection otherwise.
+  if (dropped.length === 0) await rm(runDir(run.runId), { recursive: true, force: true });
+  else { run.status = 'done'; await saveRun(run); }
+
+  state.status = 'done';
+  state.result = { inboxed, dropped };
+  state.message = `${countOf(inboxed.length, 'suggestion')} moved to inbox` +
+    (dropped.length ? `, ${dropped.length} dropped by checker` : '');
+  await appendDistillLog(`${run.agent} | ${run.runId} | OK: ${inboxed.length} → inbox (${inboxed.join(', ')})` +
+    (dropped.length ? ` | DROPPED: ${fmtDropped(dropped)}` : ''));
+}
+
+// Send every chunk that isn't done yet, one at a time. Each finished reply is saved before the next call.
+async function executeRun(state, run) {
+  const stagDir  = runDir(run.runId);
+  const agentRun = activeRun;
+  try {
+    if (run.agent !== 'claude' && run.agent !== 'gemini') throw new Error(`Unknown agent: ${run.agent}`);
+    const runAgent = run.agent === 'claude' ? runClaudeAgent : runGeminiAgent;
+
+    run.status = 'running';
+    run.reason = null;
+    await saveRun(run);
+
+    const chunks = splitChunks(await readFile(join(stagDir, 'input.txt'), 'utf8'));
+    const header = await buildDistillHeader();
+    await mkdir(join(stagDir, 'replies'), { recursive: true });
+    const replyFile = i => join(stagDir, 'replies', `chunk-${i + 1}.txt`);
+
+    let earlier = ''; // suggestion blocks from finished chunks, including those of a run being resumed
+    for (let i = 0; i < chunks.length; i++) {
+      if (run.chunks[i].status === 'done') earlier += (await readFile(replyFile(i), 'utf8')).trim() + '\n\n';
+    }
+
+    state.totalCalls = chunks.length;
+    for (let i = 0; i < chunks.length; i++) {
+      if (run.chunks[i].status === 'done') continue;
+      if (agentRun.cancelled) return await stopRun(state, run, 'Cancelled.');
+
+      state.status = 'running';
+      state.callNumber = i + 1;
+      state.message = `Call ${i + 1} of ${chunks.length}`;
+      const callLabel = `${run.agent} | ${run.runId} | call ${i + 1}/${chunks.length}`;
+
+      const preBrain = await fileChecksums(BRAIN, '.git');
+      const started  = Date.now();
+      let reply;
+      try {
+        reply = await runAgent(header + earlierSection(earlier) + '=== INPUT ===\n' + chunks[i], abort => { agentRun.abort = abort; });
+      } catch (e) {
+        await appendDistillLog(`${callLabel} | ${Math.round((Date.now() - started) / 1000)}s | FAIL: ${e.message}`);
+        return await stopRun(state, run, agentRun.cancelled ? 'Cancelled.' : `Call ${i + 1} failed: ${e.message}.`);
+      } finally {
+        agentRun.abort = null;
+      }
+      const durationMs = Date.now() - started;
+
+      // The agent has no tools, so a changed brain means something is wrong: don't trust this reply.
+      const changed = brainDiff(preBrain, await fileChecksums(BRAIN, '.git'));
+      if (changed.length > 0) {
+        const reason = `~/Brain changed during call ${i + 1}: ${changed.join('; ')}.`;
+        await appendDistillLog(`${callLabel} | FAIL: ${reason}`);
+        return await stopRun(state, run, reason);
+      }
+
+      const contractError = checkReplyContract(reply);
+      if (contractError) {
+        await writeFile(join(stagDir, 'replies', `chunk-${i + 1}.rejected.txt`), reply, 'utf8');
+        await appendDistillLog(`${callLabel} | FAIL: ${contractError}`);
+        return await stopRun(state, run, `Call ${i + 1} failed: ${contractError}.`);
+      }
+
+      // Reply first, chunk marked done last: a crash between them only repeats this call.
+      await writeFile(replyFile(i), reply, 'utf8');
+      const suggestions = await parseAgentReply(reply, join(stagDir, 'out'));
+      run.chunks[i] = { status: 'done', durationMs, suggestions, finishedAt: new Date().toISOString() };
+      await saveRun(run);
+      if (reply.trim()) earlier += reply.trim() + '\n\n';
+      await noteCallDuration(durationMs);
+      await appendDistillLog(`${callLabel} | ${Math.round(durationMs / 1000)}s | ${countOf(suggestions, 'suggestion')}`);
+    }
+
+    await finishRun(state, run);
+  } catch (e) {
+    await appendDistillLog(`${run.agent} | ${run.runId} | ERROR: ${e.message}`);
+    try { await stopRun(state, run, `Error: ${e.message}.`); }
+    catch (e2) { state.status = 'failed'; state.message = `Error: ${e2.message}`; }
+  } finally {
+    if (activeRun === agentRun) activeRun = null;
+  }
+}
+
+function newRunState(runId, agent, inputNames, tracked) {
+  return { runId, status: 'pending', message: 'Preparing…', result: null, agent, inputNames, tracked,
+    callNumber: null, totalCalls: null, startedAt: new Date().toISOString() };
+}
+
+// Start a new run: write its staging folder, then execute it.
+async function runDistillPipeline(state, agent, files) {
+  const stagDir = runDir(state.runId);
+  try {
     await mkdir(join(stagDir, 'input'), { recursive: true });
     await mkdir(join(stagDir, 'out'),   { recursive: true });
     for (const f of files) {
       await writeFile(join(stagDir, 'input', basename(f.name)), f.content, 'utf8');
     }
-
-    // ── Build prompt ───────────────────────────────────────────────
-    const today         = localToday();
-    const readme        = await readFile(join(BRAIN, 'README.md'), 'utf8');
-    const brainIndex    = await buildBrainIndex();
-    const brainContent  = await buildBrainContent();
-    const inputText     = files.map(f => `=== ${f.name} ===\n${f.content}`).join('\n\n');
-
-    const brainSection = brainContent
-      ? [
-          '=== CURRENT BRAIN CONTENT ===',
-          'Compare every candidate fact against these files. Skip anything already recorded; suggest only new or changed facts.',
-          '',
-          brainContent,
-          '',
-        ].join('\n')
-      : '';
-
-    const header = [
-      'Respond ONLY with === SUGGESTION === blocks — no other text before, between, or after them.',
-      'Each block is a complete Markdown file with YAML frontmatter:',
-      '',
-      '=== SUGGESTION ===',
-      '---',
-      'title: Short descriptive title',
-      `updated: ${today}`,
-      'target: projects/foo/state.md',
-      '---',
-      '',
-      '- Bullet point fact distilled from the input',
-      '',
-      'Rules:',
-      '- One block per target file.',
-      '- target must be a relative path from the Brain Index, or a new path under projects/ for a brand-new project.',
-      '- Body: bullet-point facts only — distilled and organised. No opinions, no raw transcript.',
-      '- No permalink line in the output.',
-      '- The brain (CURRENT BRAIN CONTENT) is the source of truth. When the input conflicts with the brain, the brain wins: do not suggest the older fact.',
-      '- If the input contains something genuinely newer than the brain, suggest it with its date and keep the history in one line in the form "- <new fact> (since YYYY-MM-DD; previously <older fact>)".',
-      '- Suggest only facts that are absent from the brain. No rewording of facts already present.',
-      '- Never suggest sports, training, fitness, body or diet details (decision in projects/brain/decisions.md).',
-      '- Never create a project for something the brain says belongs to someone else.',
-      '- If nothing is worth adding, output nothing.',
-      '',
-      '=== README (Brain format rules) ===',
-      readme.trim(),
-      '',
-      '=== BRAIN INDEX ===',
-      brainIndex,
-      '',
-      brainSection,
-    ].join('\n') + '\n';
-
-    // Shown to every call after the first, so a split input doesn't produce duplicate suggestions.
-    const earlierSection = earlier => earlier.trim() ? [
-      '=== SUGGESTIONS ALREADY MADE IN THIS RUN ===',
-      'Earlier parts of this same input already produced the suggestions below.',
-      'Do not repeat them or reword them. Suggest only facts that are not already covered here or in the brain.',
-      '',
-      earlier.trim(),
-      '',
-    ].join('\n') + '\n' : '';
-
-    // Each chunk carries the full header plus up to CHARS_PER_CALL characters of input,
-    // matching the distill-call estimates shown in the Import window.
-    const available  = CHARS_PER_CALL;
-    const chunks     = [];
-    for (let offset = 0; offset < inputText.length || chunks.length === 0; offset += available) {
-      chunks.push(inputText.slice(offset, offset + available));
-    }
-
-    // ── Pre-run Brain checksum ─────────────────────────────────────
-    const preBrainSnap = await fileChecksums(BRAIN, '.git');
-
-    // ── Run agent ──────────────────────────────────────────────────
-    if (agent !== 'claude' && agent !== 'gemini') throw new Error(`Unknown agent: ${agent}`);
-    const runAgent = agent === 'claude' ? runClaudeAgent : runGeminiAgent;
-
-    let allStdout = '';
-    let earlier   = ''; // suggestion blocks from contract-conforming earlier chunks
-    let contractError = null;
-    for (let i = 0; i < chunks.length; i++) {
-      state.status  = 'running';
-      state.message = `${agentLabel} distilling${chunks.length > 1 ? ` (chunk ${i+1}/${chunks.length})` : ''}…`;
-      const prompt = header + earlierSection(earlier) + '=== INPUT ===\n' + chunks[i];
-      const reply = await runAgent(prompt);
-      const err = checkReplyContract(reply);
-      if (err && !contractError) contractError = chunks.length > 1 ? `chunk ${i+1}: ${err}` : err;
-      if (!err && reply.trim()) earlier += reply.trim() + '\n\n';
-      allStdout += reply + '\n';
-    }
-
-    state.message = 'Checking output…';
-
-    // ── Post-run Brain checksum check ──────────────────────────────
-    const postBrainSnap = await fileChecksums(BRAIN, '.git');
-    const brainChanged  = [];
-    for (const k of Object.keys(postBrainSnap)) {
-      if (!preBrainSnap[k])                          brainChanged.push(`appeared: ${k}`);
-      else if (preBrainSnap[k] !== postBrainSnap[k]) brainChanged.push(`modified: ${k}`);
-    }
-    for (const k of Object.keys(preBrainSnap)) {
-      if (!postBrainSnap[k]) brainChanged.push(`deleted: ${k}`);
-    }
-    if (brainChanged.length > 0) {
-      const reason = `~/Brain changed during run: ${brainChanged.join('; ')}`;
-      state.status = 'failed'; state.message = reason;
-      await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${reason}`);
-      return;
-    }
-
-    // ── Output contract (run-level) ────────────────────────────────
-    if (contractError) {
-      await writeFile(join(stagDir, 'out', 'raw-reply.txt'), allStdout, 'utf8');
-      state.status = 'failed'; state.message = contractError;
-      await appendDistillLog(`${agent} | ${inputLabel} | FAIL: ${contractError}`);
-      return;
-    }
-
-    // ── Parse reply → out/, then per-file checks ───────────────────
-    const outDir = join(stagDir, 'out');
-    await parseAgentReply(allStdout, outDir);
-    const { accepted, dropped } = await checkOutFiles(outDir);
-
-    // ── Move accepted files to ~/Brain/inbox/ ──────────────────────
-    const inboxed = await moveToInbox(outDir, accepted);
-
-    // Delete staging only when nothing was dropped; keep it for inspection otherwise.
-    if (dropped.length === 0) await rm(stagDir, { recursive: true, force: true });
-    else for (const f of accepted) await rm(join(outDir, f), { force: true }); // don't re-inbox on a recheck
-
-    state.status = 'done';
-    state.result = { inboxed, dropped };
-    state.message = `${inboxed.length} suggestion${inboxed.length !== 1 ? 's' : ''} moved to inbox` +
-      (dropped.length ? `, ${dropped.length} dropped by checker` : '');
-    await appendDistillLog(`${agent} | ${inputLabel} | OK: ${inboxed.length} → inbox (${inboxed.join(', ')})` +
-      (dropped.length ? ` | DROPPED: ${fmtDropped(dropped)}` : ''));
-    if (state.tracked?.length) {
-      await recordDistilled(state.tracked, { runId: state.runId, agent, suggestions: inboxed.length })
-        .catch(e => appendDistillLog(`${agent} | ${state.runId} | WARN: could not record distilled items: ${e.message}`));
-    }
-
+    const { text, ranges } = combineInput(files);
+    await writeFile(join(stagDir, 'input.txt'), text, 'utf8');
+    const run = {
+      runId: state.runId, agent, status: 'running', reason: null, createdAt: state.startedAt,
+      inputNames: state.inputNames, tracked: state.tracked || [], ranges,
+      chunks: splitChunks(text).map(() => ({ status: 'pending' })),
+      suggestions: 0, recorded: [],
+    };
+    await saveRun(run);
+    await executeRun(state, run);
   } catch (e) {
+    activeRun = null;
     state.status  = 'failed';
     state.message = `Error: ${e.message}`;
-    await appendDistillLog(`${agent} | ${inputLabel} | ERROR: ${e.message}`);
+    await appendDistillLog(`${agent} | ${state.runId} | ERROR: ${e.message}`);
+  }
+}
+
+// A run still marked running at startup was cut off by a restart or crash.
+async function recoverInterruptedRuns() {
+  for (const run of await listRuns()) {
+    if (run.status !== 'running') continue;
+    const state = newRunState(run.runId, run.agent, run.inputNames, run.tracked);
+    await stopRun(state, run, 'The server restarted during the run.').catch(e =>
+      appendDistillLog(`${run.agent} | ${run.runId} | ERROR: recovery failed: ${e.message}`));
+    runStore.set(run.runId, state);
   }
 }
 
@@ -920,12 +1077,11 @@ app.post('/api/distill/run', async (req, res) => {
   if (!agent || !Array.isArray(files) || files.length === 0)
     return res.status(400).json({ error: 'agent and files[] required' });
 
+  if (activeRun) return res.status(409).json({ error: 'Another distill run is in progress' });
+
   const runId = makeRunId();
-  const state = {
-    runId, status: 'pending', message: 'Preparing…',
-    result: null, agent, inputNames: files.map(f => f.name),
-    startedAt: new Date().toISOString(),
-  };
+  const state = newRunState(runId, agent, files.map(f => f.name), []);
+  activeRun = { runId, abort: null, cancelled: false };
   runStore.set(runId, state);
   res.json({ runId });
   runDistillPipeline(state, agent, files).catch(() => {});
@@ -938,7 +1094,7 @@ app.post('/api/distill/import', async (req, res) => {
   if (!agent) return res.status(400).json({ error: 'agent required' });
 
   const files = [];
-  const tracked = []; // recorded in distilled.json if the run succeeds
+  const tracked = []; // recorded in distilled.json once all their chunks are done
   const convDir = getConvDir();
   const memDir  = getMemDir();
 
@@ -946,14 +1102,14 @@ app.post('/api/distill/import', async (req, res) => {
   const counts = async dir => new Map((await readIndex(dir)).map(c => [c.uuid, c.messageCount]));
   const [claudeCounts, chatgptCounts, geminiCounts] = await Promise.all(
     [convDir, getChatgptConvDir(), getGeminiConvDir()].map(counts));
-  const track = (source, id, map) => tracked.push({ source, id, messageCount: map.get(id) ?? null });
+  const track = (source, id, map, name) => tracked.push({ source, id, names: [name], messageCount: map.get(id) ?? null });
 
   for (const uuid of conversationUuids) {
     if (!/^[0-9a-f-]{8,}$/i.test(uuid)) continue;
     try {
       const content = await readFile(join(convDir, `${uuid}.txt`), 'utf8');
       files.push({ name: `conv-${uuid.slice(0, 8)}.txt`, content });
-      track('claude', uuid, claudeCounts);
+      track('claude', uuid, claudeCounts, `conv-${uuid.slice(0, 8)}.txt`);
     } catch { /* skip missing */ }
   }
 
@@ -963,7 +1119,7 @@ app.post('/api/distill/import', async (req, res) => {
     try {
       const content = await readFile(join(chatgptDir, `${id}.txt`), 'utf8');
       files.push({ name: `chatgpt-${id.slice(0, 8)}.txt`, content });
-      track('chatgpt', id, chatgptCounts);
+      track('chatgpt', id, chatgptCounts, `chatgpt-${id.slice(0, 8)}.txt`);
     } catch { /* skip missing */ }
   }
 
@@ -973,7 +1129,7 @@ app.post('/api/distill/import', async (req, res) => {
     try {
       const content = await readFile(join(geminiDir, `${id}.txt`), 'utf8');
       files.push({ name: `${id.slice(0, 15)}.txt`, content });
-      track('gemini', id, geminiCounts);
+      track('gemini', id, geminiCounts, `${id.slice(0, 15)}.txt`);
     } catch { /* skip missing */ }
   }
 
@@ -1001,19 +1157,19 @@ app.post('/api/distill/import', async (req, res) => {
     }
     await walkMemFiles(join(memDir, 'memory_files'));
     // Claude memories are one item; totalChars flags a later export with changed memories.
-    if (files.some(f => f.name.startsWith('memory-') || f.name.startsWith('memfile-'))) {
-      tracked.push({ source: 'memories', id: 'claude-memories', totalChars: (await memStatsFromDisk()).totalChars });
+    const memNames = files.map(f => f.name).filter(n => n.startsWith('memory-') || n.startsWith('memfile-'));
+    if (memNames.length) {
+      tracked.push({ source: 'memories', id: 'claude-memories', names: memNames, totalChars: (await memStatsFromDisk()).totalChars });
     }
   }
 
   if (files.length === 0) return res.status(400).json({ error: 'No import content found — parse first' });
 
+  if (activeRun) return res.status(409).json({ error: 'Another distill run is in progress' });
+
   const runId = makeRunId();
-  const state = {
-    runId, status: 'pending', message: 'Preparing…',
-    result: null, agent, inputNames: files.map(f => f.name), tracked,
-    startedAt: new Date().toISOString(),
-  };
+  const state = newRunState(runId, agent, files.map(f => f.name), tracked);
+  activeRun = { runId, abort: null, cancelled: false };
   runStore.set(runId, state);
   res.json({ runId });
   runDistillPipeline(state, agent, files).catch(() => {});
@@ -1027,14 +1183,16 @@ app.get('/api/import/distilled', async (_req, res) => {
 // Re-run the checker on a kept staging folder (no agent call) and move valid files to the inbox.
 app.post('/api/distill/recheck/:runId', async (req, res) => {
   const { runId } = req.params;
-  if (!/^[0-9]{8}-[0-9]{6}-[a-z0-9]{4}$/.test(runId)) return res.status(400).json({ error: 'Invalid runId' });
+  if (!RUN_ID_RE.test(runId)) return res.status(400).json({ error: 'Invalid runId' });
   const stagDir = join(STAGING_BASE, runId);
   const outDir  = join(stagDir, 'out');
   try { await stat(outDir); } catch { return res.status(404).json({ error: 'Staging folder not found' }); }
   try {
+    if (activeRun?.runId === runId) return res.status(409).json({ error: 'Run is in progress' });
     const { accepted, dropped } = await checkOutFiles(outDir);
     const inboxed = await moveToInbox(outDir, accepted);
-    if (dropped.length === 0) await rm(stagDir, { recursive: true, force: true });
+    const stopped = (await loadRun(runId))?.status === 'stopped'; // a stopped run still needs its folder for Resume
+    if (dropped.length === 0 && !stopped) await rm(stagDir, { recursive: true, force: true });
     else for (const f of accepted) await rm(join(outDir, f), { force: true }); // don't re-inbox on a second recheck
     await appendDistillLog(`recheck | ${runId} | OK: ${inboxed.length} → inbox (${inboxed.join(', ')})` +
       (dropped.length ? ` | DROPPED: ${fmtDropped(dropped)}` : ''));
@@ -1043,6 +1201,49 @@ app.post('/api/distill/recheck/:runId', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// The run in progress, the stopped runs that can be resumed, and the average call time for estimates.
+app.get('/api/distill/runs', async (_req, res) => {
+  const stopped = (await listRuns())
+    .filter(r => r.status === 'stopped' && r.runId !== activeRun?.runId)
+    .sort((a, b) => b.runId.localeCompare(a.runId))
+    .map(r => ({ runId: r.runId, agent: r.agent, reason: r.reason, createdAt: r.createdAt,
+      inputNames: r.inputNames, tracked: r.tracked, suggestions: r.suggestions,
+      total: r.chunks.length, done: doneChunks(r) }));
+  const durations = await loadCallDurations();
+  res.json({
+    active: activeRun ? { runId: activeRun.runId } : null,
+    stopped,
+    callSamples: durations.length,
+    avgCallMs: durations.length ? Math.round(durations.reduce((n, d) => n + d, 0) / durations.length) : DEFAULT_CALL_MS,
+  });
+});
+
+// Cancel the run in progress: kills the current call; finished calls are kept.
+app.post('/api/distill/cancel/:runId', (req, res) => {
+  if (activeRun?.runId !== req.params.runId) return res.status(409).json({ error: 'Run is not in progress' });
+  activeRun.cancelled = true;
+  activeRun.abort?.('Cancelled');
+  const state = runStore.get(req.params.runId);
+  if (state) state.message = 'Cancelling…';
+  res.json({ ok: true });
+});
+
+// Resume a stopped run: sends only the chunks that aren't done.
+app.post('/api/distill/resume/:runId', async (req, res) => {
+  const { runId } = req.params;
+  if (!RUN_ID_RE.test(runId)) return res.status(400).json({ error: 'Invalid runId' });
+  const run = await loadRun(runId);
+  if (!run) return res.status(404).json({ error: 'Run not found' });
+  if (run.status !== 'stopped') return res.status(409).json({ error: 'Run is not stopped' });
+  if (activeRun) return res.status(409).json({ error: 'Another distill run is in progress' });
+
+  const state = newRunState(runId, run.agent, run.inputNames, run.tracked);
+  activeRun = { runId, abort: null, cancelled: false };
+  runStore.set(runId, state);
+  res.json({ runId });
+  executeRun(state, run).catch(() => {});
 });
 
 // Poll run status
@@ -1207,6 +1408,8 @@ app.use(express.static(join(__dirname, 'dist')));
 app.use((_req, res) =>
   res.sendFile(join(__dirname, 'dist', 'index.html'))
 );
+
+recoverInterruptedRuns();
 
 app.listen(PORT, '127.0.0.1', () =>
   console.log(`Brain app → http://localhost:${PORT}`)
