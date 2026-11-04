@@ -4,7 +4,7 @@ import * as THREE from 'three';
 import { setAutoRotate, controls } from './brain.js';
 
 // ─── STYLES BY CATEGORY ─────────────────────────────────────────────────────
-const STYLE = {
+export const STYLE = {
   projects:    { color: '#ffffff', fontWeight: '700', fontSize: '15px' },
   archive:     { color: '#A3ADD1', fontWeight: '400', fontSize: '12px' },
   people:      { color: '#B9A6FF', fontWeight: '400', fontSize: '15px' },

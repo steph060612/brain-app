@@ -6,6 +6,7 @@ import { initTopbar } from './topbar.js';
 import { initInbox } from './inbox.js';
 import { initDistill } from './distill.js';
 import { initImport } from './import.js';
+import { initList } from './list.js';
 import { fetchItems } from './api.js';
 
 async function boot() {
@@ -23,6 +24,7 @@ async function boot() {
   }
 
   initLabels(items, surfPool, surfNormVecs, camera, openPanel);
+  initList(items, openPanel);
 
   onAnimate(() => updateLabels(camera));
 }

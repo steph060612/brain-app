@@ -38,10 +38,12 @@ function err403(m) { const e = new Error(m); e.status = 403; return e; }
 const md5 = s => createHash('md5').update(s).digest('hex');
 
 // YYYY-MM-DD in local time (toISOString() is UTC and gives tomorrow's date in the evening).
-function localToday() {
-  const d = new Date(), p = n => String(n).padStart(2, '0');
+function localDate(d) {
+  const p = n => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
+
+const localToday = () => localDate(new Date());
 
 // Extract the permalink line from frontmatter (we must never alter it)
 function pickPermalink(content) {
@@ -344,6 +346,21 @@ async function subdirs(dir) {
 
 // ─── ROUTES ──────────────────────────────────────────────────────────────────
 
+// Last updated day of a file: the later of its frontmatter date and its modification time.
+// Frontmatter alone goes stale, because edits outside the app's approve flow don't touch it.
+async function fileUpdated(rel) {
+  const abs = join(BRAIN, rel);
+  const declared = (parseFM(await readFile(abs, 'utf8')).updated || '').replace(/['"]/g, '');
+  const modified = localDate((await stat(abs)).mtime);
+  return /^\d{4}-\d{2}-\d{2}$/.test(declared) && declared > modified ? declared : modified;
+}
+
+// A folder item's date is that of its newest file; null if it has no files.
+async function itemUpdated(files) {
+  const dates = await Promise.all(files.map(fileUpdated));
+  return dates.sort().at(-1) ?? null;
+}
+
 // List all Brain items: projects, archive, people, topics, profile, preferences
 app.get('/api/items', async (_req, res) => {
   try {
@@ -394,6 +411,7 @@ app.get('/api/items', async (_req, res) => {
       } catch { /* file absent */ }
     }
 
+    await Promise.all(items.map(async item => { item.updated = await itemUpdated(item.files); }));
     res.json(items);
   } catch (e) {
     res.status(500).json({ error: e.message });

@@ -1,6 +1,7 @@
 // Top bar: search input + last git commit time.
 import { fetchGitLog } from './api.js';
 import { setSearchQuery } from './labels.js';
+import { setListQuery } from './list.js';
 
 export function initTopbar() {
   const bar = document.getElementById('topbar');
@@ -8,7 +9,7 @@ export function initTopbar() {
 
   const input = document.getElementById('search-input');
   if (input) {
-    input.addEventListener('input', () => setSearchQuery(input.value));
+    input.addEventListener('input', () => { setSearchQuery(input.value); setListQuery(input.value); });
   }
 
   // Fetch git log once and display
