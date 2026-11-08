@@ -263,7 +263,7 @@ async function loadTab(idx) {
     const fm = parseFrontmatter(content);
 
     document.getElementById('panel-meta').textContent =
-      fm.updated ? `Updated ${fm.updated}` : '';
+      fm.updated ? `Updated ${String(fm.updated).replace(/['"]/g, '')}` : '';
 
     renderReadView(content, path);
   } catch (e) {

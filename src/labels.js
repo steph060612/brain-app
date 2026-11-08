@@ -166,13 +166,14 @@ export function updateLabels(camera) {
   }
 
   // Phase 2 — push overlapping visible labels apart
-  const vis = labels.filter(lb => lb._op > 0.25);
+  // Every label that can be seen takes part, so a fading label never sits on top of a clear one.
+  const vis = labels.filter(lb => lb._op > 0.05);
   if (vis.length > 1) {
     for (const lb of vis) {
       lb._hw = (lb.el.offsetWidth  || 80) * 0.5 + 5;  // half-width + margin
       lb._hh = (lb.el.offsetHeight || 16) * 0.5 + 4;  // half-height + margin
     }
-    for (let iter = 0; iter < 8; iter++) {
+    for (let iter = 0; iter < 16; iter++) {
       for (let i = 0; i < vis.length - 1; i++) {
         const a = vis[i];
         for (let j = i + 1; j < vis.length; j++) {
@@ -191,6 +192,18 @@ export function updateLabels(camera) {
             }
           }
         }
+      }
+    }
+  }
+
+  // Phase 2b — if two labels still overlap after pushing, keep the clearer one and fade the other,
+  // so text is never drawn on top of other text.
+  for (let i = 0; i < vis.length - 1; i++) {
+    for (let j = i + 1; j < vis.length; j++) {
+      const a = vis[i], b = vis[j];
+      if (a._hw + b._hw - Math.abs(b._px - a._px) > 2 && a._hh + b._hh - Math.abs(b._py - a._py) > 2) {
+        const loser = (a._hovered || a._op > b._op) ? b : a;
+        if (!loser._hovered) loser._op = Math.min(loser._op, 0.04);
       }
     }
   }

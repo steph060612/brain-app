@@ -14,6 +14,7 @@ function copyButton(label, hint) {
   const hintEl = document.createElement('span');
   hintEl.textContent = ` · ${hint}`;
   hintEl.style.color = '#5a6890';
+  hintEl.className = 'btn-hint';
   btn.appendChild(labelEl);
   if (hint) btn.appendChild(hintEl);
   return { btn, labelEl };

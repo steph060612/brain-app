@@ -43,6 +43,12 @@
         margin-left: auto;        /* pushes everything after search to the right */
       }
       #inbox-btn:hover { border-color: rgba(100,120,200,0.5) !important; }
+      #topbar { overflow-x: auto; scrollbar-width: none; }
+      #topbar::-webkit-scrollbar { display: none; }
+      #topbar > * { flex-shrink: 0; }
+      #git-time { white-space: nowrap; }
+      @media (max-width: 1150px) { #topbar .btn-hint { display: none; } #topbar { gap: 10px; } }
+      @media (max-width: 860px)  { #search-input { width: 110px; } #git-time { display: none; } #topbar { gap: 8px; padding: 0 10px; } }
     </style>
   </head>
   <body>
