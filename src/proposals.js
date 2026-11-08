@@ -105,7 +105,15 @@ function parseOldNew(lines) {
     if (!m) continue;
     const key = m.word;
     if (key in out) return { error: `more than one ${key} line` };
-    if (m.value.trim() !== '') { out[key] = unBacktick(m.value); continue; }
+    if (m.value.trim() !== '') {
+      out[key] = unBacktick(m.value);
+      // NEW may continue on the following lines (one line replaced by several, e.g. new sub-bullets).
+      // Take every following non-blank line that is not another label, so nothing is silently dropped.
+      if (key === 'NEW') {
+        while (i + 1 < lines.length && lines[i + 1].trim() !== '' && !oldNewLine(lines[i + 1])) out.NEW += '\n' + lines[++i];
+      }
+      continue;
+    }
     const next = lines.slice(i + 1).findIndex(l => l.trim() !== '');
     const val = next < 0 ? undefined : lines[i + 1 + next];
     if (val === undefined || oldNewLine(val)) return { error: `${key} has no line after it` };
@@ -149,7 +157,7 @@ export function normalizeBlock(b, { isAllowedTarget }) {
     const r = parseOldNew(b.content);
     if (r.error) return { error: r.error };
     if (!r.old.trim()) return { error: 'OLD line is empty' };
-    if (/[\n\r]/.test(r.old) || /[\n\r]/.test(r.new)) return { error: 'OLD and NEW must be single lines' };
+    if (/[\n\r]/.test(r.old)) return { error: 'OLD must be a single line' };
     return { file, action, old: r.old, new: r.new };
   }
   if (action === 'frontmatter') {
@@ -203,7 +211,7 @@ export function toInboxFile(p, today, batch, order) {
 // Read the body of an inbox file back for its action.
 export function readInboxBody(action, body) {
   if (action === 'replace-line') {
-    const m = body.match(/^=== OLD ===\n([^\n]*)\n=== NEW ===\n([^\n]*)\n?$/);
+    const m = body.match(/^=== OLD ===\n([^\n]*)\n=== NEW ===\n([\s\S]*?)\n?$/);
     if (!m) return { error: 'replace-line item is malformed (expected === OLD === and === NEW === lines)' };
     return { old: m[1], new: m[2] };
   }
