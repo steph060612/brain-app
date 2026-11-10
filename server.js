@@ -17,7 +17,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const execAsync = promisify(exec);
 const app   = express();
-const PORT  = 5180;
+const PORT  = Number(process.env.BRAIN_PORT) || 5180; // set per install in the LaunchAgent
 const BRAIN = resolve(homedir(), 'Brain');
 
 app.use(express.json({ limit: '2mb' }));
@@ -511,7 +511,17 @@ app.post('/api/file', async (req, res) => {
 });
 
 // Last git commit in ~/Brain
+// On a Mac without the developer tools, running git opens Apple's install dialog; check once instead.
+let hasGit = null;
+async function gitAvailable() {
+  if (hasGit === null) {
+    try { await execAsync('xcode-select -p', { timeout: 5000 }); hasGit = true; } catch { hasGit = false; }
+  }
+  return hasGit;
+}
+
 app.get('/api/gitlog', async (_req, res) => {
+  if (!(await gitAvailable())) return res.json({ lastCommit: null });
   try {
     const { stdout } = await execAsync(`git -C "${BRAIN}" log -1 --format="%ci"`, { timeout: 5000 });
     const raw = stdout.trim();

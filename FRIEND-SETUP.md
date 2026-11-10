@@ -3,20 +3,20 @@
 The Brain is a folder of plain notes on your Mac (`~/Brain`) that any AI assistant can work from, plus a small app at http://localhost:5180 to read it, copy context packs and approve changes. Nothing leaves your Mac unless you paste it into a chat yourself.
 
 ## What you need
-- A Mac.
-- Node.js 20 or newer (`brew install node`) and git (`xcode-select --install`).
-- An assistant plan. This guide assumes ChatGPT.
+- A Mac (personal, not a work-managed one).
+- An assistant plan: ChatGPT, Claude or Perplexity.
+- About 5 minutes.
 
-## Install (about 10 minutes)
-1. Put the `brain-app` folder at `~/Projects/brain-app`.
-2. In Terminal:
+## Install
+1. Open Terminal (press Command and Space, type Terminal, press Return).
+2. Paste this line and press Return:
    ```sh
-   cd ~/Projects/brain-app
-   bash scripts/install.sh "YourFirstName"
+   curl -fsSL https://raw.githubusercontent.com/steph060612/brain-app/main/get.sh | bash
    ```
-3. Open http://localhost:5180 in Safari, then File > Add to Dock.
+3. Type your first name when asked.
+4. Safari opens the Brain app. Keep it: File > Add to Dock.
 
-The installer creates an empty brain, starts the app at every login, and saves a local copy of the brain every 15 minutes. It never overwrites an existing `~/Brain`.
+macOS may show "Background Items Added": that is the app starting at login, leave it on. If it offers to install developer tools, accept; it enables local backups. The same line later updates the app without touching your brain.
 
 ## First session: fill your brain
 1. In the app, click **Copy setup interview** (top bar; it shows only while you have no projects).
