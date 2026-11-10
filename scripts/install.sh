@@ -13,6 +13,16 @@ TODAY="$(date +%Y-%m-%d)"
 fail() { echo "Stopped: $1" >&2; exit 1; }
 step() { echo; echo "==> $1"; }
 
+# Download with a progress bar; on a dropped connection, resume where it stopped (up to 5 times).
+fetch() {
+  local url="$1" out="$2" n=0
+  while [ "$n" -lt 5 ]; do
+    curl -fL --progress-bar --connect-timeout 20 --retry 3 --retry-delay 3 -C - "$url" -o "$out" && return 0
+    n=$((n + 1)); echo "Connection dropped, resuming ($n of 5)..." >&2; sleep 3
+  done
+  return 1
+}
+
 [ "$(uname)" = "Darwin" ] || fail "this installer is for macOS only."
 [ -f "$AGENTS_DIR/com.steph.brain-app.plist" ] && fail "this Mac runs the developer version of the Brain app; do not install over it."
 
@@ -51,10 +61,10 @@ else
   case "$(uname -m)" in arm64) ARCH=arm64 ;; x86_64) ARCH=x64 ;; *) fail "unsupported processor $(uname -m)." ;; esac
   echo "Downloading Node (about 50 MB)..."
   BASE="https://nodejs.org/dist/latest-v22.x"
-  LINE="$(curl -fsSL "$BASE/SHASUMS256.txt" | grep -E " node-v[0-9.]+-darwin-$ARCH\.tar\.gz$" | head -1)" || fail "could not reach nodejs.org."
+  LINE="$(curl -fsSL --retry 5 --retry-delay 3 --connect-timeout 20 "$BASE/SHASUMS256.txt" | grep -E " node-v[0-9.]+-darwin-$ARCH\.tar\.gz$" | head -1)" || fail "could not reach nodejs.org."
   SUM="${LINE%% *}"; FILE="${LINE##* }"
   TMP="$(mktemp -d)"
-  curl -fsSL "$BASE/$FILE" -o "$TMP/$FILE" || fail "Node download failed."
+  fetch "$BASE/$FILE" "$TMP/$FILE" || fail "the Node download failed 5 times. Check the internet connection and run the same line again."
   [ "$(shasum -a 256 "$TMP/$FILE" | cut -d' ' -f1)" = "$SUM" ] || fail "Node download is corrupted (checksum mismatch)."
   mkdir -p "$NODE_DIR"
   tar -xzf "$TMP/$FILE" -C "$NODE_DIR" --strip-components 1
