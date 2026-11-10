@@ -558,7 +558,7 @@ function updateFooter() {
 }
 
 // ─── RUN ──────────────────────────────────────────────────────────────────────
-const agentName = agent => agent === 'claude' ? 'Claude' : 'Gemini';
+const agentName = agent => ({ claude: 'Claude', gemini: 'Gemini', codex: 'Codex' }[agent] || agent);
 
 // Runs above CONFIRM_ABOVE_CALLS spend real usage and take a while, so ask first.
 async function confirmCalls(calls, onConfirm, onBack) {

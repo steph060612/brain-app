@@ -97,7 +97,7 @@ let activeRun = null; // { runId, abort, cancelled }: one run at a time, so two 
 let importParseState = null; // null = never run, or { status, startedAt, finishedAt, result, error }
 const PARSE_STATE_FILE = resolve(homedir(), '.brain', 'imports', 'last-parse.json');
 
-const AGENT_PATH = '/Users/stefanopozzato/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin';
+const AGENT_PATH = `${homedir()}/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin`;
 
 function makeRunId() {
   const d = new Date(), p = n => String(n).padStart(2, '0');
@@ -314,6 +314,25 @@ const runGeminiAgent = (prompt, onAbort) => runAgentProcess('Gemini', 'agy', [
   '--sandbox', '--print-timeout', '300s', '--print', prompt,
 ], { onAbort });
 
+// Run codex exec in its read-only sandbox (ChatGPT plans); prompt on stdin, final reply on stdout.
+// Experimental: flags verified by verifyCodexHeadless on each machine before Codex is offered.
+const CODEX_ARGS = ['exec', '--sandbox', 'read-only', '--skip-git-repo-check', '-'];
+const runCodexAgent = (prompt, onAbort) => runAgentProcess('Codex', 'codex', CODEX_ARGS, { stdin: prompt, onAbort });
+
+let codexDisabledReason = undefined; // undefined=unchecked, null=ok, string=reason
+async function verifyCodexHeadless() {
+  if (codexDisabledReason !== undefined) return codexDisabledReason;
+  try {
+    const out = await runAgentProcess('Codex', 'codex', CODEX_ARGS, { stdin: 'Reply with the single word: ok' });
+    codexDisabledReason = out.trim() ? null : 'codex returned empty output for ping test';
+  } catch (e) {
+    codexDisabledReason = `codex headless test failed: ${e.message.slice(0, 160)}`;
+  }
+  return codexDisabledReason;
+}
+
+const AGENT_RUNNERS = { claude: runClaudeAgent, gemini: (...a) => runGeminiAgent(...a), codex: runCodexAgent };
+
 // Confirm agy is reachable and produces text output in headless mode (no file tools needed).
 let geminiDisabledReason = undefined; // undefined=unchecked, null=ok, string=reason
 async function verifyGeminiHeadless() {
@@ -512,9 +531,10 @@ const PACKS_DIR = resolve(homedir(), '.brain', 'packs');
 app.post('/api/pack', async (req, res) => {
   const { mode = 'full' } = req.body || {};
   const project = String(req.body?.project || '');
-  if (!['full', 'project-only', 'general'].includes(mode)) return res.status(400).json({ error: 'Invalid pack mode' });
-  if (mode !== 'general' && !/^[a-z0-9][a-z0-9-]*$/.test(project)) return res.status(400).json({ error: 'Invalid project name' });
-  const args = mode === 'general' ? ['--general'] : mode === 'project-only' ? ['--project-only', project] : [project];
+  if (!['full', 'project-only', 'general', 'setup'].includes(mode)) return res.status(400).json({ error: 'Invalid pack mode' });
+  const noProject = mode === 'general' || mode === 'setup';
+  if (!noProject && !/^[a-z0-9][a-z0-9-]*$/.test(project)) return res.status(400).json({ error: 'Invalid project name' });
+  const args = mode === 'general' ? ['--general'] : mode === 'setup' ? ['--setup'] : mode === 'project-only' ? ['--project-only', project] : [project];
   // LaunchAgents start without a locale; pbcopy then re-encodes non-ASCII text, so force UTF-8.
   const env = { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' };
   execFile(BRAINPACK, args, { timeout: 15000, env }, async (err, stdout, stderr) => {
@@ -732,7 +752,7 @@ const CONVERT_INSTRUCTION = '- The input is a session summary, not a raw convers
 
 app.post('/api/inbox/convert', (req, res) => {
   const { agent, text } = req.body || {};
-  if (agent !== 'claude' && agent !== 'gemini') return res.status(400).json({ error: 'agent required' });
+  if (!AGENT_RUNNERS[agent]) return res.status(400).json({ error: 'agent required' });
   if (typeof text !== 'string' || !text.trim()) return res.status(400).json({ error: 'Nothing to convert' });
   if (activeRun) return res.status(409).json({ error: 'Another distill run is in progress' });
 
@@ -783,6 +803,15 @@ app.get('/api/distill/agents', async (_req, res) => {
     else { agents.push('gemini'); }
   } catch {
     reasons.gemini = 'agy not installed';
+  }
+
+  try {
+    await execAsync('which codex', { env: { ...process.env, PATH: AGENT_PATH } });
+    const reason = await verifyCodexHeadless();
+    if (reason) { reasons.codex = reason; }
+    else { agents.push('codex'); }
+  } catch {
+    reasons.codex = 'codex not installed';
   }
 
   res.json({ agents, reasons });
@@ -1072,8 +1101,8 @@ async function executeRun(state, run) {
   const stagDir  = runDir(run.runId);
   const agentRun = activeRun;
   try {
-    if (run.agent !== 'claude' && run.agent !== 'gemini') throw new Error(`Unknown agent: ${run.agent}`);
-    const runAgent = run.agent === 'claude' ? runClaudeAgent : runGeminiAgent;
+    const runAgent = AGENT_RUNNERS[run.agent];
+    if (!runAgent) throw new Error(`Unknown agent: ${run.agent}`);
 
     run.status = 'running';
     run.reason = null;

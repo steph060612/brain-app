@@ -2,7 +2,7 @@
 import { camera, surfPool, surfNormVecs, onAnimate } from './brain.js';
 import { initLabels, updateLabels } from './labels.js';
 import { initPanel, openPanel } from './panel.js';
-import { initTopbar } from './topbar.js';
+import { initTopbar, showSetupIfEmpty } from './topbar.js';
 import { initInbox } from './inbox.js';
 import { initDistill } from './distill.js';
 import { initImport } from './import.js';
@@ -25,6 +25,7 @@ async function boot() {
 
   initLabels(items, surfPool, surfNormVecs, camera, openPanel);
   initList(items, openPanel);
+  showSetupIfEmpty(items);
 
   onAnimate(() => updateLabels(camera));
 }

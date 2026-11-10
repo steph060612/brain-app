@@ -21,6 +21,14 @@ export function initTopbar() {
     hint: 'new chat, no project yet',
     body: () => ({ mode: 'general' }),
   }), gitTime);
+  const setupBtn = packButton({
+    label: 'Copy setup interview',
+    hint: 'first session, fills an empty brain',
+    body: () => ({ mode: 'setup' }),
+  });
+  setupBtn.id = 'setup-btn';
+  setupBtn.style.display = 'none';
+  gitTime?.parentNode.insertBefore(setupBtn, gitTime);
   gitTime?.parentNode.insertBefore(textCopyButton({
     label: 'Copy close-session prompt',
     text: CLOSE_SESSION_PROMPT,
@@ -41,4 +49,10 @@ export function initTopbar() {
       el.textContent = '';
     }
   }).catch(() => {});
+}
+
+// The setup interview is offered only while the brain has no projects yet.
+export function showSetupIfEmpty(items) {
+  const btn = document.getElementById('setup-btn');
+  if (btn) btn.style.display = items.some(i => i.category === 'projects') ? 'none' : '';
 }

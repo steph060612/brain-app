@@ -268,7 +268,7 @@ async function startRun(agent, fileObjects) {
   }
 
   await confirmCalls(callsForFiles(files),
-    () => postRun('/api/distill/run', { agent, files }, `Starting ${agent === 'claude' ? 'Claude' : 'Gemini'}…`),
+    () => postRun('/api/distill/run', { agent, files }, `Starting ${({ claude: 'Claude', gemini: 'Gemini', codex: 'Codex' }[agent] || agent)}…`),
     () => renderIdle(agent, fileObjects));
 }
 
