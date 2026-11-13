@@ -1,13 +1,24 @@
 #!/usr/bin/env node
-// Standalone code mapper: builds a file-level import map of a JavaScript project.
+// Standalone code mapper: builds a file-level map of a JavaScript project.
 // Usage: node src/mapper.js <project folder> <output name>
 // Read-only on the project. Writes only ~/.brain/maps/<output name>/map.json.
+//
+// Layers: imports (files), React Navigation (navigate edges), Firebase callable
+// functions (calls-function edges) and Firestore collections (reads / writes edges).
 
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { parse } from '@babel/parser';
+
+const SCHEMA_VERSION = 2;
+const IMPORT_KINDS = ['import', 're-export', 'require', 'dynamic'];
+const KINDS = {
+  nodes: ['file', 'collection'],
+  edges: [...IMPORT_KINDS, 'navigate', 'calls-function', 'reads', 'writes'],
+  unresolved: ['load', 'navigate', 'function', 'data'],
+};
 
 const JS_EXT = ['.js', '.jsx', '.mjs', '.cjs'];
 const ASSET_EXT = new Set(['.png', '.webp', '.jpg', '.jpeg', '.mp4', '.ttf', '.otf', '.csv', '.json']);
@@ -26,6 +37,9 @@ function usage(msg) {
 
 const toPosix = (p) => p.split(path.sep).join('/');
 const isJs = (p) => JS_EXT.includes(path.extname(p).toLowerCase());
+const isCall = (n) => n?.type === 'CallExpression' || n?.type === 'OptionalCallExpression';
+const isMember = (n) => n?.type === 'MemberExpression' || n?.type === 'OptionalMemberExpression';
+const propName = (m) => (isMember(m) && !m.computed && m.property.type === 'Identifier' ? m.property.name : null);
 
 function git(root, args) {
   try {
@@ -33,9 +47,7 @@ function git(root, args) {
   } catch { return null; }
 }
 
-function skipped(rel) {
-  return rel.split('/').some((seg) => SKIP_DIRS.has(seg));
-}
+const skipped = (rel) => rel.split('/').some((seg) => SKIP_DIRS.has(seg));
 
 // --- file listing -------------------------------------------------------------
 
@@ -49,12 +61,11 @@ function gitignoreMatcher(root) {
     if (!line || line.startsWith('#')) continue;
     const neg = line.startsWith('!');
     if (neg) line = line.slice(1);
-    const dirOnly = line.endsWith('/');
-    if (dirOnly) line = line.slice(0, -1);
+    if (line.endsWith('/')) line = line.slice(0, -1);
     const anchored = line.includes('/');
     if (line.startsWith('/')) line = line.slice(1);
     const re = line.split('**').map((part) => part.split('*').map((s) => s.replace(/[.+^${}()|[\]\\?]/g, '\\$&')).join('[^/]*')).join('.*');
-    rules.push({ neg, dirOnly, re: new RegExp(anchored ? `^${re}(/|$)` : `(^|/)${re}(/|$)`) });
+    rules.push({ neg, re: new RegExp(anchored ? `^${re}(/|$)` : `(^|/)${re}(/|$)`) });
   }
   return (rel) => {
     let ignored = false;
@@ -90,11 +101,13 @@ function literalValue(node) {
   return null;
 }
 
+const SKIP_KEYS = new Set(['loc', 'start', 'end', 'extra', 'range', 'leadingComments', 'trailingComments', 'innerComments']);
+
 function walkAst(node, visit) {
   if (!node || typeof node.type !== 'string') return;
   visit(node);
   for (const key in node) {
-    if (key === 'loc' || key === 'start' || key === 'end' || key === 'extra' || key.endsWith('Comments')) continue;
+    if (SKIP_KEYS.has(key)) continue;
     const v = node[key];
     if (Array.isArray(v)) { for (const c of v) if (c && typeof c.type === 'string') walkAst(c, visit); }
     else if (v && typeof v.type === 'string') walkAst(v, visit);
@@ -185,6 +198,186 @@ function collectLoads(ast) {
   return loads;
 }
 
+// --- scope analysis -----------------------------------------------------------
+// Parent links, lexical scopes, bindings, references and assignments for one file.
+// Approximate (no var hoisting), which is enough for "is this a literal in the same file".
+
+const SCOPE_TYPES = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression', 'ObjectMethod',
+  'ClassMethod', 'ClassPrivateMethod', 'BlockStatement', 'ForStatement', 'ForInStatement', 'ForOfStatement',
+  'CatchClause', 'SwitchStatement', 'StaticBlock']);
+const FUNC_TYPES = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression', 'ObjectMethod',
+  'ClassMethod', 'ClassPrivateMethod']);
+
+function patternIds(p, out = []) {
+  if (!p) return out;
+  if (p.type === 'Identifier') out.push(p);
+  else if (p.type === 'ObjectPattern') for (const q of p.properties) patternIds(q.type === 'RestElement' ? q.argument : q.value, out);
+  else if (p.type === 'ArrayPattern') for (const e of p.elements) patternIds(e, out);
+  else if (p.type === 'AssignmentPattern') patternIds(p.left, out);
+  else if (p.type === 'RestElement') patternIds(p.argument, out);
+  return out;
+}
+
+function isReference(par, key) {
+  if (!par) return true;
+  if (isMember(par) && key === 'property' && !par.computed) return false;
+  if ((par.type === 'ObjectProperty' || par.type === 'ObjectMethod' || par.type === 'ClassMethod'
+    || par.type === 'ClassProperty' || par.type === 'ClassPrivateProperty') && key === 'key' && !par.computed) return false;
+  if (['LabeledStatement', 'BreakStatement', 'ContinueStatement'].includes(par.type)) return false;
+  if (['ImportSpecifier', 'ImportDefaultSpecifier', 'ImportNamespaceSpecifier', 'ExportSpecifier', 'MetaProperty'].includes(par.type)) return false;
+  return true;
+}
+
+function analyze(ast) {
+  const parent = new Map(), parentKey = new Map(), scopeOf = new Map();
+  const refs = new Map(), assigns = new Map(), declIds = new Set();
+  const push = (m, k, v) => (m.get(k) ?? m.set(k, []).get(k)).push(v);
+  const program = { up: null, decls: new Map() };
+  const declare = (scope, id, info) => { declIds.add(id); scope.decls.set(id.name, { name: id.name, ...info }); };
+
+  function visit(node, scope, par, key) {
+    parent.set(node, par); parentKey.set(node, key); scopeOf.set(node, scope);
+    const inner = SCOPE_TYPES.has(node.type) ? { up: scope, decls: new Map() } : scope;
+    switch (node.type) {
+      case 'ImportDeclaration':
+        for (const s of node.specifiers) declare(program, s.local, { kind: 'import', spec: node.source.value });
+        break;
+      case 'VariableDeclaration':
+        for (const d of node.declarations) {
+          for (const id of patternIds(d.id)) declare(scope, id, d.id.type === 'Identifier' ? { kind: node.kind, init: d.init } : { kind: 'pattern' });
+        }
+        break;
+      case 'FunctionDeclaration': case 'ClassDeclaration':
+        if (node.id) declare(scope, node.id, { kind: 'function' });
+        break;
+      case 'CatchClause':
+        for (const id of patternIds(node.param)) declare(inner, id, { kind: 'param' });
+        break;
+      case 'AssignmentExpression':
+        if (node.left.type === 'Identifier') push(assigns, node.left.name, node);
+        break;
+      case 'UpdateExpression':
+        if (node.argument.type === 'Identifier') push(assigns, node.argument.name, node);
+        break;
+      case 'Identifier':
+        if (!declIds.has(node) && isReference(par, key)) push(refs, node.name, node);
+        break;
+    }
+    if (FUNC_TYPES.has(node.type)) {
+      for (const p of node.params) for (const id of patternIds(p)) declare(inner, id, { kind: 'param' });
+      if (node.type === 'FunctionExpression' && node.id) declare(inner, node.id, { kind: 'function' });
+    }
+    for (const k in node) {
+      if (SKIP_KEYS.has(k)) continue;
+      const v = node[k];
+      if (Array.isArray(v)) { for (const c of v) if (c && typeof c.type === 'string') visit(c, inner, node, k); }
+      else if (v && typeof v.type === 'string') visit(v, inner, node, k);
+    }
+  }
+  visit(ast.program, program, null, null);
+
+  const lookup = (name, node) => {
+    for (let s = scopeOf.get(node); s; s = s.up) { const b = s.decls.get(name); if (b) return b; }
+    return null;
+  };
+  return {
+    parent: (n) => parent.get(n),
+    key: (n) => parentKey.get(n),
+    lookup,
+    usesOf: (b) => (refs.get(b.name) || []).filter((r) => lookup(b.name, r) === b),
+    assignmentsOf: (b) => (assigns.get(b.name) || []).filter((a) => lookup(b.name, a) === b),
+    nodes: () => parent.keys(),
+  };
+}
+
+const union = (...arrs) => (arrs.some((a) => a === null) ? null : [...new Set(arrs.flat())]);
+
+// The object or array literal an expression refers to (inline, via const, or via a static member).
+function objectOf(node, A, depth = 0) {
+  if (!node || depth > 8) return null;
+  if (node.type === 'ObjectExpression' || node.type === 'ArrayExpression') return node;
+  if (node.type === 'Identifier') {
+    const b = A.lookup(node.name, node);
+    return b?.kind === 'const' && b.init ? objectOf(b.init, A, depth + 1) : null;
+  }
+  if (isMember(node)) {
+    const obj = objectOf(node.object, A, depth + 1);
+    const k = node.computed ? literalValue(node.property) ?? (node.property.type === 'NumericLiteral' ? String(node.property.value) : null) : node.property.name;
+    if (!obj || k === null) return null;
+    const v = memberValues(obj, [k]);
+    return v?.length === 1 ? objectOf(v[0], A, depth + 1) : null;
+  }
+  return null;
+}
+
+// Values of the given keys (or of all members when keys is null); null if any is missing.
+function memberValues(obj, keys) {
+  if (obj.type === 'ObjectExpression') {
+    if (obj.properties.some((p) => p.type !== 'ObjectProperty' || p.computed)) {
+      if (keys === null) return null;
+    }
+    const props = obj.properties.filter((p) => p.type === 'ObjectProperty' && !p.computed);
+    const keyOf = (p) => (p.key.type === 'Identifier' ? p.key.name : literalValue(p.key) ?? (p.key.type === 'NumericLiteral' ? String(p.key.value) : null));
+    if (keys === null) return props.map((p) => p.value);
+    const out = [];
+    for (const k of keys) { const p = props.find((q) => keyOf(q) === k); if (!p) return null; out.push(p.value); }
+    return out;
+  }
+  if (obj.type === 'ArrayExpression') {
+    if (obj.elements.some((e) => !e || e.type === 'SpreadElement')) return null;
+    if (keys === null) return obj.elements;
+    const out = [];
+    for (const k of keys) { const e = obj.elements[Number(k)]; if (!e) return null; out.push(e); }
+    return out;
+  }
+  return null;
+}
+
+// Every string an expression can evaluate to, if all of them are literals in this file; else null.
+function stringValues(node, A, depth = 0) {
+  if (!node || depth > 8) return null;
+  const lit = literalValue(node);
+  if (lit !== null) return [lit];
+  switch (node.type) {
+    case 'ConditionalExpression':
+      return union(stringValues(node.consequent, A, depth + 1), stringValues(node.alternate, A, depth + 1));
+    case 'LogicalExpression':
+      return node.operator === '&&' ? null : union(stringValues(node.left, A, depth + 1), stringValues(node.right, A, depth + 1));
+    case 'Identifier': {
+      const b = A.lookup(node.name, node);
+      if (!b || !['const', 'let', 'var'].includes(b.kind)) return null;
+      const parts = [];
+      if (b.init) parts.push(stringValues(b.init, A, depth + 1));
+      else if (b.kind === 'const') return null;
+      if (b.kind !== 'const') {
+        for (const a of A.assignmentsOf(b)) {
+          if (a.type !== 'AssignmentExpression' || a.operator !== '=') return null;
+          parts.push(stringValues(a.right, A, depth + 1));
+        }
+      }
+      return parts.length ? union(...parts) : null;
+    }
+    case 'MemberExpression': case 'OptionalMemberExpression': {
+      const obj = objectOf(node.object, A, depth + 1);
+      if (!obj) return null;
+      let keys;
+      if (!node.computed) keys = [node.property.name];
+      else if (node.property.type === 'NumericLiteral') keys = [String(node.property.value)];
+      else keys = stringValues(node.property, A, depth + 1); // null -> any member
+      const vals = memberValues(obj, keys);
+      return vals ? union(...vals.map((v) => stringValues(v, A, depth + 1))) : null;
+    }
+  }
+  return null;
+}
+
+// A name argument: direct literal, or inferred from same-file literals.
+function nameValues(node, A) {
+  const lit = literalValue(node);
+  if (lit !== null) return { values: [lit], inferred: false };
+  return { values: stringValues(node, A), inferred: true };
+}
+
 // --- navigation pass ----------------------------------------------------------
 
 const NAV_METHODS = new Set(['navigate', 'push', 'replace', 'reset']);
@@ -192,9 +385,8 @@ const NAV_METHODS = new Set(['navigate', 'push', 'replace', 'reset']);
 const NAV_RECEIVER = /^(nav\w*|\w*Navigation\w*|\w*navigationRef\w*|StackActions|CommonActions|TabActions|DrawerActions)$/i;
 
 function receiverName(obj) {
-  // navigation, props.navigation, this.props.navigation, navigationRef.current -> the most telling identifier
   let n = obj;
-  while (n && (n.type === 'MemberExpression' || n.type === 'OptionalMemberExpression')) {
+  while (isMember(n)) {
     if (!n.computed && n.property.type === 'Identifier' && n.property.name !== 'current') return n.property.name;
     n = n.object;
   }
@@ -203,72 +395,78 @@ function receiverName(obj) {
 
 function objProp(obj, key) {
   if (obj?.type !== 'ObjectExpression') return undefined;
-  const p = obj.properties.find((q) => q.type === 'ObjectProperty' && !q.computed
-    && (q.key.name === key || q.key.value === key));
+  const p = obj.properties.find((q) => q.type === 'ObjectProperty' && !q.computed && (q.key.name === key || q.key.value === key));
   return p ? p.value : undefined;
 }
 
-// Follow { screen: 'X', params: { screen: 'Y' } } down to the deepest literal screen.
-function nestedScreen(params) {
-  let chain = [], cur = params;
+// Follow { screen: 'X', params: { screen: 'Y' } } down; each level may have several inferred values.
+function nestedScreens(params, A) {
+  const levels = [];
+  let cur = objectOf(params, A);
   while (cur?.type === 'ObjectExpression') {
     const s = objProp(cur, 'screen');
     if (s === undefined) break;
-    const v = literalValue(s);
-    if (v === null) return { chain, computed: true };
-    chain.push(v);
-    cur = objProp(cur, 'params');
+    const n = nameValues(s, A);
+    if (!n.values) return { levels, computed: true };
+    levels.push(n);
+    cur = objectOf(objProp(cur, 'params'), A);
   }
-  return { chain, computed: false };
+  return { levels, computed: false };
 }
 
-// A route object { name, params } or { name, state: { routes: [...] } } -> list of targets.
-function routeTargets(route, line) {
-  const name = objProp(route, 'name');
-  const v = literalValue(name);
-  if (v === null) return [{ computed: true, line }];
-  const { chain, computed } = nestedScreen(objProp(route, 'params'));
-  const out = [{ name: v, via: [], line }];
-  if (chain.length) out[0] = { name: chain[chain.length - 1], via: [v, ...chain.slice(0, -1)], line };
+function makeTargets(nameNode, paramsNode, A, line) {
+  const first = nameValues(nameNode, A);
+  if (!first.values) return [{ computed: true, line }];
+  const { levels, computed } = nestedScreens(paramsNode, A);
+  const out = [];
+  if (levels.length) {
+    const last = levels[levels.length - 1];
+    const via = [first.values.join('|'), ...levels.slice(0, -1).map((l) => l.values.join('|'))];
+    const inferred = first.inferred || levels.some((l) => l.inferred);
+    for (const v of last.values) out.push({ name: v, via, inferred, line });
+  } else {
+    for (const v of first.values) out.push({ name: v, via: [], inferred: first.inferred, line });
+  }
   if (computed) out.push({ computed: true, line });
-  const state = objProp(route, 'state');
-  const routes = objProp(state, 'routes');
-  if (routes?.type === 'ArrayExpression') for (const r of routes.elements) out.push(...routeTargets(r, line));
   return out;
 }
 
-function collectNavCalls(ast) {
-  const calls = []; // { method, line, targets: [{ name, via } | { computed }] }
+// A route object { name, params } or { name, state: { routes: [...] } } -> targets.
+function routeTargets(route, A, line) {
+  const obj = objectOf(route, A);
+  if (obj?.type !== 'ObjectExpression') return [{ computed: true, line }];
+  const name = objProp(obj, 'name');
+  const out = name === undefined ? [{ computed: true, line }] : makeTargets(name, objProp(obj, 'params'), A, line);
+  const routes = objectOf(objProp(objectOf(objProp(obj, 'state'), A), 'routes'), A);
+  if (routes?.type === 'ArrayExpression') for (const r of routes.elements) out.push(...routeTargets(r, A, line));
+  return out;
+}
+
+function collectNavCalls(A) {
+  const calls = [];
   let skippedNonNav = 0;
-  walkAst(ast.program, (n) => {
-    if (n.type !== 'CallExpression' && n.type !== 'OptionalCallExpression') return;
+  for (const n of A.nodes()) {
+    if (!isCall(n)) continue;
     const c = n.callee;
     let method = null, recv = null;
-    if ((c.type === 'MemberExpression' || c.type === 'OptionalMemberExpression') && !c.computed && c.property.type === 'Identifier') {
-      method = c.property.name; recv = receiverName(c.object);
-    } else if (c.type === 'Identifier') { method = c.name; recv = null; }
-    if (!NAV_METHODS.has(method)) return;
-    if (method !== 'navigate' && !(recv && NAV_RECEIVER.test(recv))) { skippedNonNav++; return; }
+    if (isMember(c)) { method = propName(c); recv = receiverName(c.object); }
+    else if (c.type === 'Identifier') method = c.name;
+    if (!NAV_METHODS.has(method)) continue;
+    if (method !== 'navigate' && !(recv && NAV_RECEIVER.test(recv))) { skippedNonNav++; continue; }
     const line = n.loc.start.line;
     const [a0, a1] = n.arguments;
-    let targets = [];
+    let targets;
     if (method === 'reset') {
-      const routes = objProp(a0, 'routes');
-      if (routes?.type === 'ArrayExpression') for (const r of routes.elements) targets.push(...routeTargets(r, line));
-      else if (literalValue(a0) !== null) targets.push({ name: literalValue(a0), via: [], line });
-      else targets.push({ computed: true, line });
-    } else if (literalValue(a0) !== null) {
-      const { chain, computed } = nestedScreen(a1);
-      const first = literalValue(a0);
-      targets.push(chain.length ? { name: chain[chain.length - 1], via: [first, ...chain.slice(0, -1)], line } : { name: first, via: [], line });
-      if (computed) targets.push({ computed: true, line });
+      const routes = objectOf(objProp(objectOf(a0, A), 'routes'), A);
+      if (routes?.type === 'ArrayExpression') targets = routes.elements.flatMap((r) => routeTargets(r, A, line));
+      else targets = makeTargets(a0, undefined, A, line);
     } else if (a0?.type === 'ObjectExpression') {
-      targets.push(...routeTargets(a0, line)); // navigate({ name, params })
+      targets = routeTargets(a0, A, line); // navigate({ name, params })
     } else {
-      targets.push({ computed: true, line });
+      targets = makeTargets(a0, a1, A, line);
     }
     calls.push({ method, line, targets });
-  });
+  }
   return { calls, skippedNonNav };
 }
 
@@ -277,14 +475,12 @@ function bindings(program) {
   const b = new Map();
   const reqSpec = (init) => {
     let e = init;
-    // __DEV__ ? require('x').default : null  /  flag && require('x')
     if (e?.type === 'ConditionalExpression') return reqSpec(e.consequent) ?? reqSpec(e.alternate);
     if (e?.type === 'LogicalExpression') return reqSpec(e.right) ?? reqSpec(e.left);
     if (e?.type === 'MemberExpression') e = e.object; // require('x').default
     if (e?.type === 'CallExpression' && e.callee.name === 'require') return literalValue(e.arguments[0]);
-    // React.lazy(() => import('x')) / lazy(() => require('x'))
     if (e?.type === 'CallExpression' && /^(React\.)?lazy$/.test(e.callee.name ?? `${e.callee.object?.name}.${e.callee.property?.name}`)) {
-      let body = e.arguments[0]?.body;
+      const body = e.arguments[0]?.body;
       if (body?.type === 'ImportExpression') return literalValue(body.source);
       if (body?.type === 'CallExpression') return literalValue(body.arguments[0]);
     }
@@ -307,7 +503,7 @@ function bindings(program) {
   return b;
 }
 
-const jsxTag = (n) => n.type === 'JSXMemberExpression' ? `${jsxTag(n.object)}.${n.property.name}` : n.name;
+const jsxTag = (n) => (n.type === 'JSXMemberExpression' ? `${jsxTag(n.object)}.${n.property.name}` : n.name);
 
 // Screens registered in this file: <X.Screen name="..." component={C} />, with the
 // top-level component that hosts each navigator (for nesting).
@@ -337,13 +533,254 @@ function collectScreens(ast) {
       }
     }
     for (const key in node) {
-      if (key === 'loc' || key.endsWith('Comments')) continue;
+      if (SKIP_KEYS.has(key)) continue;
       const v = node[key];
       if (Array.isArray(v)) v.forEach((c) => c && typeof c.type === 'string' && walk(c, host));
       else if (v && typeof v.type === 'string') walk(v, host);
     }
   })(ast.program, null);
   return screens;
+}
+
+// --- cloud functions pass -----------------------------------------------------
+
+// httpsCallable(functions, 'name') or functions().httpsCallable('name').
+function collectCallables(A) {
+  const out = [];
+  for (const n of A.nodes()) {
+    if (!isCall(n)) continue;
+    let nameNode;
+    if (n.callee.type === 'Identifier' && n.callee.name === 'httpsCallable') nameNode = n.arguments[1];
+    else if (propName(n.callee) === 'httpsCallable') nameNode = n.arguments[0];
+    else continue;
+    out.push({ name: literalValue(nameNode), line: n.loc.start.line });
+  }
+  return out;
+}
+
+// Exported functions of the functions entry: name -> file that defines it.
+function functionDefinitions(ast, rel, resolve) {
+  const defs = new Map();
+  const b = bindings(ast.program);
+  const fileFor = (rhs) => {
+    let e = rhs;
+    if (isMember(e)) e = e.object;
+    if (e?.type === 'CallExpression' && e.callee.name === 'require') {
+      const spec = literalValue(e.arguments[0]);
+      return spec?.startsWith('.') ? resolve(rel, spec) ?? rel : rel;
+    }
+    if (e?.type === 'Identifier') {
+      const spec = b.get(e.name)?.spec;
+      return spec?.startsWith('.') ? resolve(rel, spec) ?? rel : rel;
+    }
+    return rel;
+  };
+  for (const st of ast.program.body) {
+    if (st.type === 'ExpressionStatement' && st.expression.type === 'AssignmentExpression') {
+      const { left, right } = st.expression;
+      if (isMember(left) && !left.computed && ((left.object.type === 'Identifier' && left.object.name === 'exports') || isModuleExports(left.object))) {
+        defs.set(left.property.name, fileFor(right));
+      } else if (isModuleExports(left) && right.type === 'ObjectExpression') {
+        for (const p of right.properties) {
+          if (p.type === 'ObjectProperty' && !p.computed) defs.set(p.key.name ?? p.key.value, fileFor(p.value));
+          if (p.type === 'SpreadElement') {
+            const f = fileFor(p.argument);
+            if (f !== rel) defs.set(`* from ${f}`, f);
+          }
+        }
+      }
+    } else if (st.type === 'ExportNamedDeclaration') {
+      if (st.declaration?.type === 'VariableDeclaration') for (const d of st.declaration.declarations) for (const id of patternIds(d.id)) defs.set(id.name, rel);
+      else if (st.declaration?.id) defs.set(st.declaration.id.name, rel);
+      for (const s of st.specifiers || []) {
+        const name = s.exported.name ?? s.exported.value;
+        defs.set(name, st.source ? resolve(rel, st.source.value) ?? rel : fileFor({ type: 'Identifier', name: s.local.name }));
+      }
+    }
+  }
+  return defs;
+}
+
+// --- Firestore pass -----------------------------------------------------------
+
+const FS_REF_FNS = new Set(['collection', 'doc', 'collectionGroup']);
+const FS_READ_FNS = new Set(['getDoc', 'getDocs', 'getDocFromServer', 'getDocsFromServer', 'getDocFromCache',
+  'getDocsFromCache', 'onSnapshot', 'getCountFromServer', 'getAggregateFromServer']);
+const FS_WRITE_FNS = new Set(['setDoc', 'updateDoc', 'addDoc', 'deleteDoc']);
+const FS_QUERY_FNS = new Set(['query']);
+// Chained (firebase-admin / namespaced) style.
+const CHAIN_READ = new Set(['get', 'onSnapshot', 'listDocuments', 'count']);
+const CHAIN_WRITE = new Set(['set', 'update', 'delete', 'add', 'create']);
+const CHAIN_QUERY = new Set(['where', 'orderBy', 'limit', 'limitToLast', 'startAt', 'startAfter', 'endAt', 'endBefore', 'select', 'offset', 'withConverter']);
+// batch.set(ref) / transaction.get(ref)
+const ARG_READ = new Set(['get', 'getAll']);
+const ARG_WRITE = new Set(['set', 'update', 'delete', 'create']);
+const REF_PROPS = new Set(['id', 'path', 'parent', 'type', 'firestore']);
+const DB_NAME =/^(db|firestore|fs|database|firestoreDb|adminDb|\w*Db)$/;
+
+// Identifier callee that is Firestore's: imported (or a global), not a local variable or parameter.
+function fsFn(n, names, A) {
+  if (!isCall(n) || n.callee.type !== 'Identifier' || !names.has(n.callee.name)) return null;
+  const b = A.lookup(n.callee.name, n.callee);
+  return !b || b.kind === 'import' ? n.callee.name : null;
+}
+
+function isDbLike(node, A) {
+  if (node?.type === 'Identifier') {
+    if (DB_NAME.test(node.name)) return true;
+    const b = A.lookup(node.name, node);
+    return !!(b?.init && isCall(b.init) && /^(getFirestore|initializeFirestore|firestore)$/.test(b.init.callee.name ?? propName(b.init.callee) ?? ''));
+  }
+  if (isCall(node)) return /^(getFirestore|initializeFirestore|firestore)$/.test(node.callee.name ?? propName(node.callee) ?? '');
+  return false;
+}
+
+const segOf = (arg) => {
+  if (!arg) return { text: '{}', node: null };
+  const lit = literalValue(arg);
+  if (lit !== null) return { text: lit, node: arg };
+  if (arg.type === 'TemplateLiteral') return { text: arg.quasis.map((q) => q.value.cooked).join('{}'), node: arg };
+  return { text: '{}', node: arg };
+};
+
+// The path segments a Firestore reference expression points at.
+// Returns null (not a reference), { unresolved: true }, or { segs: [{ text, node }] }.
+function refPath(node, A, depth = 0) {
+  if (!node || depth > 10) return null;
+  if (node.type === 'Identifier') {
+    const b = A.lookup(node.name, node);
+    return b && ['const', 'let', 'var'].includes(b.kind) && b.init ? refPath(b.init, A, depth + 1) : null;
+  }
+  if (node.type === 'AwaitExpression') return null;
+  if (!isCall(node)) return null;
+  const fn = fsFn(node, FS_REF_FNS, A) ?? fsFn(node, FS_QUERY_FNS, A);
+  const args = node.arguments;
+  if (fn === 'query') return refPath(args[0], A, depth + 1);
+  if (fn === 'collectionGroup') return { segs: [segOf(args[1])], group: true };
+  if (fn === 'collection' || fn === 'doc') {
+    if (!args.length) return null;
+    const base = refPath(args[0], A, depth + 1);
+    const rest = args.slice(1).map(segOf);
+    if (base?.unresolved) return base;
+    if (base) return { segs: [...base.segs, ...(rest.length ? rest : [{ text: '{}', node: null }])] };
+    if (isDbLike(args[0], A) && rest.length) return { segs: rest };
+    return { unresolved: true };
+  }
+  const prop = propName(node.callee);
+  if (!prop) return null;
+  const recv = node.callee.object;
+  if (prop === 'collection' || prop === 'collectionGroup') {
+    const base = refPath(recv, A, depth + 1);
+    if (base?.unresolved) return base;
+    if (base) return { segs: [...base.segs, segOf(args[0])] };
+    return isDbLike(recv, A) ? { segs: [segOf(args[0])], group: prop === 'collectionGroup' } : null;
+  }
+  if (prop === 'doc' || CHAIN_QUERY.has(prop)) {
+    const base = refPath(recv, A, depth + 1);
+    if (!base || base.unresolved) return base;
+    return prop === 'doc' ? { segs: [...base.segs, segOf(args[0])] } : base;
+  }
+  return null;
+}
+
+// Is this call a reference constructor (the start of a Firestore path)?
+function isRefCtor(n, A) {
+  if (fsFn(n, FS_REF_FNS, A)) return true;
+  const prop = propName(n.callee);
+  if (prop === 'collection' || prop === 'collectionGroup') return isDbLike(n.callee.object, A) || !!refPath(n.callee.object, A);
+  if (prop === 'doc') return !!refPath(n.callee.object, A);
+  return false;
+}
+
+// How a reference expression is used: 'reads', 'writes', 'unknown', or 'base' (feeds a longer path).
+function opsFor(node, A, depth = 0, seen = new Set()) {
+  const p = A.parent(node), k = A.key(node);
+  if (!p || depth > 8) return ['unknown'];
+  if (isCall(p) && k === 'arguments') {
+    const c = p.callee;
+    if (c.type === 'Identifier') {
+      if (FS_READ_FNS.has(c.name)) return ['reads'];
+      if (FS_WRITE_FNS.has(c.name)) return ['writes'];
+      if (FS_QUERY_FNS.has(c.name) && p.arguments[0] === node) return opsFor(p, A, depth + 1, seen);
+      if (FS_REF_FNS.has(c.name) && p.arguments[0] === node) return ['base'];
+      return ['unknown'];
+    }
+    const prop = propName(c);
+    if (prop && p.arguments[0] === node) {
+      if (ARG_READ.has(prop)) return ['reads'];
+      if (ARG_WRITE.has(prop)) return ['writes'];
+    }
+    return ['unknown'];
+  }
+  if (isMember(p) && k === 'object' && !p.computed) {
+    const g = A.parent(p), prop = propName(p);
+    if (REF_PROPS.has(prop) && !(isCall(g) && A.key(p) === 'callee')) return ['none']; // ref.id, ref.path
+    if (isCall(g) && A.key(p) === 'callee') {
+      if (CHAIN_READ.has(prop)) return ['reads'];
+      if (CHAIN_WRITE.has(prop)) return ['writes'];
+      if (CHAIN_QUERY.has(prop)) return opsFor(g, A, depth + 1, seen);
+      if (prop === 'doc' || prop === 'collection' || prop === 'collectionGroup') return ['base'];
+    }
+    return ['unknown'];
+  }
+  // Several uses: a real read/write wins over incidental uses (passed along, .id, ...).
+  const merge = (ops) => {
+    const rw = ops.filter((o) => o === 'reads' || o === 'writes');
+    if (rw.length) return rw;
+    if (ops.includes('unknown')) return ['unknown'];
+    return ops.includes('base') ? ['base'] : ['none'];
+  };
+  const viaBinding = (b) => {
+    if (!b || seen.has(b)) return ['unknown'];
+    seen.add(b);
+    const uses = A.usesOf(b);
+    return uses.length ? merge(uses.flatMap((u) => opsFor(u, A, depth + 1, seen))) : ['unknown'];
+  };
+  if (p.type === 'VariableDeclarator' && k === 'init' && p.id.type === 'Identifier') return viaBinding(A.lookup(p.id.name, p.id));
+  if (p.type === 'AssignmentExpression' && k === 'right' && p.left.type === 'Identifier') return viaBinding(A.lookup(p.left.name, p));
+  // Returned from a helper defined in this file: follow the helper's call sites.
+  if (p.type === 'ReturnStatement' || (p.type === 'ArrowFunctionExpression' && k === 'body')) {
+    let f = p;
+    if (p.type === 'ReturnStatement') { f = A.parent(p); while (f && !FUNC_TYPES.has(f.type)) f = A.parent(f); }
+    if (!f || seen.has(f)) return ['unknown'];
+    seen.add(f);
+    let b = null;
+    if (f.type === 'FunctionDeclaration' && f.id) b = A.lookup(f.id.name, f.id);
+    else { const d = A.parent(f); if (d?.type === 'VariableDeclarator' && d.id.type === 'Identifier') b = A.lookup(d.id.name, d.id); }
+    const calls = b ? A.usesOf(b).filter((u) => isCall(A.parent(u)) && A.key(u) === 'callee').map((u) => A.parent(u)) : [];
+    return calls.length ? merge(calls.flatMap((c) => opsFor(c, A, depth + 1, seen))) : ['unknown'];
+  }
+  if (p.type === 'AwaitExpression') return opsFor(p, A, depth + 1, seen);
+  if (['ConditionalExpression', 'LogicalExpression', 'ParenthesizedExpression', 'SequenceExpression'].includes(p.type)) return opsFor(p, A, depth + 1, seen);
+  return ['unknown'];
+}
+
+function collectData(A) {
+  const uses = [], unresolvedLines = [];
+  for (const n of A.nodes()) {
+    if (!isCall(n) || !isRefCtor(n, A)) continue;
+    let ops = [...new Set(opsFor(n, A))];
+    if (ops.length === 1 && ops[0] === 'base') continue; // the longer path is recorded instead
+    ops = ops.filter((o) => o !== 'base' && o !== 'none');
+    if (!ops.length) ops = ['unknown']; // only its id / path is used
+    const line = n.loc.start.line;
+    const r = refPath(n, A);
+    if (!r || r.unresolved || !r.segs.length) { unresolvedLines.push(line); continue; }
+    const pathText = r.segs.map((s) => s.text).join('/').split('/').filter(Boolean).join('/');
+    let tops, inferred = false;
+    const first = r.segs[0];
+    const head = first.text.split('/')[0];
+    if (head && !head.includes('{')) tops = [head];
+    else if (first.node && first.node.type !== 'TemplateLiteral') {
+      const v = stringValues(first.node, A);
+      if (v) { tops = [...new Set(v.map((x) => x.split('/')[0]).filter((x) => x && !x.includes('{')))]; inferred = true; }
+    }
+    if (!tops?.length) { unresolvedLines.push(line); continue; }
+    for (const collection of tops) {
+      for (const op of ops) if (op !== 'base') uses.push({ collection, path: inferred ? pathText.replace(/^[^/]*/, collection) : pathText, op, line, inferred, group: !!r.group });
+    }
+  }
+  return { uses, unresolvedLines };
 }
 
 // --- resolution ---------------------------------------------------------------
@@ -368,6 +805,8 @@ const packageName = (spec) => {
   const parts = spec.split('/');
   return spec.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0];
 };
+
+const countBy = (arr, f) => arr.reduce((o, x) => { const k = f(x); o[k] = (o[k] || 0) + 1; return o; }, {});
 
 // --- main ---------------------------------------------------------------------
 
@@ -405,12 +844,13 @@ function main() {
       if (jsFiles.includes(rel)) { g.entry = rel; break; }
     }
   }
+  const functionsEntry = rootGroups.find((g) => g.name === 'functions')?.entry ?? null;
 
   const resolve = makeResolver(root);
   const nodeSet = new Set(jsFiles);
   const nodes = [], edges = [], unresolved = [], missing = [], parseFailures = [];
-  const rawScreens = [], navCallsByFile = new Map();
-  let navSkippedNonNav = 0;
+  const rawScreens = [], navCallsByFile = new Map(), callablesByFile = new Map(), dataByFile = new Map();
+  let navSkippedNonNav = 0, functionDefs = new Map();
   const assetTotals = { total: 0, byExtension: {} };
 
   for (const rel of jsFiles) {
@@ -418,6 +858,8 @@ function main() {
     const lines = code.length === 0 ? 0 : code.split('\n').length - (code.endsWith('\n') ? 1 : 0);
     const segs = rel.split('/');
     const node = {
+      id: rel,
+      kind: 'file',
       path: rel,
       topFolder: segs.length > 1 ? segs[0] : '(root)',
       rootGroup: groupOf(rel),
@@ -452,12 +894,15 @@ function main() {
         else missing.push({ file: rel, line: ld.line, ...(to ? { resolvedOutsideScan: true } : {}) });
       } else {
         node.packageImports++;
-        pkgs.add(packageName(ld.spec.replace(/^node:/, 'node:')));
+        pkgs.add(packageName(ld.spec));
       }
     }
     node.packages = [...pkgs].sort();
 
+    if (rel === functionsEntry) functionDefs = functionDefinitions(ast, rel, resolve);
+
     if (node.rootGroup === 'app') {
+      const A = analyze(ast);
       const found = collectScreens(ast);
       if (found.length) {
         const b = bindings(ast.program);
@@ -470,47 +915,52 @@ function main() {
           rawScreens.push({ ...s, navigatorFile: rel, file, localComponent: !spec && !!bind?.local });
         }
       }
-      const { calls, skippedNonNav } = collectNavCalls(ast);
+      const { calls, skippedNonNav } = collectNavCalls(A);
       navSkippedNonNav += skippedNonNav;
       if (calls.length) navCallsByFile.set(rel, calls);
+      const callables = collectCallables(A);
+      if (callables.length) callablesByFile.set(rel, callables);
+      const data = collectData(A);
+      if (data.uses.length || data.unresolvedLines.length) dataByFile.set(rel, data);
     }
   }
 
-  // Navigation: registered screens, nesting, and navigate edges.
+  // --- navigation: screens, nesting, navigate edges
   const screens = rawScreens.map((s) => ({
     name: s.name, component: s.component, file: s.file, navigator: s.navigator,
     navigatorFile: s.navigatorFile, line: s.line, host: s.host, localComponent: s.localComponent,
   }));
-  // Nesting: a navigator hosted by component H in file F is nested under the screen that
-  // renders H (defined locally in F), or under a screen whose component is imported from F.
+  // A navigator hosted by component H in file F is nested under the screen that renders H
+  // (defined locally in F), or under a screen whose component is imported from F.
   const hostsIn = (f) => new Set(screens.filter((x) => x.navigatorFile === f).map((x) => x.host));
   for (const s of screens) {
-    const parent = screens.find((p) => p.host !== s.host || p.navigatorFile !== s.navigatorFile
-      ? p.file === s.navigatorFile && (p.localComponent ? p.component === s.host : hostsIn(s.navigatorFile).size === 1)
-        && !(p.navigatorFile === s.navigatorFile && p.host === s.host)
-      : false);
+    const parent = screens.find((p) => !(p.navigatorFile === s.navigatorFile && p.host === s.host)
+      && p.file === s.navigatorFile && (p.localComponent ? p.component === s.host : hostsIn(s.navigatorFile).size === 1));
     s.parent = parent ? parent.name : null;
   }
   for (const s of screens) { delete s.host; delete s.localComponent; }
   const screensByName = new Map();
   for (const s of screens) if (s.name) (screensByName.get(s.name) ?? screensByName.set(s.name, []).get(s.name)).push(s);
 
-  const navStats = { calls: 0, targets: 0, matched: 0, computed: 0, unmatched: [], byMethod: {}, skippedNonNavigationReceivers: navSkippedNonNav };
+  const navStats = { calls: 0, targets: 0, matched: 0, matchedInferred: 0, computed: 0, inferredCalls: 0, unmatched: [], byMethod: {}, skippedNonNavigationReceivers: navSkippedNonNav };
   const navIncoming = new Map(), viaIncoming = new Map();
   for (const [from, calls] of navCallsByFile) {
     for (const call of calls) {
       navStats.calls++;
       navStats.byMethod[call.method] = (navStats.byMethod[call.method] || 0) + 1;
+      if (call.targets.some((t) => t.inferred)) navStats.inferredCalls++;
       for (const t of call.targets) {
         navStats.targets++;
         if (t.computed) { navStats.computed++; unresolved.push({ file: from, line: t.line, kind: 'navigate' }); continue; }
         const hits = screensByName.get(t.name);
-        if (!hits) { navStats.unmatched.push({ name: t.name, file: from, line: t.line }); continue; }
+        if (!hits) { navStats.unmatched.push({ name: t.name, file: from, line: t.line, ...(t.inferred ? { inferred: true } : {}) }); continue; }
         navStats.matched++;
+        if (t.inferred) navStats.matchedInferred++;
         navIncoming.set(t.name, (navIncoming.get(t.name) || 0) + 1);
-        for (const via of t.via) viaIncoming.set(via, (viaIncoming.get(via) || 0) + 1);
+        for (const via of t.via) for (const v of via.split('|')) viaIncoming.set(v, (viaIncoming.get(v) || 0) + 1);
         for (const h of hits) {
-          if (h.file) edges.push({ from, to: h.file, kind: 'navigate', line: t.line, screen: t.name, method: call.method, ...(t.via.length ? { via: t.via } : {}) });
+          if (h.file) edges.push({ from, to: h.file, kind: 'navigate', line: t.line, screen: t.name, method: call.method,
+            ...(t.via.length ? { via: t.via } : {}), ...(t.inferred ? { inferred: true } : {}) });
         }
       }
     }
@@ -519,10 +969,49 @@ function main() {
     s.incomingNavigation = navIncoming.get(s.name) || 0;
     s.incomingAsNestedParent = viaIncoming.get(s.name) || 0;
   }
-  const importEdges = edges.filter((e) => e.kind !== 'navigate');
-  const navEdges = edges.length - importEdges.length;
 
-  // Reachability from each root group's entry, and from the project index.js.
+  // --- cloud functions: calls-function edges
+  const fnStats = { calls: 0, matched: 0, computed: 0, unmatched: [], names: {} };
+  for (const [from, calls] of callablesByFile) {
+    for (const c of calls) {
+      fnStats.calls++;
+      if (c.name === null) { fnStats.computed++; unresolved.push({ file: from, line: c.line, kind: 'function' }); continue; }
+      const def = functionDefs.get(c.name);
+      (fnStats.names[c.name] ??= { definedIn: def ?? null, callers: [] }).callers.push(from);
+      if (!def) { fnStats.unmatched.push({ name: c.name, file: from, line: c.line }); continue; }
+      fnStats.matched++;
+      edges.push({ from, to: def, kind: 'calls-function', line: c.line, function: c.name });
+    }
+  }
+  fnStats.exported = [...functionDefs.keys()];
+
+  // --- Firestore: collection nodes and reads / writes edges (one per file, collection and kind)
+  const dataEdges = new Map(), collections = new Map(), dataOpUnknown = [];
+  for (const [from, data] of dataByFile) {
+    for (const line of data.unresolvedLines) unresolved.push({ file: from, line, kind: 'data' });
+    for (const u of data.uses) {
+      const col = collections.get(u.collection) ?? collections.set(u.collection, { readers: new Set(), writers: new Set(), unknown: new Set(), paths: new Set(), group: false }).get(u.collection);
+      col.paths.add(u.path);
+      if (u.group) col.group = true;
+      if (u.op === 'unknown') { col.unknown.add(from); dataOpUnknown.push({ file: from, line: u.line, collection: u.collection, path: u.path }); continue; }
+      (u.op === 'reads' ? col.readers : col.writers).add(from);
+      const key = `${from}\0${u.collection}\0${u.op}`;
+      const e = dataEdges.get(key) ?? dataEdges.set(key, { from, to: `collection:${u.collection}`, kind: u.op, count: 0, lines: [], paths: [] }).get(key);
+      e.count++;
+      if (!e.lines.includes(u.line)) e.lines.push(u.line);
+      if (!e.paths.includes(u.path)) e.paths.push(u.path);
+      if (u.inferred) e.inferred = true;
+    }
+  }
+  edges.push(...dataEdges.values());
+  for (const [name, c] of [...collections].sort((a, b) => a[0].localeCompare(b[0]))) {
+    nodes.push({ id: `collection:${name}`, kind: 'collection', name, readers: c.readers.size, writers: c.writers.size,
+      usedWithUnknownOperation: c.unknown.size, paths: [...c.paths].sort(), ...(c.group ? { collectionGroup: true } : {}) });
+  }
+
+  // --- reachability over import edges only
+  const fileNodes = nodes.filter((n) => n.kind === 'file');
+  const importEdges = edges.filter((e) => IMPORT_KINDS.includes(e.kind));
   const out = new Map(jsFiles.map((f) => [f, []]));
   const importers = new Map(jsFiles.map((f) => [f, new Set()]));
   for (const e of importEdges) { out.get(e.from).push(e.to); importers.get(e.to).add(e.from); }
@@ -536,14 +1025,14 @@ function main() {
   const appEntry = rootGroups[0].entry;
   const fromAppEntry = reach(appEntry);
   for (const g of rootGroups) {
-    const members = nodes.filter((n) => n.rootGroup === g.name).map((n) => n.path);
+    const members = fileNodes.filter((n) => n.rootGroup === g.name).map((n) => n.path);
     const fromOwn = reach(g.entry);
     g.fileCount = members.length;
     g.notImportedFromAppEntry = members.filter((f) => !fromAppEntry.has(f)).length;
     g.notImportedFromOwnEntry = g.entry ? members.filter((f) => !fromOwn.has(f)).length : null;
     g.importedByNoFile = members.filter((f) => importers.get(f).size === 0).length;
   }
-  for (const n of nodes) {
+  for (const n of fileNodes) {
     n.importedBy = importers.get(n.path).size;
     n.reachableFromAppEntry = fromAppEntry.has(n.path);
   }
@@ -552,53 +1041,70 @@ function main() {
   const elapsedMs = Number(process.hrtime.bigint() - t0) / 1e6;
 
   const map = {
-    version: 1,
+    schemaVersion: SCHEMA_VERSION,
+    kinds: KINDS,
     generatedAt: new Date().toISOString(),
     durationMs: Math.round(elapsedMs),
     project: { path: root, gitCommit: commit, fileListSource: listSource },
     rootGroups,
     counts: {
-      nodes: nodes.length, edges: edges.length, importEdges: importEdges.length, navigateEdges: navEdges,
-      unresolved: unresolved.length, unresolvedLoads: unresolved.filter((u) => u.kind === 'load').length,
-      unresolvedNavigation: unresolved.filter((u) => u.kind === 'navigate').length,
-      screens: screens.length, navigationCalls: navStats.calls,
+      nodes: nodes.length, nodesByKind: countBy(nodes, (n) => n.kind),
+      edges: edges.length, edgesByKind: countBy(edges, (e) => e.kind),
+      unresolved: unresolved.length, unresolvedByKind: countBy(unresolved, (u) => u.kind),
       missingRelative: missing.length, assets: assetTotals.total, parseFailures: parseFailures.length,
+      screens: screens.length, navigationCalls: navStats.calls, functionCalls: fnStats.calls,
+      collections: collections.size, dataUsesWithUnknownOperation: dataOpUnknown.length,
     },
     nodes, edges, unresolved, missingRelative: missing, assetTotals, parseFailures,
     navigation: { screens, ...navStats },
+    functions: fnStats,
+    data: { usesWithUnknownOperation: dataOpUnknown },
   };
 
   fs.mkdirSync(outDir, { recursive: true });
   const outFile = path.join(outDir, 'map.json');
   fs.writeFileSync(outFile, JSON.stringify(map, null, 2) + '\n');
 
-  const top = [...nodes].sort((a, b) => b.importedBy - a.importedBy || a.path.localeCompare(b.path)).slice(0, 10);
-  console.log(`Map written: ${outFile}`);
+  // --- report
+  const kv = (o) => Object.entries(o).map(([k, v]) => `${k} ${v}`).join(', ');
+  console.log(`Map written: ${outFile}  (schema ${SCHEMA_VERSION})`);
   console.log(`Run time: ${Math.round(elapsedMs)} ms  (file list from ${listSource})`);
   console.log(`Commit: ${commit ?? 'none'}`);
-  console.log(`Nodes: ${nodes.length}  Edges: ${edges.length} (import ${importEdges.length}, navigate ${navEdges})  Unresolved: ${unresolved.length} (load ${map.counts.unresolvedLoads}, navigate ${map.counts.unresolvedNavigation})  Missing relative: ${missing.length}  Assets: ${assetTotals.total} ${JSON.stringify(assetTotals.byExtension)}`);
-  console.log(`App entry: ${appEntry ?? 'none'}`);
+  console.log(`Nodes: ${nodes.length} (${kv(map.counts.nodesByKind)})`);
+  console.log(`Edges: ${edges.length} (${kv(map.counts.edgesByKind)})`);
+  console.log(`Unresolved: ${unresolved.length} (${kv(map.counts.unresolvedByKind)})  Missing relative: ${missing.length}  Assets: ${assetTotals.total} ${JSON.stringify(assetTotals.byExtension)}`);
   for (const g of rootGroups) {
     console.log(`Root group ${g.name}: ${g.fileCount} files, entry ${g.entry ?? 'none'}, not imported from ${appEntry ?? 'app entry'}: ${g.notImportedFromAppEntry}`
       + (g.entry && g.name !== 'app' ? `, not imported from own entry: ${g.notImportedFromOwnEntry}` : '')
       + `, imported by no file: ${g.importedByNoFile}`);
   }
   console.log('Most imported:');
-  for (const n of top) console.log(`  ${n.importedBy}  ${n.path}`);
+  for (const n of [...fileNodes].sort((a, b) => b.importedBy - a.importedBy || a.path.localeCompare(b.path)).slice(0, 10)) console.log(`  ${n.importedBy}  ${n.path}`);
+
   if (screens.length || navStats.calls) {
-    const nested = screens.filter((s) => s.parent).length;
-    console.log(`Screens registered: ${screens.length} (${nested} nested), in ${new Set(screens.map((s) => s.navigatorFile)).size} navigator file(s); without a resolved file: ${screens.filter((s) => !s.file).length}`);
-    console.log(`Navigation calls: ${navStats.calls} ${JSON.stringify(navStats.byMethod)}, targets ${navStats.targets}: matched ${navStats.matched}, unmatched ${navStats.unmatched.length}, computed ${navStats.computed}; push/replace/reset on non-navigation receivers ignored: ${navStats.skippedNonNavigationReceivers}`);
-    const um = {};
-    for (const u of navStats.unmatched) um[u.name] = (um[u.name] || 0) + 1;
-    console.log(`Unmatched names: ${Object.entries(um).map(([k, v]) => `${k} (${v})`).join(', ') || 'none'}`);
+    console.log(`Screens registered: ${screens.length} (${screens.filter((s) => s.parent).length} nested); without a resolved file: ${screens.filter((s) => !s.file).length}`);
+    console.log(`Navigation calls: ${navStats.calls} ${JSON.stringify(navStats.byMethod)}; targets ${navStats.targets}: matched ${navStats.matched} (inferred ${navStats.matchedInferred}), unmatched ${navStats.unmatched.length}, still computed ${navStats.computed}; calls with inferred targets: ${navStats.inferredCalls}`);
+    const um = countBy(navStats.unmatched, (u) => u.name);
+    console.log(`Unmatched screen names: ${kv(um) || 'none'}`);
     console.log('Most navigated-to screens:');
-    for (const s of [...screens].sort((a, b) => b.incomingNavigation - a.incomingNavigation || a.name.localeCompare(b.name)).slice(0, 10)) {
-      console.log(`  ${s.incomingNavigation}  ${s.name}  ${s.file ?? '(no file)'}`);
-    }
+    for (const s of [...screens].sort((a, b) => b.incomingNavigation - a.incomingNavigation || a.name.localeCompare(b.name)).slice(0, 10)) console.log(`  ${s.incomingNavigation}  ${s.name}`);
     const none = screens.filter((s) => !s.incomingNavigation && !s.incomingAsNestedParent);
-    console.log(`No incoming navigation found: ${none.length}`);
-    for (const s of none) console.log(`  ${s.name}${s.parent ? ` (in ${s.parent})` : ''}  ${s.file ?? '(no file)'}`);
+    console.log(`No incoming navigation found: ${none.length}: ${none.map((s) => s.name + (s.parent ? ` (in ${s.parent})` : '')).join(', ')}`);
+  }
+  if (fnStats.calls || functionDefs.size) {
+    console.log(`Callable functions: ${fnStats.calls} calls, matched ${fnStats.matched}, computed ${fnStats.computed}; exported by ${functionsEntry}: ${functionDefs.size}`);
+    for (const [name, v] of Object.entries(fnStats.names)) console.log(`  ${name} -> ${v.definedIn ?? 'NO MATCH'}  called from ${[...new Set(v.callers)].join(', ')}`);
+  }
+  if (collections.size) {
+    console.log(`Collections: ${collections.size} (readers / writers / used with unknown operation)`);
+    for (const n of nodes.filter((x) => x.kind === 'collection').sort((a, b) => (b.readers + b.writers) - (a.readers + a.writers) || a.name.localeCompare(b.name))) {
+      console.log(`  ${n.name}: ${n.readers} / ${n.writers} / ${n.usedWithUnknownOperation}${n.collectionGroup ? ' (collection group)' : ''}`);
+    }
+    const touch = new Map();
+    for (const e of edges) if (e.kind === 'reads' || e.kind === 'writes') (touch.get(e.from) ?? touch.set(e.from, new Set()).get(e.from)).add(e.to);
+    console.log('Files touching the most collections:');
+    for (const [f, s] of [...touch].sort((a, b) => b[1].size - a[1].size || a[0].localeCompare(b[0])).slice(0, 10)) console.log(`  ${s.size}  ${f}`);
+    console.log(`Data uses with unknown read/write: ${dataOpUnknown.length}; unresolved data paths: ${map.counts.unresolvedByKind.data ?? 0}`);
   }
   console.log(`Parse failures: ${parseFailures.length}`);
   for (const f of parseFailures) console.log(`  ${f.file}:${f.line ?? '?'} ${f.reason}`);
