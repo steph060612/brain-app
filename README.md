@@ -53,3 +53,13 @@ npm run dev
 ```
 
 Starts Vite on port 5174 (with hot reload) and the API on port 3001 in parallel.
+
+## Code maps
+
+A project's panel can link a code folder (stored in `~/.brain/code-folders.json`, never in `~/Brain`) and
+**Map project**: the server runs `node src/mapper.js <folder> <slug>` (spawned with an argument list, 60 second
+limit) and writes `~/.brain/maps/<slug>/map.json` (schemaVersion 2). **View map** replaces the brain with a
+force-directed diagram of that map. Linked folders are only read; git is called with `--no-optional-locks`.
+Only JavaScript projects are supported.
+
+The mapper also runs on its own: `node src/mapper.js <project folder> <output name>`.

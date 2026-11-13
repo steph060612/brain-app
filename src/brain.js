@@ -282,10 +282,14 @@ const _frameCallbacks = new Set();
 export function onAnimate(cb) { _frameCallbacks.add(cb); }
 export function offAnimate(cb) { _frameCallbacks.delete(cb); }
 export function setAutoRotate(v) { controls.autoRotate = v; }
+// Skip rendering while another view (the code map) covers the brain. The brain itself is unchanged.
+let paused = false;
+export function setBrainPaused(v) { paused = v; }
 
 const clock = new THREE.Clock();
 (function loop() {
   requestAnimationFrame(loop);
+  if (paused) return;
   ptMat.uniforms.time.value = clock.getElapsedTime();
   controls.update();
   composer.render();

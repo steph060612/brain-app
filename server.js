@@ -1,5 +1,5 @@
 // Local API server — reads and writes ~/Brain .md files.
-// Listens only on localhost:3001. Never touches anything outside ~/Brain.
+// Listens only on localhost. Brain content stays in ~/Brain; app state (staging, packs, code maps) in ~/.brain.
 import express from 'express';
 import { readdir, readFile, writeFile, stat, access, unlink, mkdir, rm, rename } from 'fs/promises';
 import { resolve, join, sep, extname, basename, dirname, relative } from 'path';
@@ -12,6 +12,7 @@ import { parseConversations, parseMemories, getConvDir, getMemDir, CHARS_PER_CAL
 import { parseConversations as parseChatgptConversations, getConvDir as getChatgptConvDir } from './src/chatgpt-parser.js';
 import { parseConversations as parseGeminiConversations, getConvDir as getGeminiConvDir } from './src/gemini-parser.js';
 import { parseProposals, toInboxFile, batchLines, readInboxBody, applyProposal, ACTIONS } from './src/proposals.js';
+import { registerCodeMapRoutes } from './src/codemap-routes.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -1564,6 +1565,10 @@ app.get('/api/import/gemini-index', async (_req, res) => {
     res.status(404).json({ error: 'Not parsed yet — POST /api/import/parse first' });
   }
 });
+
+// ── CODE MAPS ─────────────────────────────────────────────────────────────────
+// Link a project to a code folder and map it; see src/codemap-routes.js.
+registerCodeMapRoutes(app, { gitAvailable });
 
 // ── STATIC ────────────────────────────────────────────────────────────────────
 

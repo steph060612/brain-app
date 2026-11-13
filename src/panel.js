@@ -2,6 +2,7 @@
 import { fetchFile, saveFile } from './api.js';
 import { setPanelOpen } from './labels.js';
 import { packButton } from './pack.js';
+import { createCodeSection, showCodeSection } from './codemap-panel.js';
 
 // ─── STATE ───────────────────────────────────────────────────────────────────
 let currentItem  = null;
@@ -148,6 +149,9 @@ export function initPanel() {
   projectPack('Copy project only', 'chat that already has my rules', 'project-only');
   header.appendChild(packRow);
 
+  // Code folder link and Map project (projects and archive only)
+  header.appendChild(createCodeSection());
+
   panelEl.appendChild(header);
 
   // Tabs
@@ -200,10 +204,12 @@ export async function openPanel(item) {
   document.getElementById('panel-title').textContent = item.name;
   const isProject = item.type === 'folder' && (item.category === 'projects' || item.category === 'archive');
   document.getElementById('pack-row').style.display = isProject ? 'flex' : 'none';
+  showCodeSection(isProject ? { slug: item.path.split('/').pop(), name: item.name } : null);
 
   buildTabs();
   panelEl.style.transform = 'translateX(0)';
   setPanelOpen(true);
+  window.dispatchEvent(new CustomEvent('brain-panel', { detail: { open: true } }));
 
   await loadTab(0);
 }
@@ -211,6 +217,7 @@ export async function openPanel(item) {
 function closePanel() {
   panelEl.style.transform = 'translateX(100%)';
   setPanelOpen(false);
+  window.dispatchEvent(new CustomEvent('brain-panel', { detail: { open: false } }));
   currentItem = null;
 }
 

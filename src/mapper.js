@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { parse } from '@babel/parser';
 
 const SCHEMA_VERSION = 2;
@@ -20,9 +21,9 @@ const KINDS = {
   unresolved: ['load', 'navigate', 'function', 'data'],
 };
 
-const JS_EXT = ['.js', '.jsx', '.mjs', '.cjs'];
+export const JS_EXT = ['.js', '.jsx', '.mjs', '.cjs'];
 const ASSET_EXT = new Set(['.png', '.webp', '.jpg', '.jpeg', '.mp4', '.ttf', '.otf', '.csv', '.json']);
-const SKIP_DIRS = new Set(['node_modules', 'ios', 'android', 'build', 'dist', '.git', '.claude',
+export const SKIP_DIRS = new Set(['node_modules', 'ios', 'android', 'build', 'dist', '.git', '.claude',
   'cache', '.cache', '.expo', '.next', '.turbo', 'coverage', 'web-build']);
 // Resolution order for an extensionless relative path. Platform variants are what Metro tries.
 const RESOLVE_SUFFIXES = ['', '.js', '.jsx', '.mjs', '.cjs', '.ios.js', '.android.js', '.native.js',
@@ -41,7 +42,11 @@ const isCall = (n) => n?.type === 'CallExpression' || n?.type === 'OptionalCallE
 const isMember = (n) => n?.type === 'MemberExpression' || n?.type === 'OptionalMemberExpression';
 const propName = (m) => (isMember(m) && !m.computed && m.property.type === 'Identifier' ? m.property.name : null);
 
+export const NO_JS_EXIT = 3;
+export const NO_JS_MESSAGE = 'No JavaScript files found. Other languages are not supported yet.';
+
 function git(root, args) {
+  if (process.env.MAPPER_NO_GIT === '1') return null; // the caller knows git is unavailable
   try {
     return execFileSync('git', ['-C', root, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024 });
   } catch { return null; }
@@ -826,6 +831,7 @@ function main() {
   const t0 = process.hrtime.bigint();
   const { source: listSource, files: allFiles } = listFiles(root);
   const jsFiles = allFiles.filter(isJs).sort();
+  if (!jsFiles.length) { console.error(NO_JS_MESSAGE); process.exit(NO_JS_EXIT); }
 
   // Root groups: the project itself, plus separate roots such as functions/ and scripts/.
   const rootGroups = [{ name: 'app', dir: '' }];
@@ -1110,4 +1116,5 @@ function main() {
   for (const f of parseFailures) console.log(`  ${f.file}:${f.line ?? '?'} ${f.reason}`);
 }
 
-main();
+// Run only when executed directly, so the server can import the constants above.
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) main();
