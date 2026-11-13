@@ -185,6 +185,167 @@ function collectLoads(ast) {
   return loads;
 }
 
+// --- navigation pass ----------------------------------------------------------
+
+const NAV_METHODS = new Set(['navigate', 'push', 'replace', 'reset']);
+// push/replace/reset are also String/Array/form methods, so they count only on a navigation-like receiver.
+const NAV_RECEIVER = /^(nav\w*|\w*Navigation\w*|\w*navigationRef\w*|StackActions|CommonActions|TabActions|DrawerActions)$/i;
+
+function receiverName(obj) {
+  // navigation, props.navigation, this.props.navigation, navigationRef.current -> the most telling identifier
+  let n = obj;
+  while (n && (n.type === 'MemberExpression' || n.type === 'OptionalMemberExpression')) {
+    if (!n.computed && n.property.type === 'Identifier' && n.property.name !== 'current') return n.property.name;
+    n = n.object;
+  }
+  return n?.type === 'Identifier' ? n.name : n?.type === 'ThisExpression' ? 'this' : null;
+}
+
+function objProp(obj, key) {
+  if (obj?.type !== 'ObjectExpression') return undefined;
+  const p = obj.properties.find((q) => q.type === 'ObjectProperty' && !q.computed
+    && (q.key.name === key || q.key.value === key));
+  return p ? p.value : undefined;
+}
+
+// Follow { screen: 'X', params: { screen: 'Y' } } down to the deepest literal screen.
+function nestedScreen(params) {
+  let chain = [], cur = params;
+  while (cur?.type === 'ObjectExpression') {
+    const s = objProp(cur, 'screen');
+    if (s === undefined) break;
+    const v = literalValue(s);
+    if (v === null) return { chain, computed: true };
+    chain.push(v);
+    cur = objProp(cur, 'params');
+  }
+  return { chain, computed: false };
+}
+
+// A route object { name, params } or { name, state: { routes: [...] } } -> list of targets.
+function routeTargets(route, line) {
+  const name = objProp(route, 'name');
+  const v = literalValue(name);
+  if (v === null) return [{ computed: true, line }];
+  const { chain, computed } = nestedScreen(objProp(route, 'params'));
+  const out = [{ name: v, via: [], line }];
+  if (chain.length) out[0] = { name: chain[chain.length - 1], via: [v, ...chain.slice(0, -1)], line };
+  if (computed) out.push({ computed: true, line });
+  const state = objProp(route, 'state');
+  const routes = objProp(state, 'routes');
+  if (routes?.type === 'ArrayExpression') for (const r of routes.elements) out.push(...routeTargets(r, line));
+  return out;
+}
+
+function collectNavCalls(ast) {
+  const calls = []; // { method, line, targets: [{ name, via } | { computed }] }
+  let skippedNonNav = 0;
+  walkAst(ast.program, (n) => {
+    if (n.type !== 'CallExpression' && n.type !== 'OptionalCallExpression') return;
+    const c = n.callee;
+    let method = null, recv = null;
+    if ((c.type === 'MemberExpression' || c.type === 'OptionalMemberExpression') && !c.computed && c.property.type === 'Identifier') {
+      method = c.property.name; recv = receiverName(c.object);
+    } else if (c.type === 'Identifier') { method = c.name; recv = null; }
+    if (!NAV_METHODS.has(method)) return;
+    if (method !== 'navigate' && !(recv && NAV_RECEIVER.test(recv))) { skippedNonNav++; return; }
+    const line = n.loc.start.line;
+    const [a0, a1] = n.arguments;
+    let targets = [];
+    if (method === 'reset') {
+      const routes = objProp(a0, 'routes');
+      if (routes?.type === 'ArrayExpression') for (const r of routes.elements) targets.push(...routeTargets(r, line));
+      else if (literalValue(a0) !== null) targets.push({ name: literalValue(a0), via: [], line });
+      else targets.push({ computed: true, line });
+    } else if (literalValue(a0) !== null) {
+      const { chain, computed } = nestedScreen(a1);
+      const first = literalValue(a0);
+      targets.push(chain.length ? { name: chain[chain.length - 1], via: [first, ...chain.slice(0, -1)], line } : { name: first, via: [], line });
+      if (computed) targets.push({ computed: true, line });
+    } else if (a0?.type === 'ObjectExpression') {
+      targets.push(...routeTargets(a0, line)); // navigate({ name, params })
+    } else {
+      targets.push({ computed: true, line });
+    }
+    calls.push({ method, line, targets });
+  });
+  return { calls, skippedNonNav };
+}
+
+// Local name -> { spec } (import / require) or { local: true } (defined in this file).
+function bindings(program) {
+  const b = new Map();
+  const reqSpec = (init) => {
+    let e = init;
+    // __DEV__ ? require('x').default : null  /  flag && require('x')
+    if (e?.type === 'ConditionalExpression') return reqSpec(e.consequent) ?? reqSpec(e.alternate);
+    if (e?.type === 'LogicalExpression') return reqSpec(e.right) ?? reqSpec(e.left);
+    if (e?.type === 'MemberExpression') e = e.object; // require('x').default
+    if (e?.type === 'CallExpression' && e.callee.name === 'require') return literalValue(e.arguments[0]);
+    // React.lazy(() => import('x')) / lazy(() => require('x'))
+    if (e?.type === 'CallExpression' && /^(React\.)?lazy$/.test(e.callee.name ?? `${e.callee.object?.name}.${e.callee.property?.name}`)) {
+      let body = e.arguments[0]?.body;
+      if (body?.type === 'ImportExpression') return literalValue(body.source);
+      if (body?.type === 'CallExpression') return literalValue(body.arguments[0]);
+    }
+    return undefined;
+  };
+  for (const st of program.body) {
+    if (st.type === 'ImportDeclaration') for (const s of st.specifiers) b.set(s.local.name, { spec: st.source.value });
+    const decl = st.type === 'ExportNamedDeclaration' || st.type === 'ExportDefaultDeclaration' ? st.declaration : st;
+    if (!decl) continue;
+    if ((decl.type === 'FunctionDeclaration' || decl.type === 'ClassDeclaration') && decl.id) b.set(decl.id.name, { local: true });
+    if (decl.type === 'VariableDeclaration') {
+      for (const d of decl.declarations) {
+        const spec = reqSpec(d.init);
+        const names = d.id.type === 'Identifier' ? [d.id.name]
+          : d.id.type === 'ObjectPattern' ? d.id.properties.map((p) => p.value?.name).filter(Boolean) : [];
+        for (const nm of names) b.set(nm, spec ? { spec } : { local: true });
+      }
+    }
+  }
+  return b;
+}
+
+const jsxTag = (n) => n.type === 'JSXMemberExpression' ? `${jsxTag(n.object)}.${n.property.name}` : n.name;
+
+// Screens registered in this file: <X.Screen name="..." component={C} />, with the
+// top-level component that hosts each navigator (for nesting).
+function collectScreens(ast) {
+  const screens = [];
+  (function walk(node, host) {
+    if (!node || typeof node.type !== 'string') return;
+    if (node.type === 'FunctionDeclaration' && node.id && /^[A-Z]/.test(node.id.name)) host = node.id.name;
+    if (node.type === 'VariableDeclarator' && node.id.type === 'Identifier' && /^[A-Z]/.test(node.id.name)) host = node.id.name;
+    if (node.type === 'JSXOpeningElement') {
+      const tag = jsxTag(node.name);
+      if (/\.Screen$/.test(tag)) {
+        const attr = (k) => node.attributes.find((a) => a.type === 'JSXAttribute' && a.name.name === k);
+        const nameAttr = attr('name')?.value;
+        const name = nameAttr?.type === 'StringLiteral' ? nameAttr.value
+          : nameAttr?.type === 'JSXExpressionContainer' ? literalValue(nameAttr.expression) : null;
+        const comp = attr('component')?.value?.expression;
+        const getComp = attr('getComponent')?.value?.expression;
+        let component = null, spec;
+        if (comp?.type === 'Identifier') component = comp.name;
+        else if (comp?.type === 'MemberExpression') component = `${comp.object.name}.${comp.property.name}`;
+        if (getComp?.body) {
+          const body = getComp.body.type === 'MemberExpression' ? getComp.body.object : getComp.body;
+          if (body?.type === 'CallExpression' && body.callee.name === 'require') spec = literalValue(body.arguments[0]);
+        }
+        screens.push({ name, component, spec, navigator: tag.replace(/\.Screen$/, ''), host, line: node.loc.start.line });
+      }
+    }
+    for (const key in node) {
+      if (key === 'loc' || key.endsWith('Comments')) continue;
+      const v = node[key];
+      if (Array.isArray(v)) v.forEach((c) => c && typeof c.type === 'string' && walk(c, host));
+      else if (v && typeof v.type === 'string') walk(v, host);
+    }
+  })(ast.program, null);
+  return screens;
+}
+
 // --- resolution ---------------------------------------------------------------
 
 function makeResolver(root) {
@@ -248,6 +409,8 @@ function main() {
   const resolve = makeResolver(root);
   const nodeSet = new Set(jsFiles);
   const nodes = [], edges = [], unresolved = [], missing = [], parseFailures = [];
+  const rawScreens = [], navCallsByFile = new Map();
+  let navSkippedNonNav = 0;
   const assetTotals = { total: 0, byExtension: {} };
 
   for (const rel of jsFiles) {
@@ -276,7 +439,7 @@ function main() {
 
     const pkgs = new Set();
     for (const ld of collectLoads(ast)) {
-      if (ld.spec === null) { unresolved.push({ file: rel, line: ld.line }); continue; }
+      if (ld.spec === null) { unresolved.push({ file: rel, line: ld.line, kind: 'load' }); continue; }
       const ext = path.extname(ld.spec.split('?')[0]).toLowerCase();
       if (ASSET_EXT.has(ext)) {
         assetTotals.total++;
@@ -293,12 +456,76 @@ function main() {
       }
     }
     node.packages = [...pkgs].sort();
+
+    if (node.rootGroup === 'app') {
+      const found = collectScreens(ast);
+      if (found.length) {
+        const b = bindings(ast.program);
+        for (const s of found) {
+          const bind = s.component ? b.get(s.component.split('.')[0]) : null;
+          const spec = s.spec ?? bind?.spec;
+          let file = null;
+          if (spec && (spec.startsWith('.') || spec.startsWith('/'))) file = resolve(rel, spec);
+          else if (!spec && (bind?.local || !s.component)) file = rel; // defined here, or children render
+          rawScreens.push({ ...s, navigatorFile: rel, file, localComponent: !spec && !!bind?.local });
+        }
+      }
+      const { calls, skippedNonNav } = collectNavCalls(ast);
+      navSkippedNonNav += skippedNonNav;
+      if (calls.length) navCallsByFile.set(rel, calls);
+    }
   }
+
+  // Navigation: registered screens, nesting, and navigate edges.
+  const screens = rawScreens.map((s) => ({
+    name: s.name, component: s.component, file: s.file, navigator: s.navigator,
+    navigatorFile: s.navigatorFile, line: s.line, host: s.host, localComponent: s.localComponent,
+  }));
+  // Nesting: a navigator hosted by component H in file F is nested under the screen that
+  // renders H (defined locally in F), or under a screen whose component is imported from F.
+  const hostsIn = (f) => new Set(screens.filter((x) => x.navigatorFile === f).map((x) => x.host));
+  for (const s of screens) {
+    const parent = screens.find((p) => p.host !== s.host || p.navigatorFile !== s.navigatorFile
+      ? p.file === s.navigatorFile && (p.localComponent ? p.component === s.host : hostsIn(s.navigatorFile).size === 1)
+        && !(p.navigatorFile === s.navigatorFile && p.host === s.host)
+      : false);
+    s.parent = parent ? parent.name : null;
+  }
+  for (const s of screens) { delete s.host; delete s.localComponent; }
+  const screensByName = new Map();
+  for (const s of screens) if (s.name) (screensByName.get(s.name) ?? screensByName.set(s.name, []).get(s.name)).push(s);
+
+  const navStats = { calls: 0, targets: 0, matched: 0, computed: 0, unmatched: [], byMethod: {}, skippedNonNavigationReceivers: navSkippedNonNav };
+  const navIncoming = new Map(), viaIncoming = new Map();
+  for (const [from, calls] of navCallsByFile) {
+    for (const call of calls) {
+      navStats.calls++;
+      navStats.byMethod[call.method] = (navStats.byMethod[call.method] || 0) + 1;
+      for (const t of call.targets) {
+        navStats.targets++;
+        if (t.computed) { navStats.computed++; unresolved.push({ file: from, line: t.line, kind: 'navigate' }); continue; }
+        const hits = screensByName.get(t.name);
+        if (!hits) { navStats.unmatched.push({ name: t.name, file: from, line: t.line }); continue; }
+        navStats.matched++;
+        navIncoming.set(t.name, (navIncoming.get(t.name) || 0) + 1);
+        for (const via of t.via) viaIncoming.set(via, (viaIncoming.get(via) || 0) + 1);
+        for (const h of hits) {
+          if (h.file) edges.push({ from, to: h.file, kind: 'navigate', line: t.line, screen: t.name, method: call.method, ...(t.via.length ? { via: t.via } : {}) });
+        }
+      }
+    }
+  }
+  for (const s of screens) {
+    s.incomingNavigation = navIncoming.get(s.name) || 0;
+    s.incomingAsNestedParent = viaIncoming.get(s.name) || 0;
+  }
+  const importEdges = edges.filter((e) => e.kind !== 'navigate');
+  const navEdges = edges.length - importEdges.length;
 
   // Reachability from each root group's entry, and from the project index.js.
   const out = new Map(jsFiles.map((f) => [f, []]));
   const importers = new Map(jsFiles.map((f) => [f, new Set()]));
-  for (const e of edges) { out.get(e.from).push(e.to); importers.get(e.to).add(e.from); }
+  for (const e of importEdges) { out.get(e.from).push(e.to); importers.get(e.to).add(e.from); }
   const reach = (start) => {
     const seen = new Set();
     if (!start) return seen;
@@ -331,10 +558,14 @@ function main() {
     project: { path: root, gitCommit: commit, fileListSource: listSource },
     rootGroups,
     counts: {
-      nodes: nodes.length, edges: edges.length, unresolved: unresolved.length,
+      nodes: nodes.length, edges: edges.length, importEdges: importEdges.length, navigateEdges: navEdges,
+      unresolved: unresolved.length, unresolvedLoads: unresolved.filter((u) => u.kind === 'load').length,
+      unresolvedNavigation: unresolved.filter((u) => u.kind === 'navigate').length,
+      screens: screens.length, navigationCalls: navStats.calls,
       missingRelative: missing.length, assets: assetTotals.total, parseFailures: parseFailures.length,
     },
     nodes, edges, unresolved, missingRelative: missing, assetTotals, parseFailures,
+    navigation: { screens, ...navStats },
   };
 
   fs.mkdirSync(outDir, { recursive: true });
@@ -345,7 +576,7 @@ function main() {
   console.log(`Map written: ${outFile}`);
   console.log(`Run time: ${Math.round(elapsedMs)} ms  (file list from ${listSource})`);
   console.log(`Commit: ${commit ?? 'none'}`);
-  console.log(`Nodes: ${nodes.length}  Edges: ${edges.length}  Unresolved: ${unresolved.length}  Missing relative: ${missing.length}  Assets: ${assetTotals.total} ${JSON.stringify(assetTotals.byExtension)}`);
+  console.log(`Nodes: ${nodes.length}  Edges: ${edges.length} (import ${importEdges.length}, navigate ${navEdges})  Unresolved: ${unresolved.length} (load ${map.counts.unresolvedLoads}, navigate ${map.counts.unresolvedNavigation})  Missing relative: ${missing.length}  Assets: ${assetTotals.total} ${JSON.stringify(assetTotals.byExtension)}`);
   console.log(`App entry: ${appEntry ?? 'none'}`);
   for (const g of rootGroups) {
     console.log(`Root group ${g.name}: ${g.fileCount} files, entry ${g.entry ?? 'none'}, not imported from ${appEntry ?? 'app entry'}: ${g.notImportedFromAppEntry}`
@@ -354,6 +585,21 @@ function main() {
   }
   console.log('Most imported:');
   for (const n of top) console.log(`  ${n.importedBy}  ${n.path}`);
+  if (screens.length || navStats.calls) {
+    const nested = screens.filter((s) => s.parent).length;
+    console.log(`Screens registered: ${screens.length} (${nested} nested), in ${new Set(screens.map((s) => s.navigatorFile)).size} navigator file(s); without a resolved file: ${screens.filter((s) => !s.file).length}`);
+    console.log(`Navigation calls: ${navStats.calls} ${JSON.stringify(navStats.byMethod)}, targets ${navStats.targets}: matched ${navStats.matched}, unmatched ${navStats.unmatched.length}, computed ${navStats.computed}; push/replace/reset on non-navigation receivers ignored: ${navStats.skippedNonNavigationReceivers}`);
+    const um = {};
+    for (const u of navStats.unmatched) um[u.name] = (um[u.name] || 0) + 1;
+    console.log(`Unmatched names: ${Object.entries(um).map(([k, v]) => `${k} (${v})`).join(', ') || 'none'}`);
+    console.log('Most navigated-to screens:');
+    for (const s of [...screens].sort((a, b) => b.incomingNavigation - a.incomingNavigation || a.name.localeCompare(b.name)).slice(0, 10)) {
+      console.log(`  ${s.incomingNavigation}  ${s.name}  ${s.file ?? '(no file)'}`);
+    }
+    const none = screens.filter((s) => !s.incomingNavigation && !s.incomingAsNestedParent);
+    console.log(`No incoming navigation found: ${none.length}`);
+    for (const s of none) console.log(`  ${s.name}${s.parent ? ` (in ${s.parent})` : ''}  ${s.file ?? '(no file)'}`);
+  }
   console.log(`Parse failures: ${parseFailures.length}`);
   for (const f of parseFailures) console.log(`  ${f.file}:${f.line ?? '?'} ${f.reason}`);
 }
