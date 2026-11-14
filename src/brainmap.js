@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // brainmap: read-only answers about a mapped code project, for coding assistants. Reads
-// ~/.brain/maps/<slug>/map.json (schemaVersion 5); refreshes it first when the code changed (the same check
+// ~/.brain/maps/<slug>/map.json (schemaVersion 6); refreshes it first when the code changed (the same check
 // as the Brain app's "Map is current"). Prints paths, names and numbers only, never file contents.
 // No network, no model calls.
 import { stat } from 'fs/promises';

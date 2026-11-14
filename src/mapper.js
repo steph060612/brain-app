@@ -13,7 +13,7 @@ import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { parse } from '@babel/parser';
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 const IMPORT_KINDS = ['import', 're-export', 'require', 'dynamic'];
 const KINDS = {
   nodes: ['file', 'collection', 'subcollection'],
@@ -1068,6 +1068,17 @@ function opsFor(node, A, depth = 0, seen = new Set()) {
 }
 
 const isHole = (seg) => seg.includes('{');
+
+// A literal document ID that must never be stored or shown: a generated-looking value (16+ letters and digits
+// mixed), a UUID, an email address or a long number. Short fixed names the app uses as documents (stats,
+// exercisePRs, settings, state) are kept.
+export const looksLikeId = (seg) => !seg.includes('{') && (
+  (seg.length >= 16 && /[A-Za-z]/.test(seg) && /\d/.test(seg) && /^[A-Za-z0-9_-]+$/.test(seg))
+  || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg)
+  || /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(seg)
+  || /^\d{6,}$/.test(seg));
+// Document positions are the odd segments of a path (after each collection name); collection names stay.
+const maskIds = (parts, group) => (group ? parts : parts.map((p, i) => (i % 2 === 1 && looksLikeId(p) ? '{id}' : p)));
 // One key per subcollection, whatever the document ids are called: users/{uid}/workoutLogs -> users/{}/workoutLogs.
 const subKey = (colParts) => colParts.map((p, i) => (i % 2 ? '{}' : p)).join('/');
 
@@ -1097,7 +1108,7 @@ const cleanOps = (ops) => {
 };
 
 function collectData(A) {
-  const uses = [], unresolvedLines = [], partial = [];
+  const uses = [], unresolvedLines = [], partial = [], masked = new Set();
   for (const n of A.nodes()) {
     if (!isCall(n) || !isRefCtor(n, A)) continue;
     // Where the reference is used: here, or at each call of the helper that returns it.
@@ -1112,8 +1123,10 @@ function collectData(A) {
     const inferred = r.segs.some((sg) => sg.inferred);
     let any = false;
     for (const raw of new Set(variants)) {
-      const parts = raw.split('/').filter(Boolean);
-      if (!parts.length || isHole(parts[0])) continue;
+      const rawParts = raw.split('/').filter(Boolean);
+      if (!rawParts.length || isHole(rawParts[0])) continue;
+      const parts = maskIds(rawParts, r.group);
+      if (parts.some((p, i) => p !== rawParts[i])) masked.add(parts.join('/')); // counted, never the raw form
       any = true;
       const pathText = parts.join('/');
       const colParts = r.group ? parts : parts.length % 2 === 0 ? parts.slice(0, -1) : parts;
@@ -1126,7 +1139,7 @@ function collectData(A) {
     }
     if (!any) unresolvedLines.push(line);
   }
-  return { uses, unresolvedLines, partial };
+  return { uses, unresolvedLines, partial, masked };
 }
 
 // --- resolution ---------------------------------------------------------------
@@ -1420,7 +1433,9 @@ function main() {
     if (!e.paths.includes(u.path)) e.paths.push(u.path);
     if (u.inferred) e.inferred = true;
   };
+  const maskedPaths = new Set();
   for (const [from, data] of dataByFile) {
+    for (const m of data.masked) maskedPaths.add(m);
     for (const line of data.unresolvedLines) unresolved.push({ file: from, line, kind: 'data' });
     const seenPartial = new Set();
     for (const p of data.partial) {
@@ -1515,12 +1530,13 @@ function main() {
       missingRelative: missing.length, assets: assetTotals.total, parseFailures: parseFailures.length,
       screens: screens.length, navigationCalls: navStats.calls, functionCalls: fnStats.calls,
       functionCallSites: callStats.calls, functionCallsResolved: callStats.resolved, functionCallsViaValue: callStats.viaValue || 0, functionCallsUnresolved: callStats.unresolved,
-      collections: collections.size, subcollections: subs.size, dataUsesWithUnknownOperation: dataOpUnknown.length,
+      collections: collections.size, subcollections: subs.size, documentIdPathsMasked: maskedPaths.size, dataUsesWithUnknownOperation: dataOpUnknown.length,
     },
     nodes, edges, unresolved, missingRelative: missing, assetTotals, parseFailures,
     navigation: { screens, ...navStats },
     functions: fnStats,
-    data: { usesWithUnknownOperation: dataOpUnknown },
+    // Paths in which a literal document ID was replaced by {id} (masked form only; the raw ID is never stored).
+    data: { usesWithUnknownOperation: dataOpUnknown, documentIdPathsMasked: [...maskedPaths].sort() },
   };
 
   fs.mkdirSync(outDir, { recursive: true });
@@ -1568,7 +1584,7 @@ function main() {
     for (const [f, s] of [...touch].sort((a, b) => b[1].size - a[1].size || a[0].localeCompare(b[0])).slice(0, 10)) console.log(`  ${s.size}  ${f}`);
     console.log(`Subcollections: ${subs.size} (readers / writers / used with unknown operation)`);
     for (const n of nodes.filter((x) => x.kind === 'subcollection')) console.log(`  ${n.pattern}: ${n.readers} / ${n.writers} / ${n.usedWithUnknownOperation}`);
-    console.log(`Data uses with unknown read/write: ${dataOpUnknown.length}; unresolved data paths: ${map.counts.unresolvedByKind.data ?? 0}`);
+    console.log(`Data uses with unknown read/write: ${dataOpUnknown.length}; unresolved data paths: ${map.counts.unresolvedByKind.data ?? 0}; paths with a literal document ID masked as {id}: ${maskedPaths.size}`);
   }
   console.log(`Function calls between files: ${callStats.resolved} resolved (${callStats.viaValue || 0} via a value passed on), ${callStats.unresolved} unresolved (kind call)`);
   console.log(`Parse failures: ${parseFailures.length}`);
