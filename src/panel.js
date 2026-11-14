@@ -97,17 +97,25 @@ function esc(s) {
 }
 
 // ─── BUILD ───────────────────────────────────────────────────────────────────
+// Panel width: about half the window, never narrower than 380px (or the window) nor wider than 960px.
+// The code map diagram and the list view read the same variable to stay clear of the panel.
+const PANEL_WIDTH = 'clamp(min(380px, 100vw), 50vw, 960px)';
+
 export function initPanel() {
+  document.documentElement.style.setProperty('--panel-w', PANEL_WIDTH);
   panelEl = document.createElement('div');
   panelEl.id = 'brain-panel';
+  // The whole panel scrolls (header, code section, tabs and body together), so no section is cut off.
   panelEl.style.cssText = `
-    position:fixed; top:44px; right:0; height:calc(100% - 44px); width:380px;
-    background:rgba(5,7,15,0.96); color:#e8eaf0;
+    position:fixed; top:44px; right:0; height:calc(100% - 44px); width:var(--panel-w);
+    background:#05070F; color:#e8eaf0; /* opaque: the wider panel covers part of the brain and its labels */
     font-family:system-ui,-apple-system,sans-serif; font-size:14px;
     border-left:1px solid rgba(100,120,200,0.18);
     transform:translateX(100%); transition:transform 0.22s ease;
-    display:flex; flex-direction:column; z-index:30; overflow:hidden;
+    display:flex; flex-direction:column; z-index:30; overflow-x:hidden; overflow-y:auto;
+    scrollbar-width:thin; scrollbar-color:#2a3050 transparent;
   `;
+  panelEl.addEventListener('wheel', chainWheel, { passive: false });
 
   // Header
   const header = document.createElement('div');
@@ -164,10 +172,7 @@ export function initPanel() {
 
   // Body
   bodyEl = document.createElement('div');
-  bodyEl.style.cssText = `
-    flex:1; overflow-y:auto; padding:16px;
-    scrollbar-width:thin; scrollbar-color:#2a3050 transparent;
-  `;
+  bodyEl.style.cssText = 'flex:1 0 auto; padding:16px 16px 32px;';
   panelEl.appendChild(bodyEl);
 
   // Status bar
@@ -175,10 +180,28 @@ export function initPanel() {
   statusEl.style.cssText = `
     padding:8px 16px; font-size:12px; min-height:32px; flex-shrink:0;
     border-top:1px solid rgba(100,120,200,0.12);
+    position:sticky; bottom:0; background:rgba(5,7,15,0.98);
   `;
   panelEl.appendChild(statusEl);
 
   document.body.appendChild(panelEl);
+}
+
+// A box inside the panel with its own scroll (a code preview) hands the wheel on to the panel once it
+// reaches its end, instead of swallowing it.
+function chainWheel(e) {
+  if (e.ctrlKey || !e.deltaY) return;
+  const down = e.deltaY > 0;
+  for (let n = e.target; n && n !== panelEl; n = n.parentElement) {
+    if (n.scrollHeight <= n.clientHeight + 1 || !/(auto|scroll)/.test(getComputedStyle(n).overflowY)) continue;
+    const canScroll = down ? n.scrollTop + n.clientHeight < n.scrollHeight - 1 : n.scrollTop > 0;
+    if (canScroll) return; // the inner box still has room: let it scroll
+    // At its end: move the panel instead.
+    e.preventDefault();
+    const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? panelEl.clientHeight : 1;
+    panelEl.scrollTop += e.deltaY * unit;
+    return;
+  }
 }
 
 // ─── OPEN / CLOSE ────────────────────────────────────────────────────────────
@@ -207,6 +230,7 @@ export async function openPanel(item) {
   showCodeSection(isProject ? { slug: item.path.split('/').pop(), name: item.name } : null);
 
   buildTabs();
+  panelEl.scrollTop = 0; // a newly opened item starts at its header
   panelEl.style.transform = 'translateX(0)';
   setPanelOpen(true);
   window.dispatchEvent(new CustomEvent('brain-panel', { detail: { open: true } }));

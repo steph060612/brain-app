@@ -10,7 +10,6 @@ const GROUPS = [
   { title: 'Profile and Preferences', categories: ['profile', 'preferences'] },
 ];
 const VIEW_KEY = 'brain-view';
-const PANEL_WIDTH = 380; // rows stay clear of the open panel
 
 let items    = [];
 let query    = '';
@@ -84,7 +83,7 @@ function render() {
   const top = listEl.scrollTop;
   listEl.innerHTML = '';
   const wrap = document.createElement('div');
-  wrap.style.cssText = `width:max(280px, min(640px, calc(100vw - ${PANEL_WIDTH + 48}px)));`;
+  wrap.style.cssText = 'width:max(280px, min(640px, calc(100vw - var(--panel-w, 380px) - 48px)));'; // rows stay clear of the open panel
 
   const matches = items.filter(i => !query || i.name.toLowerCase().includes(query));
   for (const { title, categories } of GROUPS) {

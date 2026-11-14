@@ -10,7 +10,6 @@ import { setBrainPaused } from './brain.js';
 
 const SCHEMA_VERSION = 4;
 const BG = '#05070F';
-const PANEL_W = 380;
 let TOP = 96;             // below the toolbar; follows its height when it wraps
 const SIDE_W = 300;       // findings column and selection card
 const DEFAULT_LABELS = 8;
@@ -96,7 +95,7 @@ function build() {
   if (root) return;
   root = document.createElement('div');
   root.id = 'code-map';
-  root.style.cssText = `position:fixed; top:44px; left:0; right:${PANEL_W}px; bottom:0; z-index:26; display:none;
+  root.style.cssText = `position:fixed; top:44px; left:0; right:var(--panel-w, 380px); bottom:0; z-index:26; display:none;
     background:${BG}; font-family:system-ui,-apple-system,sans-serif; color:#c8d0e8; overflow:hidden;`;
   root.innerHTML = `
     <style>
@@ -160,7 +159,7 @@ function build() {
   window.addEventListener('resize', () => { if (isCodeMapOpen()) { resize(); placeBelowToolbar(); } });
   window.addEventListener('brain-panel', e => {
     panelOpen = !!e.detail?.open;
-    root.style.right = panelOpen ? `${PANEL_W}px` : '0';
+    root.style.right = panelOpen ? 'var(--panel-w, 380px)' : '0';
     if (isCodeMapOpen()) { resize(); placeBelowToolbar(); }
   });
   window.addEventListener('keydown', e => {
