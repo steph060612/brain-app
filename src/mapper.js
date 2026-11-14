@@ -13,12 +13,12 @@ import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { parse } from '@babel/parser';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const IMPORT_KINDS = ['import', 're-export', 'require', 'dynamic'];
 const KINDS = {
   nodes: ['file', 'collection', 'subcollection'],
-  edges: [...IMPORT_KINDS, 'navigate', 'calls-function', 'reads', 'writes'],
-  unresolved: ['load', 'navigate', 'function', 'data'],
+  edges: [...IMPORT_KINDS, 'navigate', 'calls-function', 'reads', 'writes', 'calls'],
+  unresolved: ['load', 'navigate', 'function', 'data', 'call'],
 };
 
 export const JS_EXT = ['.js', '.jsx', '.mjs', '.cjs'];
@@ -245,7 +245,10 @@ function analyze(ast) {
     const inner = SCOPE_TYPES.has(node.type) ? { up: scope, decls: new Map() } : scope;
     switch (node.type) {
       case 'ImportDeclaration':
-        for (const s of node.specifiers) declare(program, s.local, { kind: 'import', spec: node.source.value });
+        for (const s of node.specifiers) {
+          const imported = s.type === 'ImportDefaultSpecifier' ? 'default' : s.type === 'ImportNamespaceSpecifier' ? '*' : (s.imported.name ?? s.imported.value);
+          declare(program, s.local, { kind: 'import', spec: node.source.value, imported });
+        }
         break;
       case 'VariableDeclaration':
         for (const d of node.declarations) {
@@ -612,6 +615,176 @@ function functionDefinitions(ast, rel, resolve) {
   return defs;
 }
 
+// --- function call layer ---------------------------------------------------------
+// Which named function a node sits in, the functions each file exports, and calls from one project file to a
+// function exported by another. Nothing is guessed: what cannot be traced is counted as unresolved (kind call).
+
+const keyName = (k) => (k?.type === 'Identifier' ? k.name : literalValue(k) ?? (k?.type === 'NumericLiteral' ? String(k.value) : null));
+
+// The name a function gets from where it is written: function f, const f = () =>, exports.f = ..., { f: () => },
+// class methods (Class.method). Null for an anonymous function.
+function functionName(f, A) {
+  if (f.type === 'FunctionDeclaration') return f.id?.name ?? null;
+  if (f.type === 'ClassMethod' || f.type === 'ClassPrivateMethod') {
+    const cls = A.parent(A.parent(f));
+    const k = f.key.type === 'PrivateName' ? `#${f.key.id.name}` : keyName(f.key);
+    return k ? (cls?.id ? `${cls.id.name}.${k}` : k) : null;
+  }
+  if (f.type === 'ObjectMethod') return keyName(f.key);
+  if (f.id?.name) return f.id.name; // named function expression
+  return assignedName(f, A);
+}
+
+// The name a value is given: const x = v, x = v, exports.x = v, { x: v }, class field x = v. Also looks through
+// wrapper calls, so const load = useCallback(async () => ..., []) and exports.onLog = onCall(async () => ...) are named.
+function assignedName(node, A) {
+  let cur = node, p = A.parent(cur), wrapped = null;
+  // Look through a wrapper call only when it returns the function itself: React's useCallback / memo /
+  // forwardRef, or a cloud function definition that is exported (exports.x = onCall(fn), export const x =
+  // onRequest(fn)). Not docs.map(fn) or const unsubscribe = onAuthStateChanged(auth, fn), whose results are values.
+  for (let i = 0; p && i < 6 && isCall(p) && A.key(cur) === 'arguments'; i++) { wrapped ??= p; cur = p; p = A.parent(cur); }
+  if (!p) return null;
+  const hook = wrapped && /^(useCallback|memo|forwardRef)$/.test(wrapped.callee.name ?? propName(wrapped.callee) ?? '');
+  const exported = () => (p.type === 'VariableDeclarator' && A.parent(A.parent(p))?.type === 'ExportNamedDeclaration')
+    || (p.type === 'AssignmentExpression' && isMember(p.left) && ((p.left.object.type === 'Identifier' && p.left.object.name === 'exports') || isModuleExports(p.left.object)));
+  if (wrapped && !hook && !exported()) return null;
+  if (p.type === 'VariableDeclarator' && A.key(cur) === 'init' && p.id.type === 'Identifier') return p.id.name;
+  if (p.type === 'AssignmentExpression' && A.key(cur) === 'right') {
+    if (p.left.type === 'Identifier') return p.left.name;
+    if (isMember(p.left) && !p.left.computed) return p.left.property.name;
+  }
+  if ((p.type === 'ObjectProperty' || p.type === 'ClassProperty') && A.key(cur) === 'value' && !p.computed) return keyName(p.key);
+  if (p.type === 'ExportDefaultDeclaration') return 'default';
+  return null;
+}
+
+// The nearest enclosing function that has a name; anonymous callbacks count as part of the function around them.
+function enclosingFunction(node, A) {
+  for (let n = A.parent(node); n; n = A.parent(n)) {
+    if (!FUNC_TYPES.has(n.type)) continue;
+    const name = functionName(n, A);
+    if (name) return name;
+  }
+  return null;
+}
+
+const isFnNode = (n) => n && (n.type === 'ArrowFunctionExpression' || n.type === 'FunctionExpression' || n.type === 'FunctionDeclaration');
+
+// What a file exports: name -> { local, fn } for its own values, or { file, name } for a re-export; plus `export *`.
+function exportTable(program, rel, resolve) {
+  const localFns = new Set(), locals = new Set();
+  for (const st of program.body) {
+    const d = st.type === 'ExportNamedDeclaration' || st.type === 'ExportDefaultDeclaration' ? st.declaration : st;
+    if (d?.type === 'FunctionDeclaration' && d.id) { localFns.add(d.id.name); locals.add(d.id.name); }
+    if (d?.type === 'ClassDeclaration' && d.id) locals.add(d.id.name);
+    if (d?.type === 'VariableDeclaration') for (const x of d.declarations) if (x.id.type === 'Identifier') { locals.add(x.id.name); if (isFnNode(x.init)) localFns.add(x.id.name); }
+  }
+  const names = new Map(), stars = [];
+  const own = (exp, local, fnNode) => names.set(exp, { local, fn: fnNode ? isFnNode(fnNode) : localFns.has(local) });
+  const target = (spec) => (spec && (spec.startsWith('.') || spec.startsWith('/')) ? resolve(rel, spec) : null);
+  let cjs = false;
+  for (const st of program.body) {
+    if (st.type === 'ExportNamedDeclaration') {
+      const d = st.declaration;
+      if (d?.type === 'FunctionDeclaration') own(d.id.name, d.id.name, d);
+      else if (d?.type === 'ClassDeclaration') own(d.id.name, d.id.name, null);
+      else if (d?.type === 'VariableDeclaration') for (const x of d.declarations) for (const id of patternIds(x.id)) own(id.name, id.name, x.id.type === 'Identifier' ? x.init : null);
+      for (const sp of st.specifiers || []) {
+        const exp = sp.exported.name ?? sp.exported.value;
+        if (st.source) { const f = target(st.source.value); if (f) names.set(exp, { file: f, name: sp.type === 'ExportNamespaceSpecifier' ? '*' : (sp.local?.name ?? sp.local?.value ?? 'default') }); }
+        else own(exp, sp.local.name, null);
+      }
+    } else if (st.type === 'ExportDefaultDeclaration') {
+      const d = st.declaration;
+      if (d.type === 'Identifier') own('default', d.name, null);
+      else if (d.type === 'FunctionDeclaration' || isFnNode(d)) own('default', d.id?.name ?? 'default', d);
+      else names.set('default', { local: 'default', fn: false });
+    } else if (st.type === 'ExportAllDeclaration' && !st.exported) {
+      const f = target(st.source.value);
+      if (f) stars.push(f);
+    } else if (st.type === 'ExpressionStatement' && st.expression.type === 'AssignmentExpression') {
+      const { left, right } = st.expression;
+      const valueOwn = (exp, v) => {
+        if (v.type === 'Identifier') own(exp, v.name, null);
+        else if (isFnNode(v)) own(exp, v.id?.name ?? exp, v);
+        else if (isCall(v) && v.callee.name === 'require' && target(literalValue(v.arguments[0]))) names.set(exp, { file: target(literalValue(v.arguments[0])), name: '*' });
+        else names.set(exp, { local: exp, fn: isCall(v) }); // e.g. exports.x = onCall(...): callable
+      };
+      if (isModuleExports(left)) {
+        cjs = true;
+        if (right.type === 'ObjectExpression') {
+          for (const pr of right.properties) {
+            if (pr.type === 'ObjectMethod') own(keyName(pr.key), keyName(pr.key), pr);
+            else if (pr.type === 'ObjectProperty' && !pr.computed) valueOwn(keyName(pr.key), pr.value);
+          }
+        } else valueOwn('default', right);
+      } else if (isMember(left) && !left.computed && ((left.object.type === 'Identifier' && left.object.name === 'exports') || isModuleExports(left.object))) {
+        cjs = true;
+        valueOwn(left.property.name, right);
+      }
+    }
+  }
+  return { names, stars, cjs };
+}
+
+// Bindings that refer to another project file: import { a as b }, import x, import * as ns, and the CommonJS
+// forms const x = require('./y'), const { a, b: c } = require('./y'), const a = require('./y').a.
+function importBindings(ast, A, rel, resolve) {
+  const out = new Map(); // binding -> { file, imported }
+  const fileOf = (spec) => (spec && (spec.startsWith('.') || spec.startsWith('/')) ? resolve(rel, spec) : null);
+  const declared = (id) => A.lookup(id.name, id);
+  walkAst(ast.program, (n) => {
+    if (n.type === 'ImportDeclaration') {
+      const file = fileOf(n.source.value);
+      if (!file) return;
+      for (const sp of n.specifiers) { const b = declared(sp.local); if (b) out.set(b, { file, imported: b.imported }); }
+    } else if (n.type === 'VariableDeclarator' && n.init) {
+      let init = n.init, member = null;
+      if (isMember(init) && !init.computed) { member = init.property.name; init = init.object; }
+      if (!isCall(init) || init.callee.name !== 'require') return;
+      const file = fileOf(literalValue(init.arguments[0]));
+      if (!file) return;
+      if (n.id.type === 'Identifier') { const b = declared(n.id); if (b) out.set(b, { file, imported: member ?? '*' }); }
+      else if (n.id.type === 'ObjectPattern' && !member) {
+        for (const pr of n.id.properties) {
+          if (pr.type !== 'ObjectProperty' || pr.computed) continue;
+          const id = pr.value.type === 'AssignmentPattern' ? pr.value.left : pr.value;
+          if (id.type === 'Identifier') { const b = declared(id); if (b) out.set(b, { file, imported: keyName(pr.key) }); }
+        }
+      }
+    }
+  });
+  return out;
+}
+
+// Calls to functions imported from other project files: { file, name, line, caller, via }, and the uses the
+// mapper cannot follow (a computed member, an imported function passed as a value, a module object passed on).
+function collectCalls(ast, A, rel, resolve) {
+  const imports = importBindings(ast, A, rel, resolve);
+  const calls = [], values = [];
+  for (const [b, imp] of imports) {
+    for (const ref of A.usesOf(b)) {
+      const p = A.parent(ref), k = A.key(ref);
+      const line = ref.loc.start.line;
+      if (isCall(p) && k === 'callee') { calls.push({ file: imp.file, name: imp.imported, line, caller: enclosingFunction(ref, A) }); continue; }
+      if (isMember(p) && k === 'object') {
+        const g = A.parent(p), member = p.computed ? literalValue(p.property) : p.property.name;
+        const called = isCall(g) && A.key(p) === 'callee';
+        if (imp.imported === '*' || imp.imported === 'default') {
+          if (member === null) { values.push({ file: imp.file, name: null, line, reason: 'computed member' }); continue; }
+          if (called) { calls.push({ file: imp.file, name: member, line, caller: enclosingFunction(ref, A), via: imp.imported }); continue; }
+          values.push({ file: imp.file, name: member, local: member, line, reason: 'function used as a value', member: true });
+        }
+        continue; // fn.length, Component.propTypes, ...: not a call
+      }
+      if (p?.type === 'UnaryExpression' && p.operator === 'typeof') continue;
+      if (p?.type === 'ExportSpecifier') continue;
+      values.push({ file: imp.file, name: imp.imported, local: ref.name, line, reason: imp.imported === '*' ? 'module object used as a value' : 'function used as a value' });
+    }
+  }
+  return { calls, values };
+}
+
 // --- Firestore pass -----------------------------------------------------------
 
 const FS_REF_FNS = new Set(['collection', 'doc', 'collectionGroup']);
@@ -822,14 +995,36 @@ const subKey = (colParts) => colParts.map((p, i) => (i % 2 ? '{}' : p)).join('/'
 
 // Firestore references in one file. Each use names its top-level collection (as in schema 2) and, when the
 // path goes deeper, the subcollection pattern it reaches (a document path counts as its collection's).
+// When a reference is what a helper in the same file returns (function workoutLogsRef(uid) { return collection(...) }),
+// it is really used where the helper is called: those call nodes, or null.
+function helperCallSites(n, A) {
+  let cur = n, p = A.parent(cur);
+  while (p && (p.type === 'ParenthesizedExpression' || p.type === 'TSAsExpression')) { cur = p; p = A.parent(p); }
+  let f = null;
+  if (p?.type === 'ReturnStatement') { f = A.parent(p); while (f && !FUNC_TYPES.has(f.type)) f = A.parent(f); }
+  else if (p?.type === 'ArrowFunctionExpression' && A.key(cur) === 'body') f = p;
+  if (!f) return null;
+  let b = null;
+  if (f.type === 'FunctionDeclaration' && f.id) b = A.lookup(f.id.name, f.id);
+  else { const d = A.parent(f); if (d?.type === 'VariableDeclarator' && d.id.type === 'Identifier') b = A.lookup(d.id.name, d.id); }
+  const calls = b ? A.usesOf(b).filter((u) => isCall(A.parent(u)) && A.key(u) === 'callee').map((u) => A.parent(u)) : [];
+  return calls.length ? calls : null;
+}
+
+const cleanOps = (ops) => {
+  ops = [...new Set(ops)];
+  if (ops.length === 1 && ops[0] === 'base') return null; // the longer path is recorded instead
+  ops = ops.filter((o) => o !== 'base' && o !== 'none');
+  return ops.length ? ops : ['unknown']; // only its id / path is used
+};
+
 function collectData(A) {
   const uses = [], unresolvedLines = [], partial = [];
   for (const n of A.nodes()) {
     if (!isCall(n) || !isRefCtor(n, A)) continue;
-    let ops = [...new Set(opsFor(n, A))];
-    if (ops.length === 1 && ops[0] === 'base') continue; // the longer path is recorded instead
-    ops = ops.filter((o) => o !== 'base' && o !== 'none');
-    if (!ops.length) ops = ['unknown']; // only its id / path is used
+    // Where the reference is used: here, or at each call of the helper that returns it.
+    const sites = (helperCallSites(n, A) ?? [n]).map((c) => ({ ops: cleanOps(opsFor(c, A)), line: c.loc.start.line, fn: enclosingFunction(c, A) })).filter((x) => x.ops);
+    if (!sites.length) continue;
     const line = n.loc.start.line;
     const r = refPath(n, A);
     if (!r || r.unresolved || !r.segs.length) { unresolvedLines.push(line); continue; }
@@ -849,7 +1044,7 @@ function collectData(A) {
         if (colParts.some((p, i) => i % 2 === 0 && isHole(p))) partial.push({ line, path: pathText });
         else sub = { key: subKey(colParts), pattern: colParts.join('/') };
       }
-      for (const op of ops) uses.push({ collection: parts[0], path: pathText, op, line, inferred, group: !!r.group, sub });
+      for (const st of sites) for (const op of st.ops) uses.push({ collection: parts[0], path: pathText, op, line: st.line, fn: st.fn, inferred, group: !!r.group, sub });
     }
     if (!any) unresolvedLines.push(line);
   }
@@ -924,6 +1119,7 @@ function main() {
   const nodeSet = new Set(jsFiles);
   const nodes = [], edges = [], unresolved = [], missing = [], parseFailures = [];
   const rawScreens = [], navCallsByFile = new Map(), callablesByFile = new Map(), dataByFile = new Map();
+  const exportTables = new Map(), callsByFile = new Map();
   let navSkippedNonNav = 0, functionDefs = new Map();
   const assetTotals = { total: 0, byExtension: {} };
 
@@ -977,6 +1173,9 @@ function main() {
 
     // Firestore use is read in every root group (app, functions/, scripts/); the rest is app only.
     const A = analyze(ast);
+    exportTables.set(rel, exportTable(ast.program, rel, resolve));
+    const fc = collectCalls(ast, A, rel, resolve);
+    if (fc.calls.length || fc.values.length) callsByFile.set(rel, fc);
     const data = collectData(A);
     if (data.uses.length || data.unresolvedLines.length || data.partial.length) dataByFile.set(rel, data);
 
@@ -1061,6 +1260,50 @@ function main() {
   }
   fnStats.exported = [...functionDefs.keys()];
 
+  // --- function calls between project files: calls edges (one per call site)
+  const resolveExport = (file, name, depth = 0) => {
+    const t = exportTables.get(file);
+    if (!t || depth > 10) return null;
+    const e = t.names.get(name);
+    if (e) return e.file ? (e.name === '*' ? null : resolveExport(e.file, e.name, depth + 1)) : { file, name, local: e.local, fn: e.fn };
+    if (name !== 'default') for (const f of t.stars) { const r = resolveExport(f, name, depth + 1); if (r) return r; }
+    return null;
+  };
+  const callStats = { calls: 0, resolved: 0, unresolved: 0 };
+  for (const [from, fc] of callsByFile) {
+    for (const c of fc.calls) {
+      callStats.calls++;
+      const t = exportTables.get(c.file);
+      let name = c.name;
+      if (name === '*') name = 'default'; // const f = require('./f'); f()
+      if (c.via === 'default' && !t?.cjs && !t?.names.has(name)) name = null; // a member of an ES default export object
+      const r = name === null ? null : resolveExport(c.file, name);
+      if (!r) {
+        callStats.unresolved++;
+        unresolved.push({ file: from, line: c.line, kind: 'call', reason: name === null ? 'called through the default export object' : 'export not found', target: c.file, name: c.name });
+        continue;
+      }
+      callStats.resolved++;
+      edges.push({ from, to: r.file, kind: 'calls', line: c.line, function: r.name === 'default' ? r.local : r.name,
+        ...(r.name !== (r.name === 'default' ? r.local : r.name) ? { export: r.name } : {}),
+        ...(r.local && r.local !== r.name ? { local: r.local } : {}), ...(c.caller ? { caller: c.caller } : {}) });
+    }
+    // Imported functions handed on as values cannot be followed. Components (capitalised names) are rendered,
+    // not called, and non-function exports are plain values, so neither is counted.
+    for (const v of fc.values) {
+      if (v.reason === 'module object used as a value' || v.reason === 'computed member') {
+        callStats.unresolved++;
+        unresolved.push({ file: from, line: v.line, kind: 'call', reason: v.reason, target: v.file });
+        continue;
+      }
+      if (/^[A-Z]/.test(v.local)) continue;
+      const r = resolveExport(v.file, v.name === '*' ? 'default' : v.name);
+      if (!r?.fn) continue;
+      callStats.unresolved++;
+      unresolved.push({ file: from, line: v.line, kind: 'call', reason: v.reason, target: r.file, name: r.name === 'default' ? r.local : r.name });
+    }
+  }
+
   // --- Firestore: collection and subcollection nodes, reads / writes edges (one per file, target and kind).
   // Top-level collection nodes count every use under them, subcollections included (as in schema 2);
   // subcollection nodes are one per path pattern. Each edge says which root group and folder its file is in.
@@ -1070,9 +1313,11 @@ function main() {
   const addEdge = (from, to, u) => {
     const key = `${from}\0${to}\0${u.op}`;
     const f = fileByPath.get(from);
-    const e = dataEdges.get(key) ?? dataEdges.set(key, { from, to, kind: u.op, count: 0, lines: [], paths: [], group: f.rootGroup, folder: f.topFolder }).get(key);
+    const e = dataEdges.get(key) ?? dataEdges.set(key, { from, to, kind: u.op, count: 0, lines: [], paths: [], sites: [], group: f.rootGroup, folder: f.topFolder }).get(key);
     e.count++;
     if (!e.lines.includes(u.line)) e.lines.push(u.line);
+    // Each line with the named function it is in (none at the top level of the file).
+    if (!e.sites.some((x) => x.line === u.line)) e.sites.push({ line: u.line, function: u.fn ?? null });
     if (!e.paths.includes(u.path)) e.paths.push(u.path);
     if (u.inferred) e.inferred = true;
   };
@@ -1096,7 +1341,7 @@ function main() {
       }
       if (u.op === 'unknown') {
         col.unknown.add(from); sub?.unknown.add(from);
-        dataOpUnknown.push({ file: from, line: u.line, collection: u.collection, path: u.path, ...(u.sub ? { subcollection: u.sub.key } : {}) });
+        dataOpUnknown.push({ file: from, line: u.line, function: u.fn ?? null, collection: u.collection, path: u.path, ...(u.sub ? { subcollection: u.sub.key } : {}) });
         continue;
       }
       (u.op === 'reads' ? col.readers : col.writers).add(from);
@@ -1170,6 +1415,7 @@ function main() {
       unresolved: unresolved.length, unresolvedByKind: countBy(unresolved, (u) => u.kind),
       missingRelative: missing.length, assets: assetTotals.total, parseFailures: parseFailures.length,
       screens: screens.length, navigationCalls: navStats.calls, functionCalls: fnStats.calls,
+      functionCallSites: callStats.calls, functionCallsResolved: callStats.resolved, functionCallsUnresolved: callStats.unresolved,
       collections: collections.size, subcollections: subs.size, dataUsesWithUnknownOperation: dataOpUnknown.length,
     },
     nodes, edges, unresolved, missingRelative: missing, assetTotals, parseFailures,
@@ -1225,6 +1471,7 @@ function main() {
     for (const n of nodes.filter((x) => x.kind === 'subcollection')) console.log(`  ${n.pattern}: ${n.readers} / ${n.writers} / ${n.usedWithUnknownOperation}`);
     console.log(`Data uses with unknown read/write: ${dataOpUnknown.length}; unresolved data paths: ${map.counts.unresolvedByKind.data ?? 0}`);
   }
+  console.log(`Function calls between files: ${callStats.resolved} resolved, ${callStats.unresolved} unresolved (kind call)`);
   console.log(`Parse failures: ${parseFailures.length}`);
   for (const f of parseFailures) console.log(`  ${f.file}:${f.line ?? '?'} ${f.reason}`);
 }
