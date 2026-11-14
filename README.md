@@ -79,13 +79,37 @@ The mapper also runs on its own: `node src/mapper.js <project folder> <output na
 ### brainmap (for coding assistants)
 
 `brainmap` answers structure questions from the saved map, in compact plain text (each list shows its first
-items with "(+N more, use --all)"):
-`overview`, `files <folder>`, `file <path>`, `impact <path>`, `screen <name>`, `collection <name>`,
-`function <name>`, `callers <name|file:name>`, `find <text>`, `unused`. `collection` also lists the functions that
-read or write it and who calls them ("Through functions"; `--depth 2` adds the callers of those callers). Run it inside a linked folder, or pass `--project <name>`. Before
-answering it runs the same "code changed since last map" check as the panel and re-maps when needed. It prints
-paths, names and numbers only, never file contents. `install.sh` links it next to `brainpack`
-(`~/.brain/brainmap.sh`, symlinked into `/opt/homebrew/bin` or `/usr/local/bin`).
+items with "(+N more, use --all)"): `overview`, `files <folder>`, `file <path>`, `impact <path>`, `screen <name>`,
+`collection <name>`, `function <name>`, `callers <name|file:name>`, `find <text>`, `unused`. `collection` also lists the
+functions that read or write it and who calls them ("Through functions"; `--depth 2` adds the callers of those
+callers). Run it inside a linked folder, or pass `--project <name>`. Before answering it runs the same "code changed
+since last map" check as the panel and re-maps when needed. It prints paths, names and numbers only, never file
+contents. `install.sh` links it next to `brainpack` (`~/.brain/brainmap.sh`, symlinked into `/opt/homebrew/bin` or
+`/usr/local/bin`).
+
+**Tools for Claude Code (MCP).** `src/brainmap-mcp.js` is a local stdio tool server with the same queries as tools
+(`overview`, `file`, `impact`, `callers`, `collection`, `screen`, `find`, `unused`, each with an `all` option). Each tool
+runs `brainmap` in the assistant's working folder, so the text, limits and automatic refresh are the same; in a folder
+that is not linked it answers in one line. Read-only. `install.sh` registers it at user scope (every project, no
+project files touched):
+
+```sh
+claude mcp add --scope user brainmap -- "$(command -v node)" ~/Projects/brain-app/src/brainmap-mcp.js   # install
+claude mcp remove --scope user brainmap                                                              # uninstall
+bash install.sh --remove-assistant-tools                                                             # same, via the installer
+```
+
+In a fresh session it adds about 100 tokens to `/context` (57 for the server instructions plus the tool names); the
+full tool definitions (about 900 tokens) are loaded only when the assistant looks them up.
+
+**Strict mode** (panel, per project, opt in: "Strict: send the first code search to the map") adds a Claude Code
+PreToolUse hook (`src/brainmap-hook.js`) to the project's `.claude/settings.local.json`. In each session it blocks the
+first Grep, Glob or Read of source code once, with a message to use the map tools, then allows everything. It never
+blocks CLAUDE.md, AGENTS.md, other Markdown, JSON or configuration files, does nothing in a folder without a map, and
+lets everything through on any error. Session markers live in `~/.brain/strict-sessions`. It is refused when git
+would track the file; the change is previewed, refused if the file changed after the preview, and Remove restores
+the file byte for byte (original kept in `~/.brain/strict-backups`) unless it was edited since, in which case only
+the hook is taken out.
 
 **Enable for assistants** (panel, linked projects) adds a short marked block, between `<!-- brainmap:start … -->` and
 `<!-- brainmap:end -->`, that tells coding assistants to run `brainmap overview` at the start of a code task and the

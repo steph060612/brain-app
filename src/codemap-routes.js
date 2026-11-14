@@ -1,7 +1,8 @@
 // Code maps: link a Brain project to a code folder and map it with src/mapper.js.
 // Links live in ~/.brain/code-folders.json (slug → absolute path), maps in ~/.brain/maps/<slug>/map.json.
-// Nothing here writes to ~/Brain. The only write to a linked folder is the marked brainmap block in its
-// AGENTS.md or CLAUDE.md, after the person confirms it (brainmap-agents.js). Git is only read, with
+// Nothing here writes to ~/Brain. The only writes to a linked folder are the marked brainmap block in its
+// CLAUDE.md / AGENTS.md and the strict-mode hook in .claude/settings.local.json, each after the person confirms
+// it (brainmap-agents.js, brainmap-strict.js). Git is only read, with
 // --no-optional-locks so that `git status` never refreshes the folder's index; nothing is committed.
 import { writeFile, rename, mkdir, stat, realpath, readdir } from 'fs/promises';
 import { join, resolve, sep, isAbsolute } from 'path';
@@ -9,6 +10,7 @@ import {
   HOME, DOT, LINKS, BRAIN, fail, tilde, realOrSelf, inside, loadLinks, readMap, mapStatus, runMapper,
 } from './codemap-status.js';
 import { assistantsPreview, enableAssistants, removeAssistants } from './brainmap-agents.js';
+import { strictPreview, enableStrict, removeStrict } from './brainmap-strict.js';
 
 const SLUG_RE  = /^[a-z0-9][a-z0-9-]*$/;
 const send = (res, e) => res.status(e.status || 500).json({ error: e.message });
@@ -205,5 +207,16 @@ export function registerCodeMapRoutes(app, { gitAvailable }) {
   });
   app.delete('/api/code/:slug/assistants', async (req, res) => {
     try { res.json(await removeAssistants(await agentsFolder(req), req.body?.expect)); } catch (e) { send(res, e); }
+  });
+
+  // Strict mode: the brainmap PreToolUse hook in the project's .claude/settings.local.json (see brainmap-strict.js).
+  app.get('/api/code/:slug/strict', async (req, res) => {
+    try { res.json(await strictPreview(await agentsFolder(req))); } catch (e) { send(res, e); }
+  });
+  app.post('/api/code/:slug/strict', async (req, res) => {
+    try { res.json(await enableStrict(await agentsFolder(req), req.body?.expect)); } catch (e) { send(res, e); }
+  });
+  app.delete('/api/code/:slug/strict', async (req, res) => {
+    try { res.json(await removeStrict(await agentsFolder(req), req.body?.expect)); } catch (e) { send(res, e); }
   });
 }

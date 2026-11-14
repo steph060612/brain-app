@@ -4,6 +4,7 @@ import { openCodeMap, closeCodeMap, isCodeMapOpen } from './codemap.js';
 let el = null, current = null, info = null, busy = false, linking = false;
 const autoRemapped = new Set();
 let agents = null, agentsConfirm = null; // assistants block preview; 'enable' | 'remove' while asking
+let strict = null, strictConfirm = null;  // strict-mode hook preview; 'enable' | 'remove' while asking
 const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 const BTN = `padding:4px 10px; background:rgba(60,108,255,0.18); border:1px solid rgba(60,108,255,0.4); color:#9FD8FF;
@@ -24,7 +25,7 @@ export function createCodeSection() {
 export function showCodeSection(project) {
   current = project;
   linking = false;
-  info = null; agents = null; agentsConfirm = null;
+  info = null; agents = null; agentsConfirm = null; strict = null; strictConfirm = null;
   if (!project) { el.style.display = 'none'; el.innerHTML = ''; return; }
   el.style.display = 'block';
   el.innerHTML = `<span style="${MUTED}">Code folder…</span>`;
@@ -208,14 +209,12 @@ async function loadStatus() {
 // ─── "Enable for assistants": a marked block in the project's AGENTS.md or CLAUDE.md ───────────────────
 async function loadAgents() {
   const slug = current.slug;
-  try {
-    const a = await api('GET', '/assistants');
-    if (current?.slug !== slug) return;
-    agents = a;
-  } catch (e) {
-    if (current?.slug !== slug) return;
-    agents = { error: e.message };
-  }
+  const [a, st] = await Promise.all([
+    api('GET', '/assistants').catch(e => ({ error: e.message })),
+    api('GET', '/strict').catch(e => ({ error: e.message })),
+  ]);
+  if (current?.slug !== slug) return;
+  agents = a; strict = st;
   renderAgents();
 }
 
@@ -269,6 +268,62 @@ function renderAgents() {
     : `<button class="cm-agents-enable" style="${BTN2}" title="Adds a short block to the project's CLAUDE.md and AGENTS.md that tells coding assistants to use the brainmap command">Enable for assistants</button>`;
   box.querySelector('.cm-agents-enable')?.addEventListener('click', () => askAgents('enable'));
   box.querySelector('.cm-agents-remove')?.addEventListener('click', () => askAgents('remove'));
+  renderStrict(box);
+}
+
+// ─── Strict: send the first code search to the map (hook in .claude/settings.local.json) ─────────────
+function renderStrict(box) {
+  if (!strict) return;
+  const row = document.createElement('div');
+  row.style.cssText = 'margin-top:6px;';
+  if (strict.error) row.innerHTML = `<div style="${MUTED}">Strict mode: ${esc(strict.error)}</div>`;
+  else if (strictConfirm) {
+    const enable = strictConfirm === 'enable';
+    row.innerHTML = `<div style="border:1px solid rgba(100,120,200,0.22); border-radius:6px; padding:8px 10px; font-size:11.5px; color:#c8d0e8;">
+      ${enable
+        ? `<div>This adds a Claude Code hook to <b>${esc(strict.path)}</b>${strict.exists ? '' : ' (new file)'} (git: ${esc(strict.git)}). In each session it blocks the first Grep, Glob or Read of source code once, with a message to use the brainmap tools first, then allows everything. CLAUDE.md, AGENTS.md and configuration files are never blocked. The settings already in the file stay as they are (the file is saved as standard JSON), Remove puts the file back exactly as it was, and nothing is committed.</div>
+           <pre style="margin:6px 0 0; padding:7px 8px; background:#0b0e1c; border:1px solid rgba(100,120,200,0.15); border-radius:4px; font-size:10.5px; line-height:1.45; color:#a8b4d4; white-space:pre-wrap; word-break:break-word; max-height:200px; overflow:auto">${esc(strict.added)}</pre>`
+        : `<div>This takes the brainmap hook out of <b>${esc(strict.path)}</b>. If the file was not edited since, it is restored exactly as it was before (or removed, if the app created it). Nothing is committed.</div>`}
+      <div style="display:flex; gap:6px; margin-top:8px">
+        <button class="cm-strict-ok" style="${BTN}">${enable ? 'Add the hook' : 'Remove the hook'}</button>
+        <button class="cm-strict-cancel" style="${BTN2}">Cancel</button></div></div>`;
+    row.querySelector('.cm-strict-ok').addEventListener('click', () => (enable ? enableStrictMode() : removeStrictMode()));
+    row.querySelector('.cm-strict-cancel').addEventListener('click', () => { strictConfirm = null; renderAgents(); });
+  } else if (strict.enabled) {
+    row.innerHTML = `<div style="${MUTED} display:flex; gap:8px; align-items:baseline; flex-wrap:wrap">
+      <span style="color:#6FE3D0">Strict: first code search goes to the map</span><span>in ${esc(strict.file)}</span>
+      <button class="cm-strict-remove" style="${LINK} font-size:11px; color:#8090b0">Remove</button></div>`;
+    row.querySelector('.cm-strict-remove').addEventListener('click', () => askStrict('remove'));
+  } else if (strict.refused) {
+    row.innerHTML = `<div style="${MUTED}">Strict mode not available: ${esc(strict.refused)}</div>`;
+  } else {
+    row.innerHTML = `<button class="cm-strict-enable" style="${BTN2}" title="Claude Code only: blocks the first code search of each session once, pointing to the map tools">Strict: send the first code search to the map</button>`;
+    row.querySelector('.cm-strict-enable').addEventListener('click', () => askStrict('enable'));
+  }
+  box.appendChild(row);
+}
+
+async function askStrict(kind) {
+  await loadAgents();
+  if (strict?.error || (kind === 'enable' && strict?.refused)) return renderAgents();
+  strictConfirm = kind;
+  renderAgents();
+}
+
+async function enableStrictMode() {
+  try {
+    const r = await api('POST', '/strict', { expect: strict.expect });
+    strictConfirm = null; await loadAgents();
+    setMsg(r.already ? 'Strict mode was already on.' : `Strict mode on (${r.created ? 'created' : 'updated'} ${strict.file}).`, '#6FE3D0');
+  } catch (e) { strictConfirm = null; await loadAgents(); setMsg(e.message, '#c0503a'); }
+}
+
+async function removeStrictMode() {
+  try {
+    const r = await api('DELETE', '/strict', { expect: strict.expect });
+    strictConfirm = null; await loadAgents();
+    setMsg(r.already ? 'Strict mode was already off.' : r.restored ? (r.deleted ? 'Strict mode off; the file the app created was removed.' : 'Strict mode off; the file is back exactly as it was.') : 'Strict mode off; only the hook was taken out (the file had been edited since).', '#6FE3D0');
+  } catch (e) { strictConfirm = null; await loadAgents(); setMsg(e.message, '#c0503a'); }
 }
 
 // Always show what is on disk right now before asking.

@@ -23,6 +23,13 @@ fetch() {
   return 1
 }
 
+# Uninstall the assistant tools only:  bash install.sh --remove-assistant-tools
+if [ "${1:-}" = "--remove-assistant-tools" ]; then
+  if command -v claude >/dev/null 2>&1; then claude mcp remove --scope user brainmap && echo "brainmap tools removed from Claude Code."
+  else echo "Claude Code is not installed; nothing to remove."; fi
+  exit 0
+fi
+
 [ "$(uname)" = "Darwin" ] || fail "this installer is for macOS only."
 [ -f "$AGENTS_DIR/com.steph.brain-app.plist" ] && fail "this Mac runs the developer version of the Brain app; do not install over it."
 
@@ -121,6 +128,14 @@ for bin in /opt/homebrew/bin /usr/local/bin; do
     echo "brainpack and brainmap commands linked in $bin."; break
   fi
 done
+# Code map tools for Claude Code (user scope: every project, no project files touched). Re-added on update so
+# the path stays current. Remove with: bash install.sh --remove-assistant-tools
+if command -v claude >/dev/null 2>&1; then
+  claude mcp remove --scope user brainmap >/dev/null 2>&1 || true
+  claude mcp add --scope user brainmap -- "$NODE" "$APP_DIR/src/brainmap-mcp.js" >/dev/null && echo "brainmap tools added to Claude Code (user scope)."
+else
+  echo "Claude Code not found: the brainmap tools for assistants were not registered (the brainmap command still works)."
+fi
 
 step "Building the Brain app"
 if [ -f "$APP_DIR/dist/index.html" ]; then
