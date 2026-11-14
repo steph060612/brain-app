@@ -126,6 +126,9 @@ function build() {
       #code-map .cm-item { display:block; width:100%; text-align:left; background:none; border:none; color:#a8b4d4; font-size:11.5px;
         padding:3px 12px 3px 26px; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
       #code-map .cm-card .cm-item { padding-left:4px; }
+      #code-map .cm-card .cm-item.cm-wrap { white-space:normal; overflow:visible; text-overflow:clip; padding-left:18px; text-indent:-14px; line-height:1.4; }
+      #code-map .cm-more { background:none; border:none; padding:2px 4px; color:#7FA8FF; font-size:11px; cursor:pointer; font-family:inherit; }
+      #code-map .cm-more:hover { color:#BFD4FF; text-decoration:underline; }
       #code-map .cm-item:hover, #code-map .cm-item.cm-active { background:rgba(60,108,255,0.14); color:#fff; }
       #code-map .cm-note { font-size:11px; color:#5a6890; padding:2px 12px 6px 26px; }
       #code-map .cm-h { font-size:10.5px; color:#5a6890; letter-spacing:0.05em; text-transform:uppercase; margin:9px 0 3px; }
@@ -166,7 +169,7 @@ function build() {
   });
   window.addEventListener('keydown', e => {
     if (!isCodeMapOpen() || e.key !== 'Escape' || e.target?.tagName === 'INPUT' || e.target?.tagName === 'TEXTAREA') return;
-    select(null);
+    if (selected) { select(null); restoreView(); }
   });
   findingsEl.addEventListener('click', e => {
     const b = e.target.closest('.cm-item');
@@ -180,7 +183,15 @@ function build() {
   cardEl.addEventListener('click', e => {
     const b = e.target.closest('[data-act], .cm-item');
     if (!b) return;
-    if (b.dataset.act === 'clear') select(null);
+    if (b.dataset.act === 'more') {
+      // "+N more" ⇄ "Show fewer": the hidden rest of the list is already in the card.
+      const extra = b.previousElementSibling, open = extra.hidden;
+      extra.hidden = !open;
+      b.textContent = open ? 'Show fewer' : b.dataset.label;
+      sizeCard();
+      return;
+    }
+    if (b.dataset.act === 'clear') { select(null); restoreView(); }
     else if (b.dataset.act === 'expand') expandFolder(b.dataset.key);
     else if (b.dataset.act === 'collapse') collapseFolder(b.dataset.key);
     else if (b.dataset.id) selectById(b.dataset.id);
@@ -420,7 +431,52 @@ function collapseFolder(key) {
   select(keepSel ? selected : F.bubble);
 }
 
-function fit() {
+// Smoothly moves the view to `to` (instant when `instant`); wheel and drag stop a transition in progress.
+let viewAnim = null, viewBeforeSelection = null;
+function animateView(to, instant = false) {
+  if (instant || !to) { if (to) view = to; viewAnim = null; dirty = true; return; }
+  viewAnim = { from: { ...view }, to, t0: performance.now(), dur: 450 };
+  dirty = true;
+}
+function stepView() {
+  if (!viewAnim) return;
+  const t = Math.min(1, (performance.now() - viewAnim.t0) / viewAnim.dur), e = 1 - Math.pow(1 - t, 3);
+  const { from: a, to: b } = viewAnim;
+  // Interpolate the zoom geometrically and the world point at the centre, so it does not swing sideways.
+  const k = a.k * Math.pow(b.k / a.k, e);
+  const cxa = (width / 2 - a.x) / a.k, cya = (height / 2 - a.y) / a.k, cxb = (width / 2 - b.x) / b.k, cyb = (height / 2 - b.y) / b.k;
+  const cx = cxa + (cxb - cxa) * e, cy = cya + (cyb - cya) * e;
+  view = { k, x: width / 2 - cx * k, y: height / 2 - cy * k };
+  if (t >= 1) { view = { ...b }; viewAnim = null; }
+  dirty = true;
+}
+
+// The free area beside the selection card (top right), clear of the findings column when there is room.
+function freeArea() {
+  const right = SIDE_W + 30;
+  let left = SIDE_W + 30;
+  if (width - left - right < 220) left = 14;
+  return { left, top: TOP + 4, right: width - right, bottom: height - 30 };
+}
+
+// Zoom and pan so the selected node and its direct neighbors on the visible layers fill the free area.
+function focusSelection(instant = false) {
+  if (!selected || !width) return;
+  const group = [selected, ...neighbors].filter(nodeVisible);
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const n of group) { x0 = Math.min(x0, n.x - n.r); y0 = Math.min(y0, n.y - n.r); x1 = Math.max(x1, n.x + n.r); y1 = Math.max(y1, n.y + n.r); }
+  const A = freeArea(), w = Math.max(80, A.right - A.left), h = Math.max(80, A.bottom - A.top);
+  const pad = 70; // room for labels at the edges
+  const k = Math.min(5, Math.max(0.1, Math.min((w - pad) / (x1 - x0 + 1), (h - pad) / (y1 - y0 + 1)) * 0.92));
+  animateView({ k, x: A.left + w / 2 - k * (x0 + x1) / 2, y: A.top + h / 2 - k * (y0 + y1) / 2 }, instant);
+}
+
+function restoreView() {
+  if (viewBeforeSelection) animateView(viewBeforeSelection);
+  viewBeforeSelection = null;
+}
+
+function fit(animate = false) {
   const vis = nodes.filter(nodeVisible);
   if (!vis.length || !width) return;
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
@@ -429,8 +485,7 @@ function fit() {
   const padL = SIDE_W + 30, padT = TOP + 4, padR = legendOpen && width > 3 * SIDE_W ? 250 : 40, padB = 40;
   const w = Math.max(1, width - padL - padR), h = Math.max(1, height - padT - padB);
   const k = Math.min(2.2, Math.max(0.12, Math.min(w / (x1 - x0 + 60), h / (y1 - y0 + 60))));
-  view = { k, x: padL + w / 2 - k * (x0 + x1) / 2, y: padT + h / 2 - k * (y0 + y1) / 2 };
-  dirty = true;
+  animateView({ k, x: padL + w / 2 - k * (x0 + x1) / 2, y: padT + h / 2 - k * (y0 + y1) / 2 }, !animate);
 }
 
 // ─── drawing ─────────────────────────────────────────────────────────────────
@@ -592,10 +647,14 @@ function arrow(e, color) {
 const byDegree = (a, b) => (degree.get(b) || 0) - (degree.get(a) || 0) || a.label.localeCompare(b.label);
 
 // Which nodes get a label, most important first. Collisions are resolved in this order.
+// Top-level collections are few, so they are always labeled while Reads or Writes is on, before any file.
+const collectionLabels = () => (layerOn.reads || layerOn.writes ? nodes.filter(n => n.kind === 'collection' && nodeVisible(n)) : []);
+
 function labelCandidates() {
   const list = [];
+  if (selected) list.push(selected);
+  list.push(...collectionLabels());
   if (selected) {
-    list.push(selected);
     const ns = [...neighbors];
     const isData = n => n.kind === 'collection' || n.kind === 'subcollection';
     // A selected collection labels the subcollections tethered to it (and a subcollection its parent and children).
@@ -634,16 +693,30 @@ function drawLabels() {
     ctx.font = font;
     const text = n.kind === 'folder' ? `${n.label} ${n.F.files.length}` : n.label;
     const sx = n.x * k + view.x, sy = n.y * k + view.y;
-    const x = sx + n.r * k + 5, w = ctx.measureText(text).width;
-    const box = { x0: x - 3, y0: sy - 8, x1: x + w + 3, y1: sy + 8 };
-    if (box.x1 < 0 || box.x0 > width || box.y1 < 0 || box.y0 > height) return;
-    if (!force && overlaps(box)) return;
-    placed.push(box);
-    queue.push({ n, text, font, x, y: sy, big });
+    const w = ctx.measureText(text).width, gap = n.r * k + 5;
+    // Right of the node first; collections may also go left, above or below to avoid a collision.
+    const spots = [[sx + gap, sy]];
+    if (n.kind === 'collection') {
+      for (const f of [1, 2.2]) {
+        const g = gap * f, v = (gap + 6) * f;
+        spots.push([sx - g - w, sy], [sx - w / 2, sy - v], [sx - w / 2, sy + v],
+          [sx + g * 0.7, sy - v * 0.8], [sx + g * 0.7, sy + v * 0.8], [sx - g * 0.7 - w, sy - v * 0.8], [sx - g * 0.7 - w, sy + v * 0.8]);
+        if (f === 1) spots.push([sx + g * 2.2, sy]);
+      }
+    }
+    for (const [x, y] of spots) {
+      const box = { x0: x - 3, y0: y - 8, x1: x + w + 3, y1: y + 8 };
+      if (box.x1 < 0 || box.x0 > width || box.y1 < 0 || box.y0 > height) continue;
+      if (!force && overlaps(box)) continue;
+      placed.push(box);
+      queue.push({ n, text, font, x, y, big });
+      return;
+    }
   };
   // Hovered always shows, so it reserves its space first.
   if (hovered) place(hovered, true);
-  for (const n of labelCandidates()) if (n !== hovered) place(n, false);
+  const seen = new Set([hovered]);
+  for (const n of labelCandidates()) if (!seen.has(n)) { seen.add(n); place(n, false); }
   lastLabels = queue.map((q, i) => ({ text: q.text, box: placed[i] }));
   for (const q of queue) {
     ctx.font = q.font;
@@ -658,6 +731,7 @@ function drawLabels() {
 function loop() {
   raf = requestAnimationFrame(loop);
   if (sim && sim.alpha() > sim.alphaMin()) { sim.tick(); dirty = true; }
+  stepView();
   if (dirty) { dirty = false; draw(); }
 }
 
@@ -712,6 +786,7 @@ function showEdgeTooltip(e, x, y) {
 function bindPointer() {
   let drag = null;
   canvas.addEventListener('pointerdown', e => {
+    viewAnim = null;
     const n = hit(e.offsetX, e.offsetY);
     drag = { n, sx: e.offsetX, sy: e.offsetY, vx: view.x, vy: view.y, moved: false };
     canvas.setPointerCapture(e.pointerId);
@@ -740,7 +815,7 @@ function bindPointer() {
   const end = () => {
     if (!drag) return;
     if (drag.n) { drag.n.fx = null; drag.n.fy = null; sim?.alphaTarget(0); }
-    if (!drag.moved) select(drag.n);
+    if (!drag.moved) { if (drag.n) select(drag.n); else if (selected) { select(null); viewBeforeSelection = null; } }
     drag = null;
     canvas.style.cursor = 'grab';
   };
@@ -753,6 +828,7 @@ function bindPointer() {
   });
   canvas.addEventListener('wheel', e => {
     e.preventDefault();
+    viewAnim = null;
     const f = Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0018));
     const k = Math.min(8, Math.max(0.08, view.k * f));
     const [wx, wy] = toWorld(e.offsetX, e.offsetY);
@@ -770,19 +846,13 @@ function neighborsOf(n) {
   return s;
 }
 
-function select(n, { center = false } = {}) {
+// Selecting a node (click, search + Enter, a card or findings item) focuses the view on it and its neighbors.
+// The view from before the first selection is kept, so Clear can return to it.
+function select(n, { focus = true } = {}) {
+  if (n && !selected && !viewBeforeSelection) viewBeforeSelection = viewAnim ? { ...viewAnim.to } : { ...view };
   selected = n || null;
   neighbors = selected ? neighborsOf(selected) : new Set();
-  if (selected && center) {
-    const k = Math.max(view.k, 1.3);
-    // Centre in the free area beside the selection card (top right); keep clear of the findings column too
-    // when that still leaves room, which it may not next to the half-width panel.
-    let left = SIDE_W + 30;
-    const right = SIDE_W + 30;
-    if (width - left - right < 220) left = 0;
-    const cx = left + Math.max(0, width - left - right) / 2, cy = TOP + (height - TOP) / 2;
-    view = { k, x: cx - selected.x * k, y: cy - selected.y * k };
-  }
+  if (selected && focus) focusSelection();
   for (const el of findingsEl.querySelectorAll('.cm-item')) el.classList.toggle('cm-active', !!selected && el.dataset.id === selected.id);
   renderCard();
   dirty = true;
@@ -795,7 +865,7 @@ function selectById(id) {
   if (n.kind === 'subcollection' && mode === 'folders') setMode('files');
   if (n.kind === 'file' && !nodeVisible(n)) expandFolder(n.folder);
   if (!nodeVisible(n)) return;
-  select(n, { center: true });
+  select(n);
 }
 
 // ─── details ─────────────────────────────────────────────────────────────────
@@ -938,6 +1008,14 @@ function renderCard() {
 
 // ─── function calls in the card ──────────────────────────────────────────────
 const fileItem = (id, text) => `<button class="cm-item" data-id="${esc(id)}" title="${esc(id)}">${text}</button>`;
+const wrapItem = (id, text) => `<button class="cm-item cm-wrap" data-id="${esc(id)}" title="${esc(id)}">${text}</button>`;
+// The first `limit` rows, then the rest hidden behind a "+N more" toggle.
+function moreList(rows, limit, noun = 'more') {
+  if (ALL_ROWS || rows.length <= limit) return rows.join('');
+  const label = `+${rows.length - limit} ${noun}`;
+  return `${rows.slice(0, limit).join('')}<div hidden>${rows.slice(limit).join('')}</div><button class="cm-more" data-act="more" data-label="${esc(label)}">${esc(label)}</button>`;
+}
+const ALL_ROWS = false;
 const callsInto = (file, fn) => edges.filter(e => e.kind === 'calls' && e.to === file && (e.function === fn || e.local === fn || e.export === fn));
 // Caller rows as brainmap shows them: file (lines) in function, via value from file:line.
 function callerRows(list, limit) {
@@ -946,9 +1024,9 @@ function callerRows(list, limit) {
   const rows = [...by.values()].sort((a, b) => a[0].from.localeCompare(b[0].from)).map(es => {
     const e0 = es[0], ls = [...new Set(es.map(e => e.line))].sort((a, b) => a - b);
     const callers = [...new Set(es.map(e => e.caller).filter(Boolean))];
-    return fileItem(e0.from, `${esc(e0.from)} <span style="color:#5a6890">(line${ls.length > 1 ? 's' : ''} ${ls.slice(0, 4).join(', ')})${callers.length ? ` in ${esc(callers.slice(0, 2).join(', '))}` : ''}${e0.via === 'value' ? ` · via value from ${esc(e0.passedFrom)}:${e0.passedLine}` : ''}</span>`);
+    return wrapItem(e0.from, `${esc(e0.from)} <span style="color:#5a6890">(line${ls.length > 1 ? 's' : ''} ${ls.join(', ')})${callers.length ? ` in ${esc(callers.join(', '))}` : ''}${e0.via === 'value' ? ` · via value from ${esc(e0.passedFrom)}:${e0.passedLine}` : ''}</span>`);
   });
-  return rows.slice(0, limit).join('') + (rows.length > limit ? `<div class="cm-note" style="padding-left:4px">+${rows.length - limit} more</div>` : '');
+  return moreList(rows, limit);
 }
 
 // A file: its exported functions with how many files call each, and the functions it calls in other files.
@@ -966,12 +1044,10 @@ function functionsHtml(n) {
   const outRows = [...out.values()].sort((a, b) => b.n - a.n || a.fn.localeCompare(b.fn));
   if (!rows.length && !outRows.length) return '';
   return `${rows.length ? `<div class="cm-h">Exported functions, files calling each</div>
-      ${called.slice(0, 12).map(r => `<div style="display:flex;gap:6px"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.fn)}</span><span style="color:#c8d0e8">${r.files}</span></div>`).join('')}
-      ${called.length > 12 ? `<div style="color:#5a6890">+${called.length - 12} more called</div>` : ''}
+      ${moreList(called.map(r => `<div style="display:flex;gap:6px"><span style="flex:1;word-break:break-word">${esc(r.fn)}</span><span style="color:#c8d0e8">${r.files}</span></div>`), 12, 'more called')}
       ${silent ? `<div style="color:#5a6890">${plural(silent, 'other export')} not called from other files</div>` : ''}` : ''}
     ${outRows.length ? `<div class="cm-h">Calls functions in other files</div>
-      ${outRows.slice(0, 12).map(r => fileItem(r.to, `${esc(r.fn)} <span style="color:#5a6890">(${esc(r.to)})${r.n > 1 ? ` ×${r.n}` : ''}${r.value ? ' · via value' : ''}</span>`)).join('')}
-      ${outRows.length > 12 ? `<div style="color:#5a6890">+${outRows.length - 12} more</div>` : ''}` : ''}`;
+      ${moreList(outRows.map(r => wrapItem(r.to, `${esc(r.fn)} <span style="color:#5a6890">(${esc(r.to)})${r.n > 1 ? ` ×${r.n}` : ''}${r.value ? ' · via value' : ''}</span>`)), 12)}` : ''}`;
 }
 
 // A collection or subcollection: the functions that read or write it and who calls them (depth 1), as brainmap collection.
@@ -987,14 +1063,12 @@ function throughFunctionsHtml(n) {
   }
   const list = [...fns.values()].sort((a, b) => a.file.localeCompare(b.file) || a.fn.localeCompare(b.fn));
   if (!list.length) return '';
-  const shown = list.slice(0, 10);
   return `<div class="cm-h">Through functions (${list.length})</div>
-    ${shown.map(f => {
+    ${moreList(list.map(f => {
       const calls = callsInto(f.file, f.fn);
       return `<div style="margin-top:4px"><span style="color:#fff">${esc(f.fn)}</span> <span style="color:#5a6890">(${esc(f.file)}, ${[...f.ops].join(' and ')}) ← ${calls.length ? plural(new Set(calls.map(e => e.from)).size, 'file') : 'no calls from other files'}</span></div>
         ${calls.length ? `<div style="padding-left:10px">${callerRows(calls, 4)}</div>` : ''}`;
-    }).join('')}
-    ${list.length > shown.length ? `<div style="color:#5a6890">+${list.length - shown.length} more functions (brainmap collection lists all)</div>` : ''}`;
+    }), 10, 'more functions')}`;
 }
 
 function sizeCard() {
@@ -1025,7 +1099,7 @@ function renderToolbar() {
     <button class="cm-btn cm-fit" style="margin-left:4px">Fit</button>
     ${mode === 'folders' && expanded.size ? `<button class="cm-btn cm-collapse-all">Collapse ${expanded.size === 1 ? folders.get([...expanded][0]).label : `${expanded.size} folders`}</button>` : ''}`;
   toolbarEl.querySelector('.cm-back').addEventListener('click', closeCodeMap);
-  toolbarEl.querySelector('.cm-fit').addEventListener('click', fit);
+  toolbarEl.querySelector('.cm-fit').addEventListener('click', () => fit(true));
   toolbarEl.querySelector('.cm-collapse-all')?.addEventListener('click', () => {
     const keys = [...expanded];
     if (keys.length === 1) return collapseFolder(keys[0]);
