@@ -13,7 +13,7 @@ import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { parse } from '@babel/parser';
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const IMPORT_KINDS = ['import', 're-export', 'require', 'dynamic'];
 const KINDS = {
   nodes: ['file', 'collection', 'subcollection'],
@@ -757,11 +757,89 @@ function importBindings(ast, A, rel, resolve) {
   return out;
 }
 
+// In each top-level function of a file: where a parameter is called, as p(...), p.key(...), or through a
+// destructured { key } (in the parameter list or const { key } = p). A reassigned parameter is skipped.
+// Returns local function name -> [{ param, prop, line, caller }].
+function collectParamCalls(program, A) {
+  const fns = new Map();
+  for (const st0 of program.body) {
+    const st = (st0.type === 'ExportNamedDeclaration' || st0.type === 'ExportDefaultDeclaration') && st0.declaration ? st0.declaration : st0;
+    if (st.type === 'FunctionDeclaration' && st.id) fns.set(st.id.name, st);
+    if (st.type === 'VariableDeclaration') for (const d of st.declarations) if (d.id.type === 'Identifier' && isFnNode(d.init)) fns.set(d.id.name, d.init);
+    if (st.type === 'ExpressionStatement' && st.expression.type === 'AssignmentExpression' && isFnNode(st.expression.right)) {
+      const l = st.expression.left;
+      if (isMember(l) && !l.computed && ((l.object.type === 'Identifier' && l.object.name === 'exports') || isModuleExports(l.object))) fns.set(st.expression.right.id?.name ?? l.property.name, st.expression.right);
+    }
+  }
+  const out = new Map();
+  for (const [name, f] of fns) {
+    const calls = [];
+    const push = (u, param, prop) => calls.push({ param, prop, line: u.loc.start.line, caller: enclosingFunction(u, A) ?? name });
+    const callsOf = (id, param, prop) => {
+      const b = A.lookup(id.name, id);
+      if (!b || A.assignmentsOf(b).length) return;
+      for (const u of A.usesOf(b)) if (isCall(A.parent(u)) && A.key(u) === 'callee') push(u, param, prop);
+    };
+    const destructure = (pat, param) => {
+      for (const pr of pat.properties) {
+        if (pr.type !== 'ObjectProperty' || pr.computed) continue;
+        const v = pr.value.type === 'AssignmentPattern' ? pr.value.left : pr.value;
+        if (v.type === 'Identifier') callsOf(v, param, keyName(pr.key));
+      }
+    };
+    f.params.forEach((prm, i) => {
+      const t = prm.type === 'AssignmentPattern' ? prm.left : prm;
+      if (t.type === 'ObjectPattern') return destructure(t, i);
+      if (t.type !== 'Identifier') return;
+      const b = A.lookup(t.name, t);
+      if (!b || A.assignmentsOf(b).length) return;
+      for (const u of A.usesOf(b)) {
+        const p = A.parent(u), k = A.key(u);
+        if (isCall(p) && k === 'callee') push(u, i, null);
+        else if (isMember(p) && k === 'object' && !p.computed && isCall(A.parent(p)) && A.key(p) === 'callee') push(u, i, p.property.name);
+        else if (p.type === 'VariableDeclarator' && k === 'init' && p.id.type === 'ObjectPattern') destructure(p.id, i);
+      }
+    });
+    if (calls.length) out.set(name, calls);
+  }
+  return out;
+}
+
 // Calls to functions imported from other project files: { file, name, line, caller, via }, and the uses the
 // mapper cannot follow (a computed member, an imported function passed as a value, a module object passed on).
 function collectCalls(ast, A, rel, resolve) {
   const imports = importBindings(ast, A, rel, resolve);
   const calls = [], values = [];
+  // The imported function a call goes to, when that is certain: f(...) or ns.f(...) / def.f(...).
+  const calleeOf = (call) => {
+    const c = call.callee;
+    if (c.type === 'Identifier') {
+      const b = A.lookup(c.name, c), imp = b && imports.get(b);
+      return imp && imp.imported !== '*' ? { file: imp.file, name: imp.imported } : null;
+    }
+    if (isMember(c) && !c.computed && c.object.type === 'Identifier') {
+      const b = A.lookup(c.object.name, c.object), imp = b && imports.get(b);
+      if (imp && (imp.imported === '*' || imp.imported === 'default')) return { file: imp.file, name: c.property.name, via: imp.imported };
+    }
+    return null;
+  };
+  // Where a value is handed to an imported function: directly as argument i, or as property `key` of an object
+  // literal that is argument i (inline, or a const used only as that argument). One hop, nothing else.
+  const passedTo = (node) => {
+    const p = A.parent(node), k = A.key(node), line = node.loc.start.line;
+    const site = (call, argIndex, propKey) => { const t = calleeOf(call); return t ? { ...t, argIndex, propKey, passLine: line } : null; };
+    if (isCall(p) && k === 'arguments') return [site(p, p.arguments.indexOf(node), null)].filter(Boolean);
+    if (p?.type !== 'ObjectProperty' || k !== 'value' || p.computed) return [];
+    const key = keyName(p.key), obj = A.parent(p), op = A.parent(obj), ok = A.key(obj);
+    if (isCall(op) && ok === 'arguments') return [site(op, op.arguments.indexOf(obj), key)].filter(Boolean);
+    if (op?.type === 'VariableDeclarator' && ok === 'init' && op.id.type === 'Identifier') {
+      const b = A.lookup(op.id.name, op.id);
+      if (!b || b.kind !== 'const') return [];
+      return A.usesOf(b).filter((u) => isCall(A.parent(u)) && A.key(u) === 'arguments')
+        .map((u) => site(A.parent(u), A.parent(u).arguments.indexOf(u), key)).filter(Boolean);
+    }
+    return [];
+  };
   for (const [b, imp] of imports) {
     for (const ref of A.usesOf(b)) {
       const p = A.parent(ref), k = A.key(ref);
@@ -773,13 +851,13 @@ function collectCalls(ast, A, rel, resolve) {
         if (imp.imported === '*' || imp.imported === 'default') {
           if (member === null) { values.push({ file: imp.file, name: null, line, reason: 'computed member' }); continue; }
           if (called) { calls.push({ file: imp.file, name: member, line, caller: enclosingFunction(ref, A), via: imp.imported }); continue; }
-          values.push({ file: imp.file, name: member, local: member, line, reason: 'function used as a value', member: true });
+          values.push({ file: imp.file, name: member, local: member, line, reason: 'function used as a value', member: true, passed: passedTo(p) });
         }
         continue; // fn.length, Component.propTypes, ...: not a call
       }
       if (p?.type === 'UnaryExpression' && p.operator === 'typeof') continue;
       if (p?.type === 'ExportSpecifier') continue;
-      values.push({ file: imp.file, name: imp.imported, local: ref.name, line, reason: imp.imported === '*' ? 'module object used as a value' : 'function used as a value' });
+      values.push({ file: imp.file, name: imp.imported, local: ref.name, line, reason: imp.imported === '*' ? 'module object used as a value' : 'function used as a value', passed: passedTo(ref) });
     }
   }
   return { calls, values };
@@ -1119,7 +1197,7 @@ function main() {
   const nodeSet = new Set(jsFiles);
   const nodes = [], edges = [], unresolved = [], missing = [], parseFailures = [];
   const rawScreens = [], navCallsByFile = new Map(), callablesByFile = new Map(), dataByFile = new Map();
-  const exportTables = new Map(), callsByFile = new Map();
+  const exportTables = new Map(), callsByFile = new Map(), paramCallsByFile = new Map();
   let navSkippedNonNav = 0, functionDefs = new Map();
   const assetTotals = { total: 0, byExtension: {} };
 
@@ -1176,6 +1254,8 @@ function main() {
     exportTables.set(rel, exportTable(ast.program, rel, resolve));
     const fc = collectCalls(ast, A, rel, resolve);
     if (fc.calls.length || fc.values.length) callsByFile.set(rel, fc);
+    const pc = collectParamCalls(ast.program, A);
+    if (pc.size) paramCallsByFile.set(rel, pc);
     const data = collectData(A);
     if (data.uses.length || data.unresolvedLines.length || data.partial.length) dataByFile.set(rel, data);
 
@@ -1299,8 +1379,27 @@ function main() {
       if (/^[A-Z]/.test(v.local)) continue;
       const r = resolveExport(v.file, v.name === '*' ? 'default' : v.name);
       if (!r?.fn) continue;
+      const fnName = r.name === 'default' ? r.local : r.name;
+      // Followed one hop: the receiving function (resolved with certainty) calls that parameter or property.
+      let followed = 0;
+      for (const ps of v.passed || []) {
+        const rt = exportTables.get(ps.file);
+        const recvName = ps.via === 'default' && !rt?.cjs && !rt?.names.has(ps.name) ? null : ps.name;
+        const recv = recvName && resolveExport(ps.file, recvName);
+        if (!recv?.local) continue;
+        const hits = (paramCallsByFile.get(recv.file)?.get(recv.local) || []).filter((c) => c.param === ps.argIndex && c.prop === ps.propKey);
+        for (const h of hits) {
+          followed++;
+          edges.push({ from: recv.file, to: r.file, kind: 'calls', line: h.line, function: fnName,
+            ...(r.name !== fnName ? { export: r.name } : {}), ...(r.local && r.local !== r.name ? { local: r.local } : {}),
+            caller: h.caller, via: 'value', passedFrom: from, passedLine: ps.passLine,
+            through: ps.propKey ? `${recv.local}(…${ps.propKey})` : `${recv.local} argument ${ps.argIndex + 1}` });
+        }
+      }
+      if (followed) { callStats.resolved += followed; callStats.viaValue = (callStats.viaValue || 0) + followed; continue; }
       callStats.unresolved++;
-      unresolved.push({ file: from, line: v.line, kind: 'call', reason: v.reason, target: r.file, name: r.name === 'default' ? r.local : r.name });
+      const why = (v.passed || []).length ? 'function used as a value; the function it is passed to does not call it directly' : v.reason;
+      unresolved.push({ file: from, line: v.line, kind: 'call', reason: why, target: r.file, name: fnName });
     }
   }
 
@@ -1415,7 +1514,7 @@ function main() {
       unresolved: unresolved.length, unresolvedByKind: countBy(unresolved, (u) => u.kind),
       missingRelative: missing.length, assets: assetTotals.total, parseFailures: parseFailures.length,
       screens: screens.length, navigationCalls: navStats.calls, functionCalls: fnStats.calls,
-      functionCallSites: callStats.calls, functionCallsResolved: callStats.resolved, functionCallsUnresolved: callStats.unresolved,
+      functionCallSites: callStats.calls, functionCallsResolved: callStats.resolved, functionCallsViaValue: callStats.viaValue || 0, functionCallsUnresolved: callStats.unresolved,
       collections: collections.size, subcollections: subs.size, dataUsesWithUnknownOperation: dataOpUnknown.length,
     },
     nodes, edges, unresolved, missingRelative: missing, assetTotals, parseFailures,
@@ -1471,7 +1570,7 @@ function main() {
     for (const n of nodes.filter((x) => x.kind === 'subcollection')) console.log(`  ${n.pattern}: ${n.readers} / ${n.writers} / ${n.usedWithUnknownOperation}`);
     console.log(`Data uses with unknown read/write: ${dataOpUnknown.length}; unresolved data paths: ${map.counts.unresolvedByKind.data ?? 0}`);
   }
-  console.log(`Function calls between files: ${callStats.resolved} resolved, ${callStats.unresolved} unresolved (kind call)`);
+  console.log(`Function calls between files: ${callStats.resolved} resolved (${callStats.viaValue || 0} via a value passed on), ${callStats.unresolved} unresolved (kind call)`);
   console.log(`Parse failures: ${parseFailures.length}`);
   for (const f of parseFailures) console.log(`  ${f.file}:${f.line ?? '?'} ${f.reason}`);
 }

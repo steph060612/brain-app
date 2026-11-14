@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // brainmap: read-only answers about a mapped code project, for coding assistants. Reads
-// ~/.brain/maps/<slug>/map.json (schemaVersion 4); refreshes it first when the code changed (the same check
+// ~/.brain/maps/<slug>/map.json (schemaVersion 5); refreshes it first when the code changed (the same check
 // as the Brain app's "Map is current"). Prints paths, names and numbers only, never file contents.
 // No network, no model calls.
 import { stat } from 'fs/promises';
@@ -334,9 +334,11 @@ function screenCmd(P, ix, q) {
 // ─── function calls ──────────────────────────────────────────────────────────
 // Call edges into a function: the exported name or the local name it has in its own file.
 const callsTo = (ix, file, fn) => (ix.inn.get(file) || []).filter(e => e.kind === 'calls' && (e.function === fn || e.local === fn || e.export === fn));
-const callRows = list => [...groupBy(list, e => e.from)].map(([from, es]) => {
+// One row per calling file; calls through a function handed over as a value get their own row with where it came from.
+const callRows = list => [...groupBy(list, e => (e.via === 'value' ? `${e.from}\0${e.passedFrom}:${e.passedLine}` : e.from))].map(([, es]) => {
+  const e0 = es[0];
   const callers = [...new Set(es.map(e => e.caller).filter(Boolean))];
-  return { file: from, text: `${from}${linesOf(es)}${callers.length ? ` in ${callers.slice(0, 3).join(', ')}${callers.length > 3 ? ', …' : ''}` : ''}` };
+  return { file: e0.from, text: `${e0.from}${linesOf(es)}${callers.length ? ` in ${callers.slice(0, 3).join(', ')}${callers.length > 3 ? ', …' : ''}` : ''}${e0.via === 'value' ? `, via value from ${e0.passedFrom}:${e0.passedLine}` : ''}` };
 });
 
 // "Through functions": the named functions that read or write a collection, and the files that call them. With

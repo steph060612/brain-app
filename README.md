@@ -58,11 +58,14 @@ Starts Vite on port 5174 (with hot reload) and the API on port 3001 in parallel.
 
 A project's panel can link a code folder (stored in `~/.brain/code-folders.json`, never in `~/Brain`) and
 **Map project**: the server runs `node src/mapper.js <folder> <slug>` (spawned with an argument list, 60 second
-limit) and writes `~/.brain/maps/<slug>/map.json` (schemaVersion 4). Firestore use is read in every folder (app,
+limit) and writes `~/.brain/maps/<slug>/map.json` (schemaVersion 5). Firestore use is read in every folder (app,
 functions/, scripts/): one node per top-level collection (counting everything under it) and one per subcollection
 path pattern, such as `users/{uid}/workoutLogs`; each read or write records the named function it is in. Calls
 from one file to a function exported by another are `calls` edges (renamed, namespace and default imports, `require`,
-re-exports through index files); calls the mapper cannot follow are listed as unresolved, kind `call`. A map in an older format is re-made automatically by the panel and by
+re-exports through index files). An imported function handed to another file's function, as an argument or inside an
+object literal (`backfill(uid, { getWorkoutLogs })`), is followed one hop to where that function calls it, and recorded
+as a call marked via value, with both lines. Calls the mapper cannot follow with certainty are listed as unresolved,
+kind `call`. A map in an older format is re-made automatically by the panel and by
 `brainmap`. **View map** replaces the brain with a
 force-directed diagram of that map: a Folders view by default (one bubble per top-level folder, links weighted
 by the file links between them, Show files expands a folder in place) and a Files view. Linked folders are only read (the one exception is the assistants block below); git is called with
