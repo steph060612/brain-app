@@ -6,9 +6,11 @@ import { createHash } from 'crypto';
 import { join } from 'path';
 import { fail, inside, tilde } from './codemap-status.js';
 
-export const START = '<!-- brainmap:start (added by the Brain app, "Enable for assistants"; remove it there or delete this block) -->';
+// The start marker records whether the app created the file, so Remove can delete a file only when the
+// app made it and nothing else was added since. A file that existed before is never deleted.
+export const start = created => `<!-- brainmap:start created-file=${created ? 'yes' : 'no'} (added by the Brain app, "Enable for assistants"; remove it there or delete this block) -->`;
 export const END = '<!-- brainmap:end -->';
-export const BLOCK = `${START}
+export const block = created => `${start(created)}
 ## Code map (brainmap)
 - Run \`brainmap overview\` first to see this project's structure.
 - For structure questions, use \`brainmap file <path>\`, \`brainmap impact <path>\`, \`brainmap screen <name>\` and \`brainmap collection <name>\` before searching the whole repository. \`brainmap help\` lists the other commands.
@@ -17,6 +19,8 @@ export const BLOCK = `${START}
 ${END}`;
 
 const BLOCK_RE = /\n*<!-- brainmap:start[^\n]*-->[\s\S]*?<!-- brainmap:end -->[ \t]*\n?/;
+// Only an explicit created-file=yes counts; a block without the flag is treated as added to an existing file.
+const createdByApp = text => /<!-- brainmap:start created-file=yes\b/.test(text);
 const hash = text => (text === null ? 'none' : createHash('sha1').update(text).digest('hex'));
 
 async function read(folder, name) {
@@ -57,12 +61,14 @@ async function target(folder) {
 
 function removed(text) {
   // Undo what enableAssistants added: the block and the blank line before it.
-  const t = text.replace(BLOCK_RE, (m, offset) => {
+  let atStart = false;
+  let t = text.replace(BLOCK_RE, (m, offset) => {
     const before = text.slice(0, offset), after = text.slice(offset + m.length);
-    if (!before.trim()) return '';
+    if (!before.trim()) { atStart = true; return ''; }
     if (!after.trim()) return '\n';
     return after.startsWith('\n') ? '\n' : '\n\n'; // keep one blank line between the neighbors
   });
+  if (atStart) t = t.replace(/^\s*\n/, ''); // the block was first: no blank line left at the top
   return t.trim() ? t : '';
 }
 
@@ -70,10 +76,13 @@ export async function assistantsPreview(folder) {
   const t = await target(folder);
   const enabled = t.text !== null && BLOCK_RE.test(t.text);
   const afterRemove = enabled ? removed(t.text) : null;
+  const created = enabled && createdByApp(t.text);
   return {
     file: t.name, path: tilde(t.path), exists: t.text !== null, enabled, reason: t.reason,
-    block: BLOCK, expect: hash(t.text),
-    removeDeletesFile: enabled && afterRemove === '',
+    block: block(t.text === null), expect: hash(t.text),
+    createdByApp: created,
+    removeDeletesFile: created && afterRemove === '',
+    removeLeavesEmpty: enabled && !created && afterRemove === '',
   };
 }
 
@@ -81,9 +90,10 @@ export async function enableAssistants(folder, expect) {
   const t = await target(folder);
   if (expect !== hash(t.text)) throw fail(409, `${t.name} changed since the preview. Review the text again.`);
   if (t.text !== null && BLOCK_RE.test(t.text)) return { ok: true, file: t.name, already: true };
-  const text = t.text === null || !t.text.trim()
-    ? `${BLOCK}\n`
-    : `${t.text}${t.text.endsWith('\n') ? '' : '\n'}\n${BLOCK}\n`;
+  const created = t.text === null;
+  const text = created || !t.text.trim()
+    ? `${t.text ?? ''}${block(created)}\n`
+    : `${t.text}${t.text.endsWith('\n') ? '' : '\n'}\n${block(created)}\n`;
   await writeFile(t.path, text, 'utf8');
   return { ok: true, file: t.name, created: t.text === null };
 }
@@ -93,7 +103,8 @@ export async function removeAssistants(folder, expect) {
   if (t.text === null || !BLOCK_RE.test(t.text)) return { ok: true, file: t.name, already: true };
   if (expect !== hash(t.text)) throw fail(409, `${t.name} changed since the preview. Review again.`);
   const rest = removed(t.text);
-  if (rest === '') await unlink(t.path); // only the block was in it
+  const del = rest === '' && createdByApp(t.text); // the app made it and nothing else was added
+  if (del) await unlink(t.path);
   else await writeFile(t.path, rest, 'utf8');
-  return { ok: true, file: t.name, deleted: rest === '' };
+  return { ok: true, file: t.name, deleted: del, leftEmpty: rest === '' && !del };
 }

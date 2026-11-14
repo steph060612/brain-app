@@ -226,8 +226,14 @@ function renderAgents() {
     const where = `${esc(agents.path)}${enable && !agents.exists ? ' (new file)' : ''}`;
     box.innerHTML = `<div style="border:1px solid rgba(100,120,200,0.22); border-radius:6px; padding:8px 10px;">
         <div style="font-size:11.5px; color:#c8d0e8; margin-bottom:5px">${enable
-          ? `This adds the text below to ${where}. ${esc(agents.reason)} Nothing else in the file changes and nothing is committed.`
-          : `This removes only the marked brainmap block from ${where}.${agents.removeDeletesFile ? ` The file has nothing else in it, so it is deleted.` : ' The rest of the file stays as it is.'} Nothing is committed.`}</div>
+          ? `This adds the text below to ${where}. ${esc(agents.reason)} ${agents.exists
+              ? 'Nothing else in the file changes. The file existed before, so Remove will never delete it.'
+              : 'The marker records that the app created the file, so Remove deletes it again if nothing else has been added to it.'} Nothing is committed.`
+          : `This removes only the marked brainmap block from ${where}. ${agents.removeDeletesFile
+              ? 'The app created this file and nothing else is in it, so the file is deleted.'
+              : agents.removeLeavesEmpty
+                ? 'The file existed before the block was added, so it is kept, even though it will be empty.'
+                : 'The rest of the file stays as it is.'} Nothing is committed.`}</div>
         ${enable ? `<pre style="margin:0 0 7px; padding:7px 8px; background:#0b0e1c; border:1px solid rgba(100,120,200,0.15); border-radius:4px; font-size:10.5px;
           line-height:1.45; color:#a8b4d4; white-space:pre-wrap; word-break:break-word; max-height:220px; overflow:auto">${esc(agents.block)}</pre>` : ''}
         <div style="display:flex; gap:6px; align-items:center">
@@ -269,6 +275,9 @@ async function removeAgents() {
     const r = await api('DELETE', '/assistants', { expect: agents.expect });
     agentsConfirm = null;
     await loadAgents();
-    setMsg(r.already ? 'The block was already gone.' : r.deleted ? `Removed the block; ${r.file} had nothing else and was deleted.` : `Removed the brainmap block from ${r.file}.`, '#6FE3D0');
+    setMsg(r.already ? 'The block was already gone.'
+      : r.deleted ? `Removed the block and deleted ${r.file}, which the app had created.`
+      : r.leftEmpty ? `Removed the block; ${r.file} existed before, so it was kept (now empty).`
+      : `Removed the brainmap block from ${r.file}.`, '#6FE3D0');
   } catch (e) { agentsConfirm = null; await loadAgents(); setMsg(e.message, '#c0503a'); }
 }

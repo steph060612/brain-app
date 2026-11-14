@@ -68,7 +68,8 @@ The mapper also runs on its own: `node src/mapper.js <project folder> <output na
 
 ### brainmap (for coding assistants)
 
-`brainmap` answers structure questions from the saved map, in compact plain text (60 lines unless `--all`):
+`brainmap` answers structure questions from the saved map, in compact plain text (each list shows its first
+items with "(+N more, use --all)"):
 `overview`, `files <folder>`, `file <path>`, `impact <path>`, `screen <name>`, `collection <name>`,
 `function <name>`, `find <text>`, `unused`. Run it inside a linked folder, or pass `--project <name>`. Before
 answering it runs the same "code changed since last map" check as the panel and re-maps when needed. It prints
@@ -77,6 +78,6 @@ paths, names and numbers only, never file contents. `install.sh` links it next t
 
 **Enable for assistants** (panel, linked projects) shows a short block and, after confirmation, adds it between
 `<!-- brainmap:start … -->` and `<!-- brainmap:end -->` markers to the project's AGENTS.md (or CLAUDE.md when there
-is no AGENTS.md, unless CLAUDE.md only points to AGENTS.md). **Remove** deletes only that block (and the file, if
-nothing else is left in it).
+is no AGENTS.md, unless CLAUDE.md only points to AGENTS.md). The start marker records `created-file=yes|no`.
+**Remove** deletes only that block; it deletes the file only when the app created it and nothing else is in it.
 

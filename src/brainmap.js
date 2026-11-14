@@ -8,7 +8,7 @@ import {
   loadLinks, readMap, mapStatus, runMapper, gitAvailable, realOrSelf, inside, tilde,
 } from './codemap-status.js';
 
-const MAX_LINES = 60;
+const LIST = 10;          // default items per section; --all shows everything
 const WIDTH = 110;
 const IMPORT_KINDS = new Set(['import', 'require', 're-export', 'dynamic']);
 const HELP = `brainmap: read-only map of a JavaScript project linked in the Brain app.
@@ -25,15 +25,17 @@ Usage: brainmap <command> [argument] [--all] [--project <name>] [--no-refresh]
   unused                files not imported from the entry file, screens with no incoming navigation found
 
 The project is the linked folder that contains the current folder, or --project <name>.
-Output stops at ${MAX_LINES} lines unless --all is given. Paths are relative to the project folder.`;
+Each list shows its first items with "(+N more, use --all)"; --all shows everything. Paths are relative to the project folder.`;
 
 // ─── output ──────────────────────────────────────────────────────────────────
 const lines = [];
+let ALL = false;
 const say = (s = '') => { for (const l of String(s).split('\n')) lines.push(l); };
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 // A comma-separated list wrapped to WIDTH, continuation lines indented.
-function wrapList(head, items, indent = '  ') {
+function wrapList(head, items, limit = 30, indent = '  ') {
   if (!items.length) return say(`${head}none`);
+  if (!ALL && items.length > limit) items = [...items.slice(0, limit), `(+${items.length - limit} more, use --all)`];
   let cur = head;
   const out = [];
   items.forEach((it, i) => {
@@ -44,12 +46,13 @@ function wrapList(head, items, indent = '  ') {
   out.push(cur.trimEnd());
   say(out.join('\n'));
 }
-function flush(all) {
-  const out = !all && lines.length > MAX_LINES
-    ? [...lines.slice(0, MAX_LINES - 1), `(+${lines.length - (MAX_LINES - 1)} more, use --all)`]
-    : lines;
-  process.stdout.write(out.join('\n') + '\n');
+// One section's items, one per line, cut at `limit` with a "(+N more, use --all)" line.
+function items(list, limit = LIST) {
+  const shown = ALL ? list : list.slice(0, limit);
+  for (const x of shown) say(`  ${x}`);
+  if (shown.length < list.length) say(`  (+${list.length - shown.length} more, use --all)`);
 }
+function flush() { process.stdout.write(lines.join('\n') + '\n'); }
 // Ends with a message, keeping any note already printed (such as "Map refreshed").
 function die(msg, code = 1) { process.stdout.write([...lines, msg].join('\n') + '\n'); process.exit(code); }
 
@@ -182,17 +185,17 @@ function overview(P, ix) {
   wrapList('Entry files: ', groups.map(g => (g.entry ? `${g.entry} (${g.name})` : `${g.dir || g.name}/ has no entry file (${plural(g.fileCount, 'file')})`)));
   const fc = new Map();
   for (const f of ix.files) fc.set(folderOf(f), (fc.get(folderOf(f)) || 0) + 1);
-  wrapList('Folders: ', [...fc].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([k, n]) => `${k === '(root)' ? '(root files)' : `${k}/`} ${n}`));
+  wrapList('Folders: ', [...fc].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([k, n]) => `${k === '(root)' ? '(root files)' : `${k}/`} ${n}`), Infinity);
   say('Most imported:');
   for (const f of [...ix.files].sort((a, b) => (b.importedBy || 0) - (a.importedBy || 0) || a.path.localeCompare(b.path)).slice(0, 10)) {
     say(`  ${String(f.importedBy || 0).padStart(3)}  ${f.path}`);
   }
-  wrapList(`Screens (${ix.screens.length}): `, [...new Set(ix.screens.map(s => s.name))]);
+  wrapList(`Screens (${ix.screens.length}): `, [...new Set(ix.screens.map(s => s.name))], Infinity);
   wrapList(`Collections (${ix.collections.length}, used in app files): `, [...ix.collections].sort((a, b) => (b.readers + b.writers) - (a.readers + a.writers))
-    .map(n => `${n.name} (${n.readers}r/${n.writers}w)`));
+    .map(n => `${n.name} (${n.readers}r/${n.writers}w)`), Infinity);
   const called = map.functions?.names || {};
   wrapList(`Cloud functions (${fnNames.length}${Object.keys(called).length ? `, ${Object.keys(called).length} called from code` : ''}): `,
-    fnNames.map(n => (called[n]?.callers?.length ? `${n} ←${called[n].callers.length}` : n)));
+    fnNames.map(n => (called[n]?.callers?.length ? `${n} ←${called[n].callers.length}` : n)), Infinity);
   const app = groups.find(g => g.entry && g.name === 'app');
   const standalone = groups.filter(g => !g.entry).reduce((s, g) => s + (g.fileCount || 0), 0);
   const noNav = ix.screens.filter(s => !s.incomingNavigation && !s.incomingAsNestedParent).length;
@@ -210,30 +213,30 @@ function filesCmd(P, ix, q) {
     die(`No mapped files in "${q}". Folders: ${folders.map(f => (f === '(root)' ? '(root)' : `${f}/`)).join(', ')}`);
   }
   say(`${q.replace(/\/+$/, '')}/: ${plural(list.length, 'file')}, ${list.reduce((s, f) => s + (f.lines || 0), 0)} lines`);
-  for (const f of list) {
+  items(list.map(f => {
     const ex = f.exports || [];
-    say(`  ${f.path}  ${f.lines}${ex.length ? `  exports: ${ex.slice(0, 6).join(', ')}${ex.length > 6 ? ` +${ex.length - 6}` : ''}` : ''}`);
-  }
+    return `${f.path}  ${f.lines}${ex.length ? `  exports: ${ex.slice(0, 6).join(', ')}${ex.length > 6 ? ` +${ex.length - 6}` : ''}` : ''}`;
+  }), 50);
 }
 
 function fileCmd(P, ix, q) {
   const f = resolveFile(ix, q);
   const out = ix.out.get(f.path) || [], inn = ix.inn.get(f.path) || [];
   say(`${f.path}  ${f.lines} lines  folder ${folderOf(f)}${f.rootGroup !== 'app' ? ` (own root: ${f.rootGroup})` : ''}${f.parseError ? '  (could not be parsed)' : ''}`);
-  wrapList(`Exports (${(f.exports || []).length}): `, f.exports || []);
+  wrapList(`Exports (${(f.exports || []).length}): `, f.exports || [], 20);
   const imp = out.filter(e => IMPORT_KINDS.has(e.kind)), impBy = inn.filter(e => IMPORT_KINDS.has(e.kind));
   const impTo = groupBy(imp, e => e.to), impFrom = groupBy(impBy, e => e.from);
-  say(`Imports ${plural(impTo.size, 'file')}${imp.length !== impTo.size ? ` (${imp.length} statements)` : ''}:`);
-  for (const [p, es] of impTo) say(`  ${p}${es.some(e => e.kind !== 'import') ? ` [${[...new Set(es.map(e => e.kind))].join(', ')}]` : ''}`);
+  say(`Imports ${plural(impTo.size, 'file')}${imp.length !== impTo.size ? ` (${imp.length} statements)` : ''}${impTo.size ? ':' : ''}`);
+  items([...impTo].map(([p, es]) => `${p}${es.some(e => e.kind !== 'import') ? ` [${[...new Set(es.map(e => e.kind))].join(', ')}]` : ''}`));
   if (f.packages?.length) wrapList('Packages: ', f.packages);
-  say(`Imported by ${plural(impFrom.size, 'file')}${impBy.length !== impFrom.size ? ` (${impBy.length} statements)` : ''}${f.reachableFromAppEntry === false && f.rootGroup === 'app' ? ' · not reached from the entry file' : ''}:`);
-  for (const p of [...impFrom.keys()].sort((a, b) => a.localeCompare(b))) say(`  ${p}`);
+  say(`Imported by ${plural(impFrom.size, 'file')}${impBy.length !== impFrom.size ? ` (${impBy.length} statements)` : ''}${f.reachableFromAppEntry === false && f.rootGroup === 'app' ? ' · not reached from the entry file' : ''}${impFrom.size ? ':' : ''}`);
+  items([...impFrom.keys()].sort((a, b) => a.localeCompare(b)));
   const defines = ix.screens.filter(s => s.file === f.path);
   if (defines.length) wrapList('Defines screens: ', defines.map(s => `${s.name} (${s.navigator}${s.parent ? ` in ${s.parent}` : ''})`));
   const navTo = groupBy(out.filter(e => e.kind === 'navigate'), e => `${e.screen} → ${e.to}`);
-  if (navTo.size) { say(`Navigates to ${plural(navTo.size, 'screen')}:`); for (const [k, es] of navTo) say(`  ${k}${linesOf(es)}`); }
+  if (navTo.size) { say(`Navigates to ${plural(navTo.size, 'screen')}:`); items([...navTo].map(([k, es]) => `${k}${linesOf(es)}`)); }
   const navFrom = groupBy(inn.filter(e => e.kind === 'navigate'), e => e.from);
-  if (navFrom.size) { say(`Navigated to from ${plural(navFrom.size, 'file')}:`); for (const [k, es] of [...navFrom].sort()) say(`  ${k} (${[...new Set(es.map(e => e.screen))].join(', ')})${linesOf(es)}`); }
+  if (navFrom.size) { say(`Navigated to from ${plural(navFrom.size, 'file')}:`); items([...navFrom].sort().map(([k, es]) => `${k} (${[...new Set(es.map(e => e.screen))].join(', ')})${linesOf(es)}`)); }
   for (const kind of ['reads', 'writes']) {
     const es = out.filter(e => e.kind === kind);
     if (es.length) wrapList(`${kind === 'reads' ? 'Reads' : 'Writes'}: `, es.map(e => `${e.to.replace(/^collection:/, '')} (${plural(e.count || 1, 'use')})`));
@@ -270,7 +273,7 @@ function impactCmd(P, ix, q) {
     const list = byDepth.get(d);
     if (!list) continue;
     say(d === 1 ? 'Depth 1 (import it directly):' : `Depth ${d} (via the file shown):`);
-    for (const [p, v] of list.sort((a, b) => a[0].localeCompare(b[0]))) say(d === 1 ? `  ${p}` : `  ${p}  ← ${v.via}`);
+    items(list.sort((a, b) => a[0].localeCompare(b[0])).map(([p, v]) => (d === 1 ? p : `${p}  ← ${v.via}`)));
   }
   const nav = new Set((ix.inn.get(f.path) || []).filter(e => e.kind === 'navigate').map(e => e.from));
   if (nav.size) say(`Also navigated to from ${plural(nav.size, 'file')} (not counted above): brainmap file ${f.path}`);
@@ -299,15 +302,15 @@ function screenCmd(P, ix, q) {
   const fromBy = groupBy(from, e => e.from);
   const nested = hits.reduce((s, h) => s + (h.incomingAsNestedParent || 0), 0);
   say(`Reached from ${plural(fromBy.size, 'file')} (${plural(from.length, 'call')})${nested ? `, plus ${nested} navigation calls into screens nested inside it` : ''}:`);
-  for (const [p, es] of [...fromBy].sort()) {
+  items([...fromBy].sort().map(([p, es]) => {
     const methods = [...new Set(es.map(e => e.method).filter(Boolean))];
     const owner = ix.screens.filter(x => x.file === p).map(x => x.name);
-    say(`  ${p}${owner.length ? ` [${owner.slice(0, 3).join(', ')}]` : ''}${methods.length ? ` ${methods.join('/')}` : ''}${linesOf(es)}`);
-  }
+    return `${p}${owner.length ? ` [${owner.slice(0, 3).join(', ')}]` : ''}${methods.length ? ` ${methods.join('/')}` : ''}${linesOf(es)}`;
+  }), 15);
   if (!from.length) say('  none found (it may be the first screen, reached through a navigator, or by a computed name)');
   const to = groupBy([...files].flatMap(fp => (ix.out.get(fp) || []).filter(e => e.kind === 'navigate')), e => `${e.screen} → ${e.to}`);
   say(`Navigates to ${plural(to.size, 'screen')}:`);
-  for (const [k, es] of to) say(`  ${k}${linesOf(es)}`);
+  items([...to].map(([k, es]) => `${k}${linesOf(es)}`));
   if (!to.size) say('  none found');
 }
 
@@ -319,13 +322,13 @@ function collectionCmd(P, ix, q) {
   const unknown = (P.map.data?.usesWithUnknownOperation || []).filter(u => u.collection === col.name);
   const unknownFiles = new Set(unknown.map(u => u.file)).size;
   say(`Collection ${col.name}: read by ${plural(col.readers, 'file')}, written by ${plural(col.writers, 'file')}${unknown.length ? `; read or write unknown: ${plural(unknown.length, 'use')} in ${plural(unknownFiles, 'file')}` : ''}`);
-  wrapList('Paths: ', col.paths || []);
+  wrapList(`Paths (${(col.paths || []).length}): `, col.paths || [], 12);
   for (const kind of ['writes', 'reads']) {
     const list = es.filter(e => e.kind === kind).sort((a, b) => a.from.localeCompare(b.from));
     say(`${kind === 'writes' ? 'Written by' : 'Read by'} (${list.length}):`);
-    for (const e of list) say(`  ${e.from}  ${plural(e.count || 1, 'use')}${linesOf([e])}${e.paths?.length ? `  ${e.paths.slice(0, 3).join(' ')}${e.paths.length > 3 ? ' …' : ''}` : ''}`);
+    items(list.map(e => `${e.from}  ${plural(e.count || 1, 'use')}${linesOf([e])}${e.paths?.length ? `  ${e.paths.slice(0, 3).join(' ')}${e.paths.length > 3 ? ' …' : ''}` : ''}`), 15);
   }
-  if (unknown.length) { say(`Read or write unknown (${unknown.length}):`); for (const u of unknown) say(`  ${u.file}:${u.line}  ${u.path || ''}`); }
+  if (unknown.length) { say(`Read or write unknown (${unknown.length}):`); items(unknown.map(u => `${u.file}:${u.line}  ${u.path || ''}`)); }
   const others = (P.map.rootGroups || []).filter(g => g.name !== 'app').map(g => `${g.dir || g.name}/`);
   if (others.length) say(`Note: Firestore use is mapped in app files only; ${others.join(' and ')} ${others.length === 1 ? 'is' : 'are'} not scanned for it.`);
 }
@@ -342,7 +345,7 @@ function functionCmd(P, ix, q) {
   const calls = P.map.edges.filter(e => e.kind === 'calls-function' && e.function === name);
   const by = groupBy(calls, e => e.from);
   say(`Called from ${plural(by.size, 'file')}:`);
-  for (const [p, es] of by) say(`  ${p}${linesOf(es)}`);
+  items([...by].map(([p, es]) => `${p}${linesOf(es)}`), 20);
   if (!by.size) say('  none found in the code (it may run on a schedule, an HTTP request or a database trigger)');
 }
 
@@ -354,9 +357,9 @@ function findCmd(P, ix, q) {
   const scr = ix.screens.filter(s => s.name.toLowerCase().includes(low));
   const cols = ix.collections.filter(c => c.name.toLowerCase().includes(low));
   say(`"${q}": ${plural(paths.length, 'path')}, ${plural(exp.length, 'export')}, ${plural(scr.length, 'screen')}, ${plural(cols.length, 'collection')}`);
-  if (paths.length) { say('Paths:'); for (const f of paths) say(`  ${f.path}`); }
-  if (exp.length) { say('Exports:'); for (const x of exp) say(`  ${x}`); }
-  if (scr.length) { say('Screens:'); for (const s of scr) say(`  ${s.name}  ${s.file || ''}`); }
+  if (paths.length) { say('Paths:'); items(paths.map(f => f.path)); }
+  if (exp.length) { say('Exports:'); items(exp); }
+  if (scr.length) { say('Screens:'); items(scr.map(s => `${s.name}  ${s.file || ''}`)); }
   if (cols.length) wrapList('Collections: ', cols.map(c => c.name));
 }
 
@@ -369,12 +372,12 @@ function unusedCmd(P, ix) {
     const seen = reach(g.entry);
     const list = ix.files.filter(f => f.rootGroup === g.name && !seen.has(f.path)).sort((a, b) => a.path.localeCompare(b.path));
     say(`Not imported from ${g.entry} (${g.name}): ${list.length}`);
-    for (const f of list) say(`  ${f.path}${f.importedBy ? `  (imported by ${f.importedBy} unreached file${f.importedBy === 1 ? '' : 's'})` : ''}`);
+    items(list.map(f => `${f.path}${f.importedBy ? `  (imported by ${f.importedBy} unreached file${f.importedBy === 1 ? '' : 's'})` : ''}`), 25);
   }
   for (const g of groups.filter(g => !g.entry)) say(`${g.dir || g.name}/: ${plural(g.fileCount, 'file')} with no entry file (standalone scripts, run by hand); not listed`);
   const noNav = ix.screens.filter(s => !s.incomingNavigation && !s.incomingAsNestedParent);
   say(`Screens with no incoming navigation found: ${noNav.length}`);
-  for (const s of noNav) say(`  ${s.name}${s.parent ? ` (in ${s.parent})` : ''}  ${s.file || 'no file'}`);
+  items(noNav.map(s => `${s.name}${s.parent ? ` (in ${s.parent})` : ''}  ${s.file || 'no file'}`), 20);
   say('"Not found" means the map saw no link; code can still be used in ways the map does not see (computed names, other languages).');
 }
 
@@ -387,9 +390,10 @@ async function main() {
   if (cmd === 'help') die(HELP, 0);
   const run = COMMANDS[cmd];
   if (!run) die(`Unknown command "${cmd}".\n\n${HELP}`);
+  ALL = opts.all;
   const P = await loadProject(opts);
   run(P, index(P.map), rest.join(' '));
-  flush(opts.all);
+  flush();
 }
 
 main().catch(e => die(`brainmap: ${e.message}`));
