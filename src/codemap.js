@@ -1,12 +1,21 @@
 // Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (schemaVersion 2).
 // Replaces the brain visual on the left while open. Canvas 2D with pre-rendered glow sprites, so it
 // stays smooth at around 1,000 nodes; d3-force is bundled by Vite, so nothing is fetched from outside.
+//
+// Two views share one graph: "Folders" (default) shows one bubble per top-level folder, with links
+// between bubbles weighted by the file links they stand for; a bubble can be expanded in place into its
+// files. "Files" shows every file. Internally the Files view is the Folders view with every folder expanded.
 import { forceSimulation, forceManyBody, forceLink, forceX, forceY, forceCollide } from 'd3-force';
 import { setBrainPaused } from './brain.js';
 
 const SCHEMA_VERSION = 2;
 const BG = '#05070F';
 const PANEL_W = 380;
+let TOP = 96;             // below the toolbar; follows its height when it wraps
+const SIDE_W = 300;       // findings column and selection card
+const DEFAULT_LABELS = 8;
+const MAX_NEIGHBOR_LABELS = 25;
+const NARROW = 900;       // legend starts collapsed below this diagram width
 
 // Edge kinds → toggleable layers.
 const LAYERS = [
@@ -17,25 +26,29 @@ const LAYERS = [
   { id: 'writes',         label: 'Writes',         kinds: ['writes'],         color: '#FF7A59', on: false },
 ];
 const LAYER_OF = Object.fromEntries(LAYERS.flatMap(l => l.kinds.map(k => [k, l.id])));
+const LAYER_BY_ID = Object.fromEntries(LAYERS.map(l => [l.id, l]));
 
-const FOLDER_COLORS = ['#3B6CFF', '#9FD8FF', '#7C5CFF', '#FF5FD2', '#4DE1FF', '#B388FF', '#5CFFB0',
-  '#FFD166', '#FF8A5C', '#6FE3D0', '#A0B4FF', '#FF6B9A', '#C6F36B', '#E59CFF'];
-const GROUP_COLORS = { functions: '#FFB84D', scripts: '#8E80B8' };
-const ROOT_FILES_COLOR = '#C8D0E8';
-const OTHER_COLOR = '#6A7598';
+// Ten hues spread around the wheel, ordered so neighbors in size rank are far apart; all readable on BG.
+const FOLDER_PALETTE = ['#4F8DFF', '#FF9F43', '#3DDC84', '#D36BFF', '#3FD5E8', '#FF5C5C', '#E8E04A', '#8C7CFF', '#A5E86B', '#FF6FB5'];
+const OTHER_COLOR = '#7D8597';
 const COLLECTION_COLOR = '#4DFFC3';
 
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const base = p => p.split('/').pop();
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 // ─── state ───────────────────────────────────────────────────────────────────
-let root = null, canvas = null, ctx = null, tooltip = null, findingsEl = null, legendEl = null, toolbarEl = null, msgEl = null;
+let root = null, canvas = null, ctx = null, tooltip = null, findingsEl = null, cardEl = null, legendEl = null, toolbarEl = null, msgEl = null;
 let map = null, project = null, onClose = null;
-let nodes = [], byId = new Map(), edges = [], drawEdges = [];
+let nodes = [], byId = new Map(), edges = [], drawEdges = [], degree = new Map();
+let folders = new Map();             // folder key → { key, label, color, colored, files: [node], lines, bubble }
+let rankedFolders = [];
+let mode = 'folders', expanded = new Set();
 let sim = null, view = { x: 0, y: 0, k: 1 }, dpr = 1, width = 0, height = 0;
 let layerOn = {};
-let hovered = null, selected = null, neighbors = new Set(), searchHits = new Set(), searchQuery = '';
-let dirty = true, raf = 0, panelOpen = true;
+let hovered = null, selected = null, neighbors = new Set(), searchHits = new Set(), searchMatches = [], searchQuery = '';
+let lastLabels = [];
+let dirty = true, raf = 0, panelOpen = true, legendOpen = null;
 const sprites = new Map();
 
 // ─── public ──────────────────────────────────────────────────────────────────
@@ -55,12 +68,16 @@ export async function openCodeMap(proj, { onBack } = {}) {
   root.style.display = 'block';
   setBrainPaused(true);
   resize();
-  startSim();
+  if (legendOpen === null) legendOpen = width >= NARROW;
   renderToolbar();
   renderLegend();
+  layout({ warm: true, refit: true });
   renderFindings();
+  renderCard();
   dirty = true;
   loop();
+  // Dev server only (stripped from the build): lets a test script find nodes on screen.
+  if (import.meta.env?.DEV) window.__codemapDebug = { nodes: () => nodes, view: () => view, visible: nodeVisible, drawEdges: () => drawEdges, labels: () => lastLabels, mode: () => mode, expanded: () => expanded };
 }
 
 export function closeCodeMap() {
@@ -68,7 +85,7 @@ export function closeCodeMap() {
   root.style.display = 'none';
   cancelAnimationFrame(raf); raf = 0;
   sim?.stop(); sim = null;
-  map = null; nodes = []; edges = []; drawEdges = [];
+  map = null; nodes = []; edges = []; drawEdges = []; folders = new Map(); rankedFolders = [];
   hideTooltip();
   setBrainPaused(false);
   onClose?.();
@@ -90,18 +107,31 @@ function build() {
       #code-map .cm-chip { display:inline-flex; align-items:center; gap:6px; padding:3px 9px; border-radius:12px; font-size:11.5px;
         border:1px solid rgba(100,120,200,0.22); background:rgba(255,255,255,0.03); color:#8090b0; cursor:pointer; white-space:nowrap; }
       #code-map .cm-chip[aria-pressed="true"] { color:#e8eaf0; background:rgba(60,108,255,0.14); border-color:rgba(100,120,200,0.45); }
+      #code-map .cm-seg { display:inline-flex; border:1px solid rgba(100,120,200,0.3); border-radius:6px; overflow:hidden; }
+      #code-map .cm-seg button { background:transparent; border:none; color:#8090b0; font-size:12px; padding:4px 11px; cursor:pointer; }
+      #code-map .cm-seg button + button { border-left:1px solid rgba(100,120,200,0.3); }
+      #code-map .cm-seg button[aria-pressed="true"] { background:rgba(60,108,255,0.22); color:#fff; }
       #code-map .cm-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
-      #code-map .cm-panel { background:rgba(8,11,24,0.86); backdrop-filter:blur(6px); border:1px solid rgba(100,120,200,0.16); border-radius:8px; }
+      #code-map .cm-swatch { width:12px; height:12px; border-radius:3px; flex-shrink:0; }
+      #code-map .cm-panel { background:rgba(8,11,24,0.88); backdrop-filter:blur(6px); border:1px solid rgba(100,120,200,0.16); border-radius:8px; }
       #code-map .cm-sec > summary { cursor:pointer; list-style:none; padding:7px 10px; font-size:12px; color:#c8d0e8; display:flex; gap:6px; align-items:baseline; }
       #code-map .cm-sec > summary::-webkit-details-marker { display:none; }
       #code-map .cm-sec > summary::before { content:'▸'; color:#5a6890; font-size:10px; width:10px; }
       #code-map .cm-sec[open] > summary::before { content:'▾'; }
-      #code-map .cm-count { color:#5a6890; font-size:11px; margin-left:auto; }
+      #code-map .cm-sec[open] > summary { color:#fff; }
+      #code-map .cm-sec-body { max-height:42vh; overflow-y:auto; padding-bottom:4px; }
+      #code-map .cm-count { color:#8090b0; font-size:11px; margin-left:auto; font-variant-numeric:tabular-nums; }
       #code-map .cm-sub { font-size:10.5px; color:#5a6890; letter-spacing:0.04em; text-transform:uppercase; padding:6px 12px 2px 26px; }
       #code-map .cm-item { display:block; width:100%; text-align:left; background:none; border:none; color:#a8b4d4; font-size:11.5px;
         padding:3px 12px 3px 26px; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+      #code-map .cm-card .cm-item { padding-left:4px; }
       #code-map .cm-item:hover, #code-map .cm-item.cm-active { background:rgba(60,108,255,0.14); color:#fff; }
       #code-map .cm-note { font-size:11px; color:#5a6890; padding:2px 12px 6px 26px; }
+      #code-map .cm-h { font-size:10.5px; color:#5a6890; letter-spacing:0.05em; text-transform:uppercase; margin:9px 0 3px; }
+      #code-map table.cm-t { width:100%; border-collapse:collapse; font-size:11.5px; font-variant-numeric:tabular-nums; }
+      #code-map table.cm-t th { font-weight:normal; color:#5a6890; text-align:right; padding:1px 4px; font-size:10.5px; }
+      #code-map table.cm-t th:first-child, #code-map table.cm-t td:first-child { text-align:left; padding-left:0; }
+      #code-map table.cm-t td { text-align:right; padding:1px 4px; color:#a8b4d4; }
       #code-map input.cm-search { background:rgba(255,255,255,0.06); border:1px solid rgba(100,120,200,0.22); border-radius:6px;
         color:#c8d0e8; font-size:12px; padding:4px 9px; width:170px; outline:none; font-family:inherit; }
       #code-map input.cm-search:focus { border-color:rgba(100,120,200,0.5); }
@@ -110,8 +140,10 @@ function build() {
     <canvas style="position:absolute; inset:0; width:100%; height:100%; cursor:grab; touch-action:none;"></canvas>
     <div class="cm-toolbar" style="position:absolute; top:0; left:0; right:0; padding:10px 14px; display:flex; flex-wrap:wrap; gap:8px 10px; align-items:center;
       background:linear-gradient(${BG}f0, ${BG}00);"></div>
-    <div class="cm-findings cm-panel cm-scroll" style="position:absolute; left:14px; top:96px; bottom:14px; width:300px; overflow-y:auto;"></div>
-    <div class="cm-legend cm-panel" style="position:absolute; right:14px; bottom:14px; padding:9px 11px; font-size:11px; max-width:240px;"></div>
+    <div class="cm-findings cm-panel cm-scroll" style="position:absolute; left:14px; top:${TOP}px; width:${SIDE_W}px; max-height:calc(100% - ${TOP + 14}px); overflow-y:auto;"></div>
+    <div class="cm-card cm-panel cm-scroll" style="position:absolute; right:14px; top:${TOP}px; width:${SIDE_W}px; overflow-y:auto; display:none;
+      padding:9px 11px; font-size:11.5px; line-height:1.5;"></div>
+    <div class="cm-legend cm-panel" style="position:absolute; right:14px; bottom:14px; font-size:11px; width:220px;"></div>
     <div class="cm-msg" style="position:absolute; left:50%; top:45%; transform:translate(-50%,-50%); color:#8090b0; font-size:13px; display:none;"></div>
     <div class="cm-tip cm-panel" style="position:absolute; pointer-events:none; display:none; padding:8px 10px; font-size:11.5px; max-width:340px; line-height:1.5; z-index:2;"></div>
   `;
@@ -120,15 +152,16 @@ function build() {
   ctx = canvas.getContext('2d');
   toolbarEl = root.querySelector('.cm-toolbar');
   findingsEl = root.querySelector('.cm-findings');
+  cardEl = root.querySelector('.cm-card');
   legendEl = root.querySelector('.cm-legend');
   tooltip = root.querySelector('.cm-tip');
   msgEl = root.querySelector('.cm-msg');
 
-  window.addEventListener('resize', () => { if (isCodeMapOpen()) resize(); });
+  window.addEventListener('resize', () => { if (isCodeMapOpen()) { resize(); placeBelowToolbar(); } });
   window.addEventListener('brain-panel', e => {
     panelOpen = !!e.detail?.open;
     root.style.right = panelOpen ? `${PANEL_W}px` : '0';
-    if (isCodeMapOpen()) resize();
+    if (isCodeMapOpen()) { resize(); placeBelowToolbar(); }
   });
   window.addEventListener('keydown', e => {
     if (!isCodeMapOpen() || e.key !== 'Escape' || e.target?.tagName === 'INPUT' || e.target?.tagName === 'TEXTAREA') return;
@@ -137,6 +170,25 @@ function build() {
   findingsEl.addEventListener('click', e => {
     const b = e.target.closest('.cm-item');
     if (b?.dataset.id) selectById(b.dataset.id);
+  });
+  // Findings headings expand one at a time (the shared `name` does this natively; this covers older engines).
+  findingsEl.addEventListener('toggle', e => {
+    if (!e.target.matches?.('details.cm-sec') || !e.target.open) return;
+    for (const d of findingsEl.querySelectorAll('details.cm-sec[open]')) if (d !== e.target) d.open = false;
+  }, true);
+  cardEl.addEventListener('click', e => {
+    const b = e.target.closest('[data-act], .cm-item');
+    if (!b) return;
+    if (b.dataset.act === 'clear') select(null);
+    else if (b.dataset.act === 'expand') expandFolder(b.dataset.key);
+    else if (b.dataset.act === 'collapse') collapseFolder(b.dataset.key);
+    else if (b.dataset.id) selectById(b.dataset.id);
+  });
+  legendEl.addEventListener('click', e => {
+    if (!e.target.closest('.cm-legend-toggle')) return;
+    legendOpen = !legendOpen;
+    renderLegend();
+    sizeCard();
   });
   bindPointer();
 }
@@ -150,108 +202,210 @@ function resize() {
 }
 
 // ─── data ────────────────────────────────────────────────────────────────────
+const folderKeyOf = f => (f.rootGroup !== 'app' ? `group:${f.rootGroup}` : `folder:${f.topFolder}`);
+const folderLabel = k => (k === 'folder:(root)' ? 'root files' : `${k.slice(k.indexOf(':') + 1)}/`);
+
 function prepare() {
   layerOn = Object.fromEntries(LAYERS.map(l => [l.id, l.on]));
-  hovered = selected = null; neighbors = new Set(); searchHits = new Set(); searchQuery = '';
+  hovered = selected = null; neighbors = new Set(); searchHits = new Set(); searchMatches = []; searchQuery = '';
+  mode = 'folders'; expanded = new Set();
 
-  const files = map.nodes.filter(n => n.kind === 'file');
-  // Folder colors: app folders by size, then fixed colors for separate root groups.
-  const folderCount = new Map();
-  for (const f of files) if (f.rootGroup === 'app' && f.topFolder !== '(root)') folderCount.set(f.topFolder, (folderCount.get(f.topFolder) || 0) + 1);
-  const folders = [...folderCount].sort((a, b) => b[1] - a[1]).map(([f]) => f);
-  const folderColor = new Map(folders.map((f, i) => [f, FOLDER_COLORS[i] ?? OTHER_COLOR]));
+  // Folders: scripts/ and functions/ (their own root groups) count as folders. The 10 largest get a hue.
+  folders = new Map();
+  for (const f of map.nodes) {
+    if (f.kind !== 'file') continue;
+    const key = folderKeyOf(f);
+    if (!folders.has(key)) folders.set(key, { key, label: folderLabel(key), files: [], lines: 0 });
+    folders.get(key).lines += f.lines || 0;
+  }
+  rankedFolders = [...folders.values()];
+  const fileCount = new Map();
+  for (const f of map.nodes) if (f.kind === 'file') fileCount.set(folderKeyOf(f), (fileCount.get(folderKeyOf(f)) || 0) + 1);
+  rankedFolders.sort((a, b) => fileCount.get(b.key) - fileCount.get(a.key) || a.label.localeCompare(b.label));
+  rankedFolders.forEach((F, i) => { F.colored = i < FOLDER_PALETTE.length; F.color = F.colored ? FOLDER_PALETTE[i] : OTHER_COLOR; });
 
-  const colorKey = n => {
-    if (n.kind === 'collection') return { key: 'collection', color: COLLECTION_COLOR };
-    if (n.rootGroup !== 'app') return { key: `group:${n.rootGroup}`, color: GROUP_COLORS[n.rootGroup] ?? OTHER_COLOR };
-    if (n.topFolder === '(root)') return { key: 'folder:(root)', color: ROOT_FILES_COLOR };
-    const c = folderColor.get(n.topFolder);
-    return c === OTHER_COLOR ? { key: 'folder:(other)', color: OTHER_COLOR } : { key: `folder:${n.topFolder}`, color: c };
-  };
-
-  nodes = map.nodes.map(n => {
-    const { key, color } = colorKey(n);
-    const isCol = n.kind === 'collection';
-    const r = isCol ? Math.min(11, 5 + Math.sqrt((n.readers || 0) + (n.writers || 0)) * 1.2)
-      : Math.max(2.2, Math.min(9, 1.6 + Math.sqrt(n.lines || 1) / 5.5));
-    return { id: n.id, kind: n.kind, raw: n, key, color, r, label: isCol ? n.name : base(n.path), x: 0, y: 0 };
+  const fileNodes = [], colNodes = [];
+  for (const n of map.nodes) {
+    if (n.kind === 'collection') {
+      colNodes.push({ id: n.id, kind: 'collection', raw: n, key: 'collection', color: COLLECTION_COLOR,
+        r: Math.min(11, 5 + Math.sqrt((n.readers || 0) + (n.writers || 0)) * 1.2), label: n.name, x: 0, y: 0 });
+      continue;
+    }
+    if (n.kind !== 'file') continue;
+    const F = folders.get(folderKeyOf(n));
+    const node = { id: n.id, kind: 'file', raw: n, folder: F.key, key: F.colored ? F.key : 'folder:(other)', color: F.color,
+      r: Math.max(2.2, Math.min(9, 1.6 + Math.sqrt(n.lines || 1) / 5.5)), label: base(n.path), x: 0, y: 0 };
+    F.files.push(node);
+    fileNodes.push(node);
+  }
+  const bubbles = rankedFolders.map(F => {
+    F.bubble = { id: `@${F.key}`, kind: 'folder', folder: F.key, key: F.key, color: F.color, F,
+      r: 7 + Math.sqrt(F.files.length) * 3.4, label: F.label, x: 0, y: 0 };
+    return F.bubble;
   });
+  nodes = [...bubbles, ...fileNodes, ...colNodes];
   byId = new Map(nodes.map(n => [n.id, n]));
 
   edges = map.edges.filter(e => byId.has(e.from) && byId.has(e.to)).map(e => ({ ...e, layer: LAYER_OF[e.kind] })).filter(e => e.layer);
 
-  // Anchors: one per color group on a golden-angle spiral, largest group in the middle.
+  // Files view anchors: one per color group on a golden-angle spiral, largest group in the middle.
+  spiralAnchors(fileNodes.concat(colNodes), 70 + Math.sqrt(fileNodes.length + colNodes.length) * 4, (n, a) => { n.fax = a.x; n.fay = a.y; });
+  // Folders view anchors: one per bubble (already in size order), collections share one.
+  spiralAnchors(bubbles.concat(colNodes), 120, (n, a) => { n.bax = a.x; n.bay = a.y; });
+  for (const n of nodes) {
+    const [ax, ay] = n.kind === 'file' ? [n.fax, n.fay] : [n.bax, n.bay];
+    n.x = ax + (Math.random() - 0.5) * 60; n.y = ay + (Math.random() - 0.5) * 60;
+  }
+  applyAnchors();
+}
+
+function spiralAnchors(list, spacing, set) {
   const groups = new Map();
-  for (const n of nodes) groups.set(n.key, (groups.get(n.key) || 0) + 1);
+  for (const n of list) groups.set(n.key, (groups.get(n.key) || 0) + (n.kind === 'folder' ? n.F.files.length : 1));
   const order = [...groups].sort((a, b) => b[1] - a[1]).map(([k]) => k);
-  const spacing = 70 + Math.sqrt(nodes.length) * 4;
   const anchors = new Map(order.map((k, i) => {
     const a = i * 2.39996, rr = spacing * Math.sqrt(i + (i ? 0.6 : 0));
     return [k, { x: Math.cos(a) * rr, y: Math.sin(a) * rr }];
   }));
+  for (const n of list) set(n, anchors.get(n.key));
+}
+
+// Expanded files keep the anchor set when their folder was opened (the bubble's position).
+function applyAnchors() {
   for (const n of nodes) {
-    const a = anchors.get(n.key);
-    n.ax = a.x; n.ay = a.y;
-    n.x = a.x + (Math.random() - 0.5) * 60; n.y = a.y + (Math.random() - 0.5) * 60;
+    if (mode === 'files') { n.ax = n.fax ?? 0; n.ay = n.fay ?? 0; }
+    else if (n.kind !== 'file') { n.ax = n.bax; n.ay = n.bay; }
   }
 }
 
-const nodeVisible = n => n.kind !== 'collection' || layerOn.reads || layerOn.writes;
+function nodeVisible(n) {
+  if (n.kind === 'collection') return !!(layerOn.reads || layerOn.writes);
+  if (n.kind === 'folder') return mode === 'folders' && !expanded.has(n.folder);
+  return mode === 'files' || expanded.has(n.folder);
+}
 
-// Visible edges, merged per layer and pair, for drawing and for the layout.
+// The node an edge end is drawn at: the file itself, or its folder's bubble when collapsed.
+function repOf(n) {
+  if (n.kind === 'file' && mode === 'folders' && !expanded.has(n.folder)) return folders.get(n.folder).bubble;
+  return n;
+}
+
+// Visible edges, merged per layer and drawn pair, for drawing and for the layout.
 function rebuildEdges() {
   const merged = new Map();
   for (const e of edges) {
-    if (!layerOn[e.layer] || e.from === e.to) continue;
-    const key = `${e.layer}|${e.from}|${e.to}`;
+    if (!layerOn[e.layer]) continue;
+    const s = repOf(byId.get(e.from)), t = repOf(byId.get(e.to));
+    if (s === t) continue;
+    const key = `${e.layer}|${s.id}|${t.id}`;
     const m = merged.get(key);
     if (m) m.count++;
-    else merged.set(key, { layer: e.layer, source: byId.get(e.from), target: byId.get(e.to), count: 1 });
+    else merged.set(key, { layer: e.layer, source: s, target: t, count: 1 });
   }
   drawEdges = [...merged.values()].filter(e => nodeVisible(e.source) && nodeVisible(e.target));
+  degree = new Map();
+  for (const e of drawEdges) {
+    degree.set(e.source, (degree.get(e.source) || 0) + e.count);
+    degree.set(e.target, (degree.get(e.target) || 0) + e.count);
+  }
 }
 
-function startSim() {
+// Bubbles with no visible links are held close to their anchor so they do not drift off the frame.
+const anchorStrength = n => (n.kind === 'folder' ? (degree.get(n) ? 0.08 : 0.25) : n.kind === 'file' && mode === 'folders' ? 0.14 : 0.05);
+
+const isBubbleEdge = e => e.source.kind === 'folder' || e.target.kind === 'folder';
+
+// Rebuilds edges and forces for what is visible now. warm: settle off-screen first; refit: frame it all.
+function layout({ warm = false, refit = false } = {}) {
   rebuildEdges();
   const visible = nodes.filter(nodeVisible);
   const pairs = new Map();
-  for (const e of drawEdges) { const k = e.source.id < e.target.id ? `${e.source.id}|${e.target.id}` : `${e.target.id}|${e.source.id}`; if (!pairs.has(k)) pairs.set(k, e); }
-  const links = [...pairs.values()].map(e => ({ source: e.source, target: e.target }));
-  sim = forceSimulation(visible).stop()
-    .force('charge', forceManyBody().strength(n => (n.kind === 'collection' ? -140 : -38)).distanceMax(420).theta(0.9))
-    .force('link', forceLink(links).distance(34).strength(0.35))
-    .force('x', forceX(n => n.ax).strength(0.05))
-    .force('y', forceY(n => n.ay).strength(0.05))
-    .force('collide', forceCollide(n => n.r + 1.5).iterations(1))
-    .alphaDecay(0.03);
-  const warm = Math.min(140, Math.max(40, Math.round(60000 / Math.max(visible.length, 1))));
-  for (let i = 0; i < warm; i++) sim.tick();
-  fit();
+  for (const e of drawEdges) {
+    const k = e.source.id < e.target.id ? `${e.source.id}|${e.target.id}` : `${e.target.id}|${e.source.id}`;
+    const p = pairs.get(k);
+    if (p) p.count += e.count; else pairs.set(k, { source: e.source, target: e.target, count: e.count });
+  }
+  const links = [...pairs.values()];
+  if (!sim) sim = forceSimulation().stop().alphaDecay(0.03);
+  sim.nodes(visible)
+    .force('charge', forceManyBody()
+      .strength(n => (n.kind === 'folder' ? -(120 + n.r * 5) : n.kind === 'collection' ? -140 : -38))
+      .distanceMax(mode === 'folders' ? 500 : 420).theta(0.9))
+    .force('link', forceLink(links)
+      .distance(l => (isBubbleEdge(l) ? l.source.r + l.target.r + 45 : 34))
+      .strength(l => (isBubbleEdge(l) ? Math.min(0.12, 0.03 + 0.012 * Math.log2(1 + l.count)) : 0.35)))
+    .force('x', forceX(n => n.ax).strength(anchorStrength))
+    .force('y', forceY(n => n.ay).strength(anchorStrength))
+    .force('collide', forceCollide(n => (n.kind === 'folder' ? n.r + 10 : n.r + 1.5)).iterations(mode === 'folders' ? 2 : 1));
+  if (warm) {
+    sim.alpha(1);
+    const ticks = Math.min(140, Math.max(40, Math.round(60000 / Math.max(visible.length, 1))));
+    for (let i = 0; i < ticks; i++) sim.tick();
+  } else sim.alpha(Math.max(sim.alpha(), 0.35));
+  if (refit) fit();
+  if (selected) neighbors = neighborsOf(selected);
   msgEl.style.display = visible.length ? 'none' : 'block';
   msgEl.textContent = 'Nothing to show.';
+  dirty = true;
 }
 
-function relayout() {
-  if (!sim) return;
-  rebuildEdges();
-  const visible = nodes.filter(nodeVisible);
-  const pairs = new Map();
-  for (const e of drawEdges) { const k = e.source.id < e.target.id ? `${e.source.id}|${e.target.id}` : `${e.target.id}|${e.source.id}`; if (!pairs.has(k)) pairs.set(k, e); }
-  sim.nodes(visible);
-  sim.force('link').links([...pairs.values()].map(e => ({ source: e.source, target: e.target })));
-  sim.alpha(Math.max(sim.alpha(), 0.35));
-  if (selected) neighbors = neighborsOf(selected);
-  dirty = true;
+function setMode(m) {
+  if (m === mode) return;
+  mode = m;
+  expanded = new Set();
+  select(null);
+  hideTooltip(); hovered = null;
+  for (const n of nodes) if (n.kind === 'collection') {
+    const [ax, ay] = m === 'files' ? [n.fax, n.fay] : [n.bax, n.bay];
+    n.x = ax + (Math.random() - 0.5) * 40; n.y = ay + (Math.random() - 0.5) * 40;
+  }
+  applyAnchors();
+  layout({ warm: true, refit: true });
+  if (searchQuery) runSearch(searchQuery);
+  renderToolbar();
+  renderLegend();
+}
+
+function expandFolder(key) {
+  const F = folders.get(key);
+  if (!F || mode !== 'folders' || expanded.has(key)) return;
+  const b = F.bubble;
+  expanded.add(key);
+  for (const f of F.files) {
+    const a = Math.random() * Math.PI * 2, d = Math.sqrt(Math.random()) * b.r;
+    f.x = b.x + Math.cos(a) * d; f.y = b.y + Math.sin(a) * d; f.vx = f.vy = 0;
+    f.ax = b.x; f.ay = b.y;
+  }
+  if (selected === b) selected = null;
+  layout({ warm: true, refit: true });
+  if (searchQuery) runSearch(searchQuery);
+  renderToolbar();
+  renderCard();
+}
+
+function collapseFolder(key) {
+  const F = folders.get(key);
+  if (!F || !expanded.has(key)) return;
+  let x = 0, y = 0;
+  for (const f of F.files) { x += f.x; y += f.y; }
+  F.bubble.x = x / F.files.length; F.bubble.y = y / F.files.length; F.bubble.vx = F.bubble.vy = 0;
+  expanded.delete(key);
+  const keepSel = selected && nodeVisible(selected);
+  layout({ warm: true, refit: true });
+  if (searchQuery) runSearch(searchQuery);
+  renderToolbar();
+  select(keepSel ? selected : F.bubble);
 }
 
 function fit() {
   const vis = nodes.filter(nodeVisible);
   if (!vis.length || !width) return;
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-  for (const n of vis) { x0 = Math.min(x0, n.x); y0 = Math.min(y0, n.y); x1 = Math.max(x1, n.x); y1 = Math.max(y1, n.y); }
-  const padL = 330, padT = 100, padR = 40, padB = 40; // keep clear of the findings column and toolbar
+  for (const n of vis) { x0 = Math.min(x0, n.x - n.r); y0 = Math.min(y0, n.y - n.r); x1 = Math.max(x1, n.x + n.r); y1 = Math.max(y1, n.y + n.r); }
+  // Keep clear of the findings column, the toolbar and (when open and the window is wide enough) the legend.
+  const padL = SIDE_W + 30, padT = TOP + 4, padR = legendOpen && width > 3 * SIDE_W ? 250 : 40, padB = 40;
   const w = Math.max(1, width - padL - padR), h = Math.max(1, height - padT - padB);
-  const k = Math.min(2.2, Math.max(0.12, Math.min(w / (x1 - x0 + 40), h / (y1 - y0 + 40))));
+  const k = Math.min(2.2, Math.max(0.12, Math.min(w / (x1 - x0 + 60), h / (y1 - y0 + 60))));
   view = { k, x: padL + w / 2 - k * (x0 + x1) / 2, y: padT + h / 2 - k * (y0 + y1) / 2 };
   dirty = true;
 }
@@ -280,6 +434,16 @@ function hexA(hex, a) {
 
 const focusActive = () => !!selected || searchHits.size > 0;
 const isFocused = n => (selected ? n === selected || neighbors.has(n) : searchHits.has(n));
+const edgeWidth = count => Math.min(10, 0.9 + 1.5 * Math.log2(count)); // screen pixels
+
+// A weighted line, nudged sideways per layer so parallel layers (and the two directions) stay apart.
+function strokeOffset(e, lw, layerIdx) {
+  const { source: s, target: t } = e, k = view.k;
+  const dx = t.x - s.x, dy = t.y - s.y, len = Math.hypot(dx, dy) || 1;
+  const off = (1.5 + layerIdx * 3.5 + lw / 2) / k, ox = (-dy / len) * off, oy = (dx / len) * off;
+  ctx.lineWidth = lw / k;
+  ctx.beginPath(); ctx.moveTo(s.x + ox, s.y + oy); ctx.lineTo(t.x + ox, t.y + oy); ctx.stroke();
+}
 
 function draw() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -294,16 +458,17 @@ function draw() {
   ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * view.x, dpr * view.y);
   ctx.globalCompositeOperation = 'lighter';
   const focus = focusActive();
+  const onLayers = LAYERS.filter(L => layerOn[L.id]).map(L => L.id);
+  const touchesSel = e => selected && (e.source === selected || e.target === selected);
 
-  // Edges, one path per layer; edges touching the selection are drawn again on top.
+  // File-to-file edges, one thin path per layer; weighted bubble edges one by one.
   ctx.lineCap = 'round';
   for (const L of LAYERS) {
     if (!layerOn[L.id]) continue;
     ctx.beginPath();
     let any = false;
     for (const e of drawEdges) {
-      if (e.layer !== L.id) continue;
-      if (selected && (e.source === selected || e.target === selected)) continue;
+      if (e.layer !== L.id || touchesSel(e) || isBubbleEdge(e)) continue;
       ctx.moveTo(e.source.x, e.source.y); ctx.lineTo(e.target.x, e.target.y); any = true;
     }
     if (!any) continue;
@@ -311,13 +476,21 @@ function draw() {
     ctx.lineWidth = 0.9 / k;
     ctx.stroke();
   }
+  for (const e of drawEdges) {
+    if (!isBubbleEdge(e) || touchesSel(e)) continue;
+    ctx.strokeStyle = hexA(LAYER_BY_ID[e.layer].color, focus ? 0.06 : 0.3);
+    strokeOffset(e, edgeWidth(e.count), onLayers.indexOf(e.layer));
+  }
   if (selected) {
     for (const e of drawEdges) {
-      if (e.source !== selected && e.target !== selected) continue;
-      const L = LAYERS.find(l => l.id === e.layer);
+      if (!touchesSel(e)) continue;
+      const L = LAYER_BY_ID[e.layer];
       ctx.strokeStyle = hexA(L.color, 0.9);
-      ctx.lineWidth = (1.3 + Math.min(2, Math.log2(e.count))) / k;
-      ctx.beginPath(); ctx.moveTo(e.source.x, e.source.y); ctx.lineTo(e.target.x, e.target.y); ctx.stroke();
+      if (isBubbleEdge(e)) strokeOffset(e, edgeWidth(e.count) + 0.6, onLayers.indexOf(e.layer));
+      else {
+        ctx.lineWidth = (1.3 + Math.min(2, Math.log2(e.count))) / k;
+        ctx.beginPath(); ctx.moveTo(e.source.x, e.source.y); ctx.lineTo(e.target.x, e.target.y); ctx.stroke();
+      }
       arrow(e, L.color);
     }
   }
@@ -327,8 +500,17 @@ function draw() {
     if (!nodeVisible(n)) continue;
     const dim = focus && !isFocused(n);
     ctx.globalAlpha = dim ? 0.13 : 1;
-    const R = n.r * (n === hovered || n === selected ? 4.6 : 3.6);
-    ctx.drawImage(sprite(n.color), n.x - R, n.y - R, R * 2, R * 2);
+    if (n.kind === 'folder') {
+      const hot = n === hovered || n === selected;
+      ctx.beginPath(); ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
+      ctx.fillStyle = hexA(n.color, hot ? 0.34 : 0.22); ctx.fill();
+      ctx.strokeStyle = hexA(n.color, 0.9); ctx.lineWidth = (hot ? 2.2 : 1.5) / k; ctx.stroke();
+      const R = n.r * 0.55;
+      ctx.drawImage(sprite(n.color), n.x - R, n.y - R, R * 2, R * 2);
+    } else {
+      const R = n.r * (n === hovered || n === selected ? 4.6 : 3.6);
+      ctx.drawImage(sprite(n.color), n.x - R, n.y - R, R * 2, R * 2);
+    }
     if (n.kind === 'collection') {
       const s = n.r * 1.25;
       ctx.beginPath();
@@ -344,7 +526,7 @@ function draw() {
   }
   ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'source-over';
-  drawLabels(focus);
+  drawLabels();
 }
 
 function arrow(e, color) {
@@ -361,34 +543,58 @@ function arrow(e, color) {
   ctx.fillStyle = color; ctx.fill();
 }
 
-function drawLabels(focus) {
+const byDegree = (a, b) => (degree.get(b) || 0) - (degree.get(a) || 0) || a.label.localeCompare(b.label);
+
+// Which nodes get a label, most important first. Collisions are resolved in this order.
+function labelCandidates() {
+  const list = [];
+  if (selected) {
+    list.push(selected);
+    const ns = [...neighbors];
+    list.push(...ns.filter(n => n.kind === 'collection').sort(byDegree));
+    list.push(...ns.filter(n => n.kind !== 'collection').sort(byDegree).slice(0, MAX_NEIGHBOR_LABELS));
+  } else if (searchHits.size) {
+    list.push(...[...searchHits].sort(byDegree).slice(0, 40));
+  } else {
+    list.push(...nodes.filter(n => n.kind !== 'collection' && nodeVisible(n) && degree.get(n)).sort(byDegree).slice(0, DEFAULT_LABELS));
+  }
+  return list;
+}
+
+function drawLabels() {
   const { k } = view;
-  const toScreen = n => [n.x * k + view.x, n.y * k + view.y];
-  const list = new Set();
-  if (hovered) list.add(hovered);
-  if (selected) { list.add(selected); for (const n of neighbors) list.add(n); }
-  if (!selected) for (const n of searchHits) { if (list.size > 60) break; list.add(n); }
-  if (!focus) {
-    const vis = nodes.filter(nodeVisible);
-    if (k >= 2.4) for (const n of vis) list.add(n);
-    else if (k >= 1.1) for (const n of vis) if (n.kind === 'collection' || (n.raw.importedBy || 0) >= 8) list.add(n);
-    else for (const n of vis) if (n.kind === 'collection') list.add(n);
-  }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.font = '11px system-ui,-apple-system,sans-serif';
   ctx.textBaseline = 'middle';
-  let drawn = 0;
-  for (const n of list) {
-    if (!nodeVisible(n)) continue;
-    const [x, y] = toScreen(n);
-    if (x < -50 || y < -20 || x > width + 50 || y > height + 20) continue;
-    if (++drawn > 400) break;
-    const strong = n === hovered || n === selected;
-    ctx.fillStyle = strong ? '#ffffff' : n.kind === 'collection' ? '#bfffe9' : 'rgba(200,210,235,0.78)';
-    ctx.shadowColor = 'rgba(0,0,0,0.9)'; ctx.shadowBlur = 4;
-    ctx.fillText(n.label, x + n.r * k + 6, y);
+  ctx.lineJoin = 'round';
+  const placed = [];
+  const overlaps = b => placed.some(p => b.x0 < p.x1 && b.x1 > p.x0 && b.y0 < p.y1 && b.y1 > p.y0);
+  const queue = [];
+  const place = (n, force) => {
+    if (!n || !nodeVisible(n)) return;
+    const big = n.kind === 'folder' || n === selected || n === hovered;
+    const font = `${n.kind === 'folder' ? '600 ' : ''}${big ? 12 : 11}px system-ui,-apple-system,sans-serif`;
+    ctx.font = font;
+    const text = n.kind === 'folder' ? `${n.label} ${n.F.files.length}` : n.label;
+    const sx = n.x * k + view.x, sy = n.y * k + view.y;
+    const x = sx + n.r * k + 5, w = ctx.measureText(text).width;
+    const box = { x0: x - 3, y0: sy - 8, x1: x + w + 3, y1: sy + 8 };
+    if (box.x1 < 0 || box.x0 > width || box.y1 < 0 || box.y0 > height) return;
+    if (!force && overlaps(box)) return;
+    placed.push(box);
+    queue.push({ n, text, font, x, y: sy, big });
+  };
+  // Hovered always shows, so it reserves its space first.
+  if (hovered) place(hovered, true);
+  for (const n of labelCandidates()) if (n !== hovered) place(n, false);
+  lastLabels = queue.map((q, i) => ({ text: q.text, box: placed[i] }));
+  for (const q of queue) {
+    ctx.font = q.font;
+    ctx.lineWidth = 3.5;
+    ctx.strokeStyle = 'rgba(3,5,12,0.92)';
+    ctx.strokeText(q.text, q.x, q.y);
+    ctx.fillStyle = q.big ? '#ffffff' : q.n.kind === 'collection' ? '#bfffe9' : 'rgba(215,222,242,0.92)';
+    ctx.fillText(q.text, q.x, q.y);
   }
-  ctx.shadowBlur = 0;
 }
 
 function loop() {
@@ -406,7 +612,7 @@ function hit(sx, sy) {
   for (const n of nodes) {
     if (!nodeVisible(n)) continue;
     const d = Math.hypot(n.x - wx, n.y - wy);
-    if (d < n.r + 5 / view.k && d < bestD) { best = n; bestD = d; }
+    if (d < n.r + 5 / view.k && d - n.r < bestD) { best = n; bestD = d - n.r; }
   }
   return best;
 }
@@ -448,6 +654,10 @@ function bindPointer() {
   canvas.addEventListener('pointerup', end);
   canvas.addEventListener('pointercancel', end);
   canvas.addEventListener('pointerleave', () => { if (!drag && hovered) { hovered = null; hideTooltip(); dirty = true; } });
+  canvas.addEventListener('dblclick', e => {
+    const n = hit(e.offsetX, e.offsetY);
+    if (n?.kind === 'folder') expandFolder(n.folder);
+  });
   canvas.addEventListener('wheel', e => {
     e.preventDefault();
     const f = Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0018));
@@ -470,63 +680,157 @@ function select(n, { center = false } = {}) {
   neighbors = selected ? neighborsOf(selected) : new Set();
   if (selected && center) {
     const k = Math.max(view.k, 1.3);
-    const cx = 330 + (width - 330) / 2, cy = 100 + (height - 100) / 2;
+    const left = SIDE_W + 30, right = width > 3 * SIDE_W ? SIDE_W + 30 : 0;
+    const cx = left + (width - left - right) / 2, cy = TOP + (height - TOP) / 2;
     view = { k, x: cx - selected.x * k, y: cy - selected.y * k };
   }
   for (const el of findingsEl.querySelectorAll('.cm-item')) el.classList.toggle('cm-active', !!selected && el.dataset.id === selected.id);
-  renderSelection();
+  renderCard();
   dirty = true;
 }
 
 function selectById(id) {
   const n = byId.get(id);
   if (!n) return;
-  if (!nodeVisible(n)) { layerOn.reads = true; renderToolbar(); relayout(); }
+  if (n.kind === 'collection' && !nodeVisible(n)) { layerOn.reads = true; layout(); renderToolbar(); renderLegend(); }
+  if (n.kind === 'file' && !nodeVisible(n)) expandFolder(n.folder);
+  if (!nodeVisible(n)) return;
   select(n, { center: true });
 }
 
-// ─── tooltip ─────────────────────────────────────────────────────────────────
-function connectionCounts(n) {
-  const c = {};
+// ─── details ─────────────────────────────────────────────────────────────────
+// Per layer: links out/in and the distinct files or collections at the other end. One file can link to
+// another more than once (for example two import statements for the same module), so both are kept and
+// shown together as "48 links from 47 files" rather than as two separate numbers.
+function linkSummary(n) {
+  const per = {};
   for (const e of edges) {
-    if (e.from === n.id) c[`out:${e.layer}`] = (c[`out:${e.layer}`] || 0) + 1;
-    if (e.to === n.id) c[`in:${e.layer}`] = (c[`in:${e.layer}`] || 0) + 1;
+    if (e.from !== n.id && e.to !== n.id) continue;
+    const p = per[e.layer] ||= { outLinks: 0, out: new Set(), inLinks: 0, in: new Set() };
+    if (e.from === n.id) { p.outLinks++; p.out.add(e.to); }
+    if (e.to === n.id) { p.inLinks++; p.in.add(e.from); }
   }
-  return c;
+  return per;
 }
 
-function detailsHtml(n) {
-  const r = n.raw;
-  if (n.kind === 'collection') {
-    return `<div style="color:#fff;font-weight:600">◆ ${esc(r.name)}</div>
-      <div style="color:#5a6890">Firestore collection</div>
-      <div>Read by ${r.readers} file${r.readers === 1 ? '' : 's'}, written by ${r.writers}${r.usedWithUnknownOperation ? `, ${r.usedWithUnknownOperation} unknown` : ''}</div>
-      ${r.paths?.length ? `<div style="color:#8090b0;margin-top:3px">${r.paths.slice(0, 6).map(esc).join('<br>')}${r.paths.length > 6 ? '<br>…' : ''}</div>` : ''}`;
-  }
-  const c = connectionCounts(n);
-  const line = (label, layer) => {
-    const i = c[`in:${layer}`] || 0, o = c[`out:${layer}`] || 0;
-    return i || o ? `<div>${label}: ${o} out · ${i} in</div>` : '';
-  };
+function linkPhrase(links, ends, dir) {
+  const cols = [...ends].every(id => byId.get(id)?.kind === 'collection');
+  const noun = c => plural(c, cols ? 'collection' : 'file');
+  return links === ends.size ? noun(links) : `${links} links ${dir === 'in' ? 'from' : 'to'} ${noun(ends.size)}`;
+}
+
+function fileDetailsHtml(n) {
+  const r = n.raw, per = linkSummary(n);
+  const rows = LAYERS.map(L => {
+    const p = per[L.id];
+    if (!p) return '';
+    const parts = [];
+    if (p.outLinks) parts.push(`out ${linkPhrase(p.outLinks, p.out, 'out')}`);
+    if (p.inLinks) parts.push(`in ${linkPhrase(p.inLinks, p.in, 'in')}`);
+    return `<div><span style="color:${L.color}">●</span> ${L.label}: ${parts.join(' · ')}</div>`;
+  }).join('');
   const screen = (map.navigation?.screens || []).filter(s => s.file === r.path).map(s => s.name);
+  const F = folders.get(n.folder);
   return `<div style="color:#fff;font-weight:600;word-break:break-all">${esc(r.path)}</div>
-    <div style="color:#5a6890">${esc(r.rootGroup)} · ${esc(r.topFolder)} · ${r.lines} lines</div>
+    <div style="color:#5a6890"><span style="color:${F.color}">■</span> ${esc(F.label)} · ${r.lines} lines</div>
     ${screen.length ? `<div style="color:#FF9FE6">Screen: ${screen.slice(0, 4).map(esc).join(', ')}${screen.length > 4 ? '…' : ''}</div>` : ''}
-    <div>Imported by ${r.importedBy} file${r.importedBy === 1 ? '' : 's'}${r.reachableFromAppEntry ? '' : ' · not imported from the entry file'}</div>
-    ${line('Imports', 'import')}${line('Navigation', 'navigate')}${line('Cloud functions', 'calls-function')}${line('Reads', 'reads')}${line('Writes', 'writes')}
+    ${r.importedBy ? '' : '<div style="color:#8090b0">Imported by no file</div>'}
+    ${r.importedBy && !r.reachableFromAppEntry ? '<div style="color:#8090b0">Not imported from the entry file</div>' : ''}
+    ${rows}
     ${r.exports?.length ? `<div style="color:#8090b0">Exports: ${r.exports.slice(0, 8).map(esc).join(', ')}${r.exports.length > 8 ? '…' : ''}</div>` : ''}
     ${r.packages?.length ? `<div style="color:#8090b0">Packages: ${r.packages.slice(0, 8).map(esc).join(', ')}${r.packages.length > 8 ? '…' : ''}</div>` : ''}
     ${r.parseError ? '<div style="color:#e08040">Could not be parsed</div>' : ''}`;
 }
 
+function collectionDetailsHtml(n) {
+  const r = n.raw;
+  return `<div style="color:#fff;font-weight:600">◆ ${esc(r.name)}</div>
+    <div style="color:#5a6890">Firestore collection</div>
+    <div>Read by ${plural(r.readers, 'file')}, written by ${r.writers}${r.usedWithUnknownOperation ? `, ${r.usedWithUnknownOperation} unknown` : ''}</div>
+    ${r.paths?.length ? `<div style="color:#8090b0;margin-top:3px">${r.paths.slice(0, 6).map(esc).join('<br>')}${r.paths.length > 6 ? '<br>…' : ''}</div>` : ''}`;
+}
+
+// Links between this folder and every other folder or collection, on visible layers.
+function folderLinks(key) {
+  const groupOf = id => { const n = byId.get(id); return n.kind === 'file' ? n.folder : n.id; };
+  const rows = new Map();
+  let inside = 0, totalIn = 0, totalOut = 0;
+  const row = g => rows.get(g) || (rows.set(g, { g, in: 0, out: 0 }), rows.get(g));
+  for (const e of edges) {
+    if (!layerOn[e.layer]) continue;
+    const a = groupOf(e.from), b = groupOf(e.to);
+    if (a === key && b === key) inside++;
+    else if (a === key) { row(b).out++; totalOut++; }
+    else if (b === key) { row(a).in++; totalIn++; }
+  }
+  return { inside, totalIn, totalOut, rows: [...rows.values()].sort((x, y) => y.in + y.out - x.in - x.out || String(x.g).localeCompare(String(y.g))) };
+}
+
+function folderSummaryHtml(n) {
+  const F = n.F;
+  return `<div style="color:#fff;font-weight:600"><span style="color:${F.color}">●</span> ${esc(F.label)}</div>
+    <div style="color:#8090b0">${plural(F.files.length, 'file')} · ${F.lines.toLocaleString()} lines</div>`;
+}
+
+function folderCardHtml(n) {
+  const F = n.F, L = folderLinks(F.key);
+  const name = g => {
+    const f = folders.get(g);
+    if (f) return `<span style="color:${f.color}">●</span> ${esc(f.label)}`;
+    return `<span style="color:${COLLECTION_COLOR}">◆</span> ${esc(byId.get(g)?.label ?? g)}`;
+  };
+  const table = L.rows.length
+    ? `<table class="cm-t"><tr><th>Folder</th><th title="Links from that folder into this one">in</th><th title="Links from this folder to that one">out</th></tr>
+      ${L.rows.map(r => `<tr><td>${name(r.g)}</td><td>${r.in || '·'}</td><td>${r.out || '·'}</td></tr>`).join('')}
+      <tr><td style="color:#5a6890">Total</td><td style="color:#c8d0e8">${L.totalIn}</td><td style="color:#c8d0e8">${L.totalOut}</td></tr></table>`
+    : '<div style="color:#5a6890">No links to other folders on the visible layers.</div>';
+  const top = [...F.files].sort((a, b) => (b.raw.importedBy || 0) - (a.raw.importedBy || 0) || a.raw.path.localeCompare(b.raw.path)).slice(0, 5);
+  return `${folderSummaryHtml(n)}
+    <div style="display:flex;gap:6px;margin-top:7px">
+      <button class="cm-btn" data-act="expand" data-key="${esc(F.key)}">Show files</button>
+      <button class="cm-btn" data-act="clear" style="margin-left:auto">Clear</button></div>
+    <div class="cm-h">Links in and out, per folder</div>
+    ${table}
+    ${L.inside ? `<div style="color:#5a6890;margin-top:3px">${plural(L.inside, 'link')} between files inside ${esc(F.label)}</div>` : ''}
+    <div class="cm-h">Most imported files inside</div>
+    ${top.map(f => `<button class="cm-item" data-id="${esc(f.id)}" title="${esc(f.raw.path)}">${esc(f.raw.path)} <span style="color:#5a6890">· imported by ${f.raw.importedBy || 0}</span></button>`).join('')}`;
+}
+
 function showTooltip(n, x, y) {
-  tooltip.innerHTML = detailsHtml(n);
+  tooltip.innerHTML = n.kind === 'folder'
+    ? `${folderSummaryHtml(n)}<div style="color:#5a6890">Click for its links · double-click to show its files</div>`
+    : n.kind === 'collection' ? collectionDetailsHtml(n) : fileDetailsHtml(n);
   tooltip.style.display = 'block';
   const tw = tooltip.offsetWidth, th = tooltip.offsetHeight;
-  tooltip.style.left = `${Math.min(x + 16, width - tw - 8)}px`;
-  tooltip.style.top = `${Math.min(y + 16, height - th - 8)}px`;
+  tooltip.style.left = `${Math.max(8, Math.min(x + 16, width - tw - 8))}px`;
+  tooltip.style.top = `${Math.max(8, Math.min(y + 16, height - th - 8))}px`;
 }
 function hideTooltip() { if (tooltip) tooltip.style.display = 'none'; }
+
+// ─── selection card (top right, separate from the findings) ──────────────────
+function renderCard() {
+  if (!cardEl) return;
+  if (!selected) { cardEl.style.display = 'none'; cardEl.innerHTML = ''; return; }
+  if (selected.kind === 'folder') cardEl.innerHTML = folderCardHtml(selected);
+  else {
+    const ns = [...neighbors].sort((a, b) => a.label.localeCompare(b.label));
+    const inExpanded = selected.kind === 'file' && mode === 'folders' && expanded.has(selected.folder);
+    const nName = n => (n.kind === 'collection' ? `◆ ${n.raw.name}` : n.kind === 'folder' ? `● ${n.label} (${plural(n.F.files.length, 'file')})` : n.raw.path);
+    cardEl.innerHTML = `${selected.kind === 'collection' ? collectionDetailsHtml(selected) : fileDetailsHtml(selected)}
+      <div style="display:flex;gap:6px;align-items:center;margin-top:7px">
+        <span style="color:#5a6890">Connected on visible layers: ${ns.length}</span>
+        ${inExpanded ? `<button class="cm-btn" data-act="collapse" data-key="${esc(selected.folder)}" style="margin-left:auto;padding:1px 7px;font-size:11px">Collapse ${esc(folders.get(selected.folder).label)}</button>` : ''}
+        <button class="cm-btn" data-act="clear" style="${inExpanded ? '' : 'margin-left:auto;'}padding:1px 7px;font-size:11px">Clear</button></div>
+      ${ns.length ? `<div style="margin-top:4px">${ns.map(n => `<button class="cm-item" data-id="${esc(n.id)}" title="${esc(nName(n))}">${esc(nName(n))}</button>`).join('')}</div>` : ''}`;
+  }
+  cardEl.style.display = 'block';
+  sizeCard();
+}
+
+function sizeCard() {
+  if (!cardEl || cardEl.style.display === 'none') return;
+  cardEl.style.maxHeight = `${Math.max(140, height - TOP - legendEl.offsetHeight - 28)}px`;
+}
 
 // ─── toolbar, legend ─────────────────────────────────────────────────────────
 function renderToolbar() {
@@ -537,60 +841,92 @@ function renderToolbar() {
   toolbarEl.innerHTML = `
     <button class="cm-btn cm-back">← Back to brain</button>
     <div style="font-size:13px;color:#fff;font-weight:600">${esc(project.name)}</div>
-    <div style="font-size:11px;color:#5a6890">${fileCount} files${colCount ? ` · ${colCount} collections` : ''} · mapped ${esc(when)}</div>
+    <div style="font-size:11px;color:#5a6890">${fileCount} files · ${folders.size} folders${colCount ? ` · ${colCount} collections` : ''} · mapped ${esc(when)}</div>
     <input class="cm-search" type="text" placeholder="Search files…" value="${esc(searchQuery)}" />
     <span class="cm-hits" style="font-size:11px;color:#5a6890"></span>
     <div style="flex-basis:100%;height:0"></div>
+    <div class="cm-seg" role="group" aria-label="View">
+      <button data-mode="folders" aria-pressed="${mode === 'folders'}">Folders</button><button data-mode="files" aria-pressed="${mode === 'files'}">Files</button>
+    </div>
     ${LAYERS.map(L => `<button class="cm-chip" data-layer="${L.id}" aria-pressed="${!!layerOn[L.id]}">
       <span class="cm-dot" style="background:${L.color};box-shadow:0 0 6px ${L.color}"></span>${L.label}
       <span style="color:#5a6890">${layerCount(L.id)}</span></button>`).join('')}
-    <button class="cm-btn cm-fit" style="margin-left:4px">Fit</button>`;
+    <button class="cm-btn cm-fit" style="margin-left:4px">Fit</button>
+    ${mode === 'folders' && expanded.size ? `<button class="cm-btn cm-collapse-all">Collapse ${expanded.size === 1 ? folders.get([...expanded][0]).label : `${expanded.size} folders`}</button>` : ''}`;
   toolbarEl.querySelector('.cm-back').addEventListener('click', closeCodeMap);
   toolbarEl.querySelector('.cm-fit').addEventListener('click', fit);
+  toolbarEl.querySelector('.cm-collapse-all')?.addEventListener('click', () => {
+    const keys = [...expanded];
+    if (keys.length === 1) return collapseFolder(keys[0]);
+    expanded = new Set(); select(null); layout({ warm: true, refit: true });
+    if (searchQuery) runSearch(searchQuery);
+    renderToolbar();
+  });
+  for (const b of toolbarEl.querySelectorAll('.cm-seg button')) b.addEventListener('click', () => setMode(b.dataset.mode));
   for (const b of toolbarEl.querySelectorAll('.cm-chip')) {
     b.addEventListener('click', () => {
       layerOn[b.dataset.layer] = !layerOn[b.dataset.layer];
       b.setAttribute('aria-pressed', String(layerOn[b.dataset.layer]));
       if (selected && !nodeVisible(selected)) select(null);
-      relayout();
+      layout();
+      if (searchQuery) runSearch(searchQuery);
+      renderCard();
       renderLegend();
     });
   }
   const input = toolbarEl.querySelector('.cm-search');
   input.addEventListener('input', () => runSearch(input.value));
   input.addEventListener('keydown', e => {
-    if (e.key === 'Enter') { const first = [...searchHits][0]; if (first) select(first, { center: true }); }
+    if (e.key === 'Enter') { const first = searchMatches[0]; if (first) selectById(first.id); }
     if (e.key === 'Escape') { input.value = ''; runSearch(''); input.blur(); }
   });
   updateHits();
+  placeBelowToolbar();
 }
 
+// Findings and the selection card sit just under the toolbar, which wraps onto more rows on narrow windows.
+function placeBelowToolbar() {
+  TOP = Math.max(60, Math.round(toolbarEl.offsetHeight + 6));
+  findingsEl.style.top = cardEl.style.top = `${TOP}px`;
+  findingsEl.style.maxHeight = `calc(100% - ${TOP + 14}px)`;
+  sizeCard();
+}
+
+// Matches are files and collections; in the Folders view a file inside a collapsed folder lights its bubble.
 function runSearch(q) {
   searchQuery = q;
   const s = q.trim().toLowerCase();
-  searchHits = new Set(s ? nodes.filter(n => nodeVisible(n) && (n.kind === 'collection' ? n.raw.name : n.raw.path).toLowerCase().includes(s)) : []);
+  searchMatches = s ? nodes.filter(n => (n.kind === 'file' || (n.kind === 'collection' && nodeVisible(n)))
+    && (n.kind === 'collection' ? n.raw.name : n.raw.path).toLowerCase().includes(s)) : [];
+  searchHits = new Set(searchMatches.map(repOf).filter(nodeVisible));
   updateHits();
   dirty = true;
 }
 function updateHits() {
   const el = toolbarEl.querySelector('.cm-hits');
-  if (el) el.textContent = searchQuery.trim() ? `${searchHits.size} match${searchHits.size === 1 ? '' : 'es'}${searchHits.size ? ' · Enter to select' : ''}` : '';
+  if (el) el.textContent = searchQuery.trim() ? `${searchMatches.length} match${searchMatches.length === 1 ? '' : 'es'}${searchMatches.length ? ' · Enter to select' : ''}` : '';
 }
 
 function renderLegend() {
-  const seen = new Map();
-  for (const n of nodes) if (nodeVisible(n) && n.kind === 'file') seen.set(n.key, { color: n.color, count: (seen.get(n.key)?.count || 0) + 1 });
-  const label = k => k.startsWith('group:') ? `${k.slice(6)}/ (own root)` : k === 'folder:(root)' ? 'project root files' : k === 'folder:(other)' ? 'other folders' : `${k.slice(7)}/`;
-  const rows = [...seen].sort((a, b) => b[1].count - a[1].count).map(([k, v]) =>
-    `<div style="display:flex;align-items:center;gap:7px;margin:2px 0"><span class="cm-dot" style="background:${v.color};box-shadow:0 0 6px ${v.color}"></span>
-      <span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(label(k))}</span><span style="color:#5a6890">${v.count}</span></div>`).join('');
+  const colored = rankedFolders.filter(F => F.colored), others = rankedFolders.filter(F => !F.colored);
+  const row = (color, name, count, title = name) =>
+    `<div style="display:flex;align-items:center;gap:7px;margin:3px 0" title="${esc(title)}"><span class="cm-swatch" style="background:${color}"></span>
+      <span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(name)}</span><span style="color:#5a6890">${count}</span></div>`;
+  const rows = colored.map(F => row(F.color, F.label, F.files.length)).join('') +
+    (others.length ? row(OTHER_COLOR, 'other folders', others.reduce((s, F) => s + F.files.length, 0), others.map(F => F.label).join(', ')) : '');
   const showCols = layerOn.reads || layerOn.writes;
-  legendEl.innerHTML = `<div style="color:#5a6890;font-size:10.5px;letter-spacing:0.05em;text-transform:uppercase;margin-bottom:4px">Files by folder</div>
-    <div class="cm-scroll" style="max-height:220px;overflow-y:auto">${rows}</div>
-    <div style="display:flex;align-items:center;gap:7px;margin-top:6px;${showCols ? '' : 'opacity:0.45'}">
-      <span style="width:9px;height:9px;transform:rotate(45deg);border:1.4px solid ${COLLECTION_COLOR};background:${hexA(COLLECTION_COLOR, 0.35)};margin:0 1px"></span>
-      <span>Firestore collection${showCols ? '' : ' (turn on Reads or Writes)'}</span></div>
-    <div style="color:#5a6890;margin-top:6px">Size: lines of code. Click a node to highlight its connections.</div>`;
+  legendEl.innerHTML = `
+    <button class="cm-legend-toggle" aria-expanded="${!!legendOpen}" style="display:flex;width:100%;align-items:center;gap:6px;background:none;border:none;cursor:pointer;
+      padding:8px 11px;color:#8090b0;font-size:10.5px;letter-spacing:0.05em;text-transform:uppercase">
+      <span style="font-size:10px;width:10px">${legendOpen ? '▾' : '▸'}</span>Legend<span style="margin-left:auto;text-transform:none;letter-spacing:0">${mode === 'folders' ? 'folders' : 'files'} by folder</span></button>
+    ${legendOpen ? `<div style="padding:0 11px 9px">
+      <div class="cm-scroll" style="max-height:240px;overflow-y:auto">${rows}</div>
+      <div style="display:flex;align-items:center;gap:7px;margin-top:6px;${showCols ? '' : 'opacity:0.45'}">
+        <span style="width:9px;height:9px;transform:rotate(45deg);border:1.4px solid ${COLLECTION_COLOR};background:${hexA(COLLECTION_COLOR, 0.35)};margin:0 2px"></span>
+        <span>Firestore collection${showCols ? '' : ' (turn on Reads or Writes)'}</span></div>
+      <div style="color:#5a6890;margin-top:6px;line-height:1.45">${mode === 'folders'
+        ? 'Bubble size: number of files. Line thickness: number of file links, per layer. Double-click a bubble to show its files.'
+        : 'Dot size: lines of code.'} Click a node to see its connections.</div></div>` : ''}`;
 }
 
 // ─── findings ────────────────────────────────────────────────────────────────
@@ -605,22 +941,25 @@ function notImported() {
       const seen = reach(g.entry);
       return { group: g, entry: g.entry, files: members.filter(f => !seen.has(f.path)) };
     }
-    return { group: g, entry: null, files: members.filter(f => !f.importedBy) };
+    return { group: g, entry: null, files: members };
   });
 }
 
 function renderFindings() {
-  const sec = (title, count, body, open = false) =>
-    `<details class="cm-sec" ${open ? 'open' : ''}><summary>${title}<span class="cm-count">${count}</span></summary>${body}</details>`;
+  const sec = (title, count, body) =>
+    `<details class="cm-sec" name="cm-findings"><summary>${title}<span class="cm-count">${count}</span></summary><div class="cm-sec-body cm-scroll">${body}</div></details>`;
   const item = (id, text, title = text) => `<button class="cm-item" data-id="${esc(id)}" title="${esc(title)}">${esc(text)}</button>`;
+  const list = files => (files.length ? files.map(f => item(f.path, f.path)).join('') : '<div class="cm-note">None</div>');
 
+  // "Not imported": app files only. Root groups without an entry (scripts/) are listed on their own.
   const groups = notImported();
-  const notImportedBody = groups.map(g => {
-    const head = g.entry ? `${esc(g.group.name)}: not imported from ${esc(g.entry)}` : `${esc(g.group.name)}: imported by no file (no entry file)`;
-    const list = g.files.length ? g.files.map(f => item(f.path, f.path)).join('') : '<div class="cm-note">None</div>';
-    return `<div class="cm-sub">${head} · ${g.files.length}</div>${list}`;
-  }).join('');
-  const notImportedCount = groups.reduce((n, g) => n + g.files.length, 0);
+  const app = groups.find(g => g.group.name === 'app' && g.entry);
+  const notImportedFiles = app ? app.files : [];
+  const notImportedBody = app
+    ? `<div class="cm-note">App files that are not reached by imports from ${esc(app.entry)}.</div>${list(app.files)}`
+    : '<div class="cm-note">No app entry file found.</div>';
+  const standalone = groups.filter(g => !g.entry).flatMap(g => g.files);
+  const standaloneBody = `<div class="cm-note">Run by hand (for example with node), so no file imports them. That is expected.</div>${list(standalone)}`;
 
   const screens = map.navigation?.screens || [];
   const noNav = screens.filter(s => !s.incomingNavigation && !s.incomingAsNestedParent);
@@ -630,15 +969,14 @@ function renderFindings() {
 
   const KIND_LABEL = { load: 'Module loads with a computed path', navigate: 'Navigation with a computed screen name', function: 'Cloud function calls with a computed name', data: 'Firestore paths that could not be resolved' };
   const unresolved = map.unresolved || [];
-  const kinds = map.kinds?.unresolved || [...new Set(unresolved.map(u => u.kind))];
+  const kinds = [...new Set([...(map.kinds?.unresolved || []), ...unresolved.map(u => u.kind)])];
   const unresolvedBody = kinds.map(kind => {
-    const list = unresolved.filter(u => u.kind === kind);
-    return `<div class="cm-sub">${esc(KIND_LABEL[kind] || kind)} · ${list.length}</div>` +
-      (list.length ? list.map(u => item(u.file, `${u.file}:${u.line}`)).join('') : '<div class="cm-note">None</div>');
-  }).join('');
+    const l = unresolved.filter(u => u.kind === kind);
+    return l.length ? `<div class="cm-sub">${esc(KIND_LABEL[kind] || kind)} · ${l.length}</div>` + l.map(u => item(u.file, `${u.file}:${u.line}`)).join('') : '';
+  }).join('') || '<div class="cm-note">None</div>';
   const unknownOps = map.data?.usesWithUnknownOperation || [];
   const unknownBody = unknownOps.length
-    ? `<div class="cm-sub">Firestore use with unknown read or write · ${unknownOps.length}</div>` + unknownOps.map(u => item(u.file, `${u.file}:${u.line} · ${u.collection}`)).join('')
+    ? `<div class="cm-sub">Also noted: Firestore use with unknown read or write · ${unknownOps.length}</div>` + unknownOps.map(u => item(u.file, `${u.file}:${u.line} · ${u.collection}`)).join('')
     : '';
 
   findingsEl.innerHTML = `
@@ -646,36 +984,17 @@ function renderFindings() {
       <div style="font-size:11px;color:#5a6890;letter-spacing:0.06em;text-transform:uppercase">Findings</div>
       <button class="cm-btn cm-collapse" style="margin-left:auto;padding:2px 8px;font-size:11px">Hide</button>
     </div>
-    <div class="cm-selection"></div>
     <div class="cm-body">
-      ${sec('Not imported', notImportedCount, notImportedBody, true)}
+      ${sec('Not imported', notImportedFiles.length, notImportedBody)}
+      ${standalone.length ? sec('Standalone scripts', standalone.length, standaloneBody) : ''}
       ${sec('No incoming navigation found', noNav.length, noNavBody)}
       ${sec('Unresolved', unresolved.length, unresolvedBody + unknownBody)}
-      <div class="cm-note" style="padding:8px 12px 10px">"Not imported" and "no incoming navigation found" mean the map found no link. A file can still be used in ways the map does not see.</div>
+      <div class="cm-note" style="padding:6px 12px 10px">"Not imported" and "no incoming navigation found" mean the map found no link. A file can still be used in ways the map does not see.</div>
     </div>`;
-  findingsEl.style.bottom = '14px';
   const collapse = findingsEl.querySelector('.cm-collapse');
   collapse.addEventListener('click', () => {
     const body = findingsEl.querySelector('.cm-body'), hidden = body.style.display === 'none';
     body.style.display = hidden ? '' : 'none';
-    findingsEl.querySelector('.cm-selection').style.display = hidden ? '' : 'none';
-    findingsEl.style.bottom = hidden ? '14px' : 'auto';
     collapse.textContent = hidden ? 'Hide' : 'Show';
   });
-  renderSelection();
-}
-
-function renderSelection() {
-  const el = findingsEl?.querySelector('.cm-selection');
-  if (!el) return;
-  if (!selected) { el.innerHTML = ''; return; }
-  const ns = [...neighbors].sort((a, b) => a.label.localeCompare(b.label));
-  el.innerHTML = `<div style="margin:2px 8px 8px;padding:8px 10px;border:1px solid rgba(100,120,200,0.2);border-radius:6px;font-size:11.5px;line-height:1.5">
-      ${detailsHtml(selected)}
-      <div style="display:flex;align-items:center;margin-top:6px"><span style="color:#5a6890">${ns.length} connection${ns.length === 1 ? '' : 's'} on visible layers</span>
-        <button class="cm-btn cm-clear" style="margin-left:auto;padding:1px 7px;font-size:11px">Clear</button></div>
-    </div>
-    ${ns.length ? `<div class="cm-scroll" style="max-height:160px;overflow-y:auto;margin-bottom:6px">${ns.map(n =>
-      `<button class="cm-item" data-id="${esc(n.id)}" title="${esc(n.kind === 'collection' ? n.raw.name : n.raw.path)}">${esc(n.kind === 'collection' ? `◆ ${n.raw.name}` : n.raw.path)}</button>`).join('')}</div>` : ''}`;
-  el.querySelector('.cm-clear').addEventListener('click', () => select(null));
 }
