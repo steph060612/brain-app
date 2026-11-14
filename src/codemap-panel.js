@@ -2,6 +2,7 @@
 import { openCodeMap, closeCodeMap, isCodeMapOpen } from './codemap.js';
 
 let el = null, current = null, info = null, busy = false, linking = false;
+let agents = null, agentsConfirm = null; // assistants block preview; 'enable' | 'remove' while asking
 const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 const BTN = `padding:4px 10px; background:rgba(60,108,255,0.18); border:1px solid rgba(60,108,255,0.4); color:#9FD8FF;
@@ -22,7 +23,7 @@ export function createCodeSection() {
 export function showCodeSection(project) {
   current = project;
   linking = false;
-  info = null;
+  info = null; agents = null; agentsConfirm = null;
   if (!project) { el.style.display = 'none'; el.innerHTML = ''; return; }
   el.style.display = 'block';
   el.innerHTML = `<span style="${MUTED}">Code folder…</span>`;
@@ -46,6 +47,7 @@ async function refresh() {
     info = d;
     render();
     if (d.folder && d.map) loadStatus();
+    if (d.folder && d.folderExists) loadAgents();
   } catch (e) {
     if (current?.slug === slug) el.innerHTML = `<span style="color:#c0503a">${esc(e.message)}</span>`;
   }
@@ -71,7 +73,9 @@ function render(message = '', color = '#8090b0') {
       <span title="${esc(info.folder)}" style="color:${missing ? '#e08040' : '#5a6890'}">Code: ${esc(info.display)}${missing ? ' (folder not found)' : ''}</span>
       <button class="cm-unlink" style="${LINK} font-size:11px; color:#8090b0">Unlink</button>
     </div>
+    <div class="cm-agents" style="margin-top:6px"></div>
     <div class="cm-msg" style="font-size:11.5px; margin-top:5px; color:${color}">${esc(message)}</div>`;
+  renderAgents();
   el.querySelector('.cm-run').addEventListener('click', runMap);
   el.querySelector('.cm-open')?.addEventListener('click', () => showMap());
   el.querySelector('.cm-unlink').addEventListener('click', unlink);
@@ -196,4 +200,75 @@ async function loadStatus() {
     const box = el.querySelector('.cm-status');
     if (box) { box.textContent = e.message; box.style.color = '#e08040'; }
   }
+}
+
+// ─── "Enable for assistants": a marked block in the project's AGENTS.md or CLAUDE.md ───────────────────
+async function loadAgents() {
+  const slug = current.slug;
+  try {
+    const a = await api('GET', '/assistants');
+    if (current?.slug !== slug) return;
+    agents = a;
+  } catch (e) {
+    if (current?.slug !== slug) return;
+    agents = { error: e.message };
+  }
+  renderAgents();
+}
+
+function renderAgents() {
+  const box = el?.querySelector('.cm-agents');
+  if (!box) return;
+  if (!agents) { box.innerHTML = ''; return; }
+  if (agents.error) { box.innerHTML = `<div style="${MUTED}">Assistants: ${esc(agents.error)}</div>`; return; }
+  if (agentsConfirm) {
+    const enable = agentsConfirm === 'enable';
+    const where = `${esc(agents.path)}${enable && !agents.exists ? ' (new file)' : ''}`;
+    box.innerHTML = `<div style="border:1px solid rgba(100,120,200,0.22); border-radius:6px; padding:8px 10px;">
+        <div style="font-size:11.5px; color:#c8d0e8; margin-bottom:5px">${enable
+          ? `This adds the text below to ${where}. ${esc(agents.reason)} Nothing else in the file changes and nothing is committed.`
+          : `This removes only the marked brainmap block from ${where}.${agents.removeDeletesFile ? ` The file has nothing else in it, so it is deleted.` : ' The rest of the file stays as it is.'} Nothing is committed.`}</div>
+        ${enable ? `<pre style="margin:0 0 7px; padding:7px 8px; background:#0b0e1c; border:1px solid rgba(100,120,200,0.15); border-radius:4px; font-size:10.5px;
+          line-height:1.45; color:#a8b4d4; white-space:pre-wrap; word-break:break-word; max-height:220px; overflow:auto">${esc(agents.block)}</pre>` : ''}
+        <div style="display:flex; gap:6px; align-items:center">
+          <button class="cm-agents-ok" style="${BTN}">${enable ? `Add to ${esc(agents.file)}` : `Remove from ${esc(agents.file)}`}</button>
+          <button class="cm-agents-cancel" style="${BTN2}">Cancel</button>
+        </div></div>`;
+    box.querySelector('.cm-agents-ok').addEventListener('click', () => (enable ? enableAgents() : removeAgents()));
+    box.querySelector('.cm-agents-cancel').addEventListener('click', () => { agentsConfirm = null; renderAgents(); });
+    return;
+  }
+  box.innerHTML = agents.enabled
+    ? `<div style="${MUTED} display:flex; gap:8px; align-items:baseline; flex-wrap:wrap">
+        <span style="color:#6FE3D0">Enabled for assistants</span><span>in ${esc(agents.file)}</span>
+        <button class="cm-agents-remove" style="${LINK} font-size:11px; color:#8090b0">Remove</button></div>`
+    : `<button class="cm-agents-enable" style="${BTN2}" title="Adds a short block to the project's ${esc(agents.file)} that tells coding assistants to use the brainmap command">Enable for assistants</button>`;
+  box.querySelector('.cm-agents-enable')?.addEventListener('click', () => askAgents('enable'));
+  box.querySelector('.cm-agents-remove')?.addEventListener('click', () => askAgents('remove'));
+}
+
+// Always show what is on disk right now before asking.
+async function askAgents(kind) {
+  await loadAgents();
+  if (agents?.error) return;
+  agentsConfirm = kind;
+  renderAgents();
+}
+
+async function enableAgents() {
+  try {
+    const r = await api('POST', '/assistants', { expect: agents.expect });
+    agentsConfirm = null;
+    await loadAgents();
+    setMsg(r.already ? `Already enabled in ${r.file}.` : `${r.created ? 'Created' : 'Updated'} ${r.file} with the brainmap block.`, '#6FE3D0');
+  } catch (e) { agentsConfirm = null; await loadAgents(); setMsg(e.message, '#c0503a'); }
+}
+
+async function removeAgents() {
+  try {
+    const r = await api('DELETE', '/assistants', { expect: agents.expect });
+    agentsConfirm = null;
+    await loadAgents();
+    setMsg(r.already ? 'The block was already gone.' : r.deleted ? `Removed the block; ${r.file} had nothing else and was deleted.` : `Removed the brainmap block from ${r.file}.`, '#6FE3D0');
+  } catch (e) { agentsConfirm = null; await loadAgents(); setMsg(e.message, '#c0503a'); }
 }

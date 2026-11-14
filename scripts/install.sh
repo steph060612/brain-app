@@ -113,8 +113,13 @@ mkdir -p "$STATE_DIR/packs" "$STATE_DIR/imports"
 [ "$MODE" = install ] && printf 'BRAIN_NAME="%s"\nBRAIN_DIR="%s"\nBRAIN_PORT="%s"\n' "$NAME" "$BRAIN_DIR" "$PORT" > "$STATE_DIR/config"
 cp "$APP_DIR/scripts/brainpack.sh" "$APP_DIR/scripts/autocommit.sh" "$STATE_DIR/"
 chmod +x "$STATE_DIR/brainpack.sh" "$STATE_DIR/autocommit.sh"
+/usr/bin/sed -e "s|__NODE__|$NODE|" -e "s|__APP_DIR__|$APP_DIR|" "$APP_DIR/scripts/brainmap.sh" > "$STATE_DIR/brainmap.sh"
+chmod +x "$STATE_DIR/brainmap.sh"
 for bin in /opt/homebrew/bin /usr/local/bin; do
-  if [ -d "$bin" ] && [ -w "$bin" ]; then ln -sf "$STATE_DIR/brainpack.sh" "$bin/brainpack"; echo "brainpack command linked in $bin."; break; fi
+  if [ -d "$bin" ] && [ -w "$bin" ]; then
+    ln -sf "$STATE_DIR/brainpack.sh" "$bin/brainpack"; ln -sf "$STATE_DIR/brainmap.sh" "$bin/brainmap"
+    echo "brainpack and brainmap commands linked in $bin."; break
+  fi
 done
 
 step "Building the Brain app"

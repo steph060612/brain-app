@@ -1,38 +1,23 @@
 // Code maps: link a Brain project to a code folder and map it with src/mapper.js.
 // Links live in ~/.brain/code-folders.json (slug → absolute path), maps in ~/.brain/maps/<slug>/map.json.
-// Nothing here writes to ~/Brain or to a linked folder: git is only read, with --no-optional-locks so
-// that `git status` never refreshes the folder's index.
-import { readFile, writeFile, rename, mkdir, stat, realpath, readdir } from 'fs/promises';
-import { spawn, execFile } from 'child_process';
-import { homedir } from 'os';
-import { join, resolve, sep, dirname, extname, isAbsolute } from 'path';
-import { fileURLToPath } from 'url';
-import { JS_EXT, SKIP_DIRS, NO_JS_EXIT, NO_JS_MESSAGE } from './mapper.js';
+// Nothing here writes to ~/Brain. The only write to a linked folder is the marked brainmap block in its
+// AGENTS.md or CLAUDE.md, after the person confirms it (brainmap-agents.js). Git is only read, with
+// --no-optional-locks so that `git status` never refreshes the folder's index; nothing is committed.
+import { writeFile, rename, mkdir, stat, realpath, readdir } from 'fs/promises';
+import { join, resolve, sep, isAbsolute } from 'path';
+import {
+  HOME, DOT, LINKS, BRAIN, fail, tilde, realOrSelf, inside, loadLinks, readMap, mapStatus, runMapper,
+} from './codemap-status.js';
+import { assistantsPreview, enableAssistants, removeAssistants } from './brainmap-agents.js';
 
-const HOME     = homedir();
-const DOT      = join(HOME, '.brain');
-const LINKS    = join(DOT, 'code-folders.json');
-const MAPS     = join(DOT, 'maps');
-const BRAIN    = join(HOME, 'Brain');
-const MAPPER   = join(dirname(fileURLToPath(import.meta.url)), 'mapper.js');
-const SCHEMA_VERSION = 2;
-const MAP_TIMEOUT_MS = 60_000;
 const SLUG_RE  = /^[a-z0-9][a-z0-9-]*$/;
-
-const fail = (status, message) => Object.assign(new Error(message), { status });
 const send = (res, e) => res.status(e.status || 500).json({ error: e.message });
-const tilde = p => (p === HOME || p.startsWith(HOME + sep) ? '~' + p.slice(HOME.length) : p);
-const isSource = rel => JS_EXT.includes(extname(rel).toLowerCase()) && !rel.split('/').some(s => SKIP_DIRS.has(s));
-const mapFile = slug => join(MAPS, slug, 'map.json');
 
 function slugOf(req) {
   const slug = String(req.params.slug || '');
   if (!SLUG_RE.test(slug)) throw fail(400, 'Invalid project name');
   return slug;
 }
-
-const realOrSelf = async p => { try { return await realpath(p); } catch { return p; } };
-const inside = (p, dir) => p === dir || p.startsWith(dir + sep);
 
 // Accept only an existing directory under the home folder, never ~/Brain or ~/.brain (or anything in them).
 async function validateFolder(input) {
@@ -51,13 +36,6 @@ async function validateFolder(input) {
 }
 
 // ─── links file ──────────────────────────────────────────────────────────────
-async function loadLinks() {
-  try {
-    const d = JSON.parse(await readFile(LINKS, 'utf8'));
-    return d && typeof d === 'object' && !Array.isArray(d) ? d : {};
-  } catch { return {}; }
-}
-
 let linksLock = Promise.resolve();
 function updateLinks(fn) {
   const next = linksLock.then(async () => {
@@ -73,17 +51,6 @@ function updateLinks(fn) {
 }
 
 // ─── map file ────────────────────────────────────────────────────────────────
-async function readMap(slug) {
-  let text;
-  try { text = await readFile(mapFile(slug), 'utf8'); } catch { return null; }
-  let map;
-  try { map = JSON.parse(text); } catch { throw fail(422, 'The saved map could not be read. Re-map the project.'); }
-  if (map?.schemaVersion !== SCHEMA_VERSION) {
-    throw fail(422, `This map uses schema version ${map?.schemaVersion ?? 'unknown'}; this app reads only version ${SCHEMA_VERSION}. Re-map the project to replace it.`);
-  }
-  return { text, map };
-}
-
 const mapSummary = map => ({
   schemaVersion: map.schemaVersion,
   generatedAt: map.generatedAt,
@@ -92,71 +59,6 @@ const mapSummary = map => ({
   folder: map.project?.path ?? null,
   counts: { nodes: map.counts?.nodes, edges: map.counts?.edges, nodesByKind: map.counts?.nodesByKind, edgesByKind: map.counts?.edgesByKind },
 });
-
-// ─── git (read-only) ─────────────────────────────────────────────────────────
-function git(folder, args) {
-  return new Promise(res => {
-    execFile('git', ['--no-optional-locks', '-C', folder, ...args],
-      { timeout: 10_000, maxBuffer: 32 * 1024 * 1024, encoding: 'utf8' },
-      (err, stdout) => res(err ? null : stdout));
-  });
-}
-
-// Source files changed since the map was made: files changed between the mapped commit and HEAD, plus
-// uncommitted source files modified after the map was written (or deleted since).
-async function changeStatus(folder, map, useGit) {
-  const mapTime = Date.parse(map.generatedAt) || 0;
-  const mapped = new Set(map.nodes.filter(n => n.kind === 'file').map(n => n.path));
-  const changed = new Set();
-  const out = { mapCommit: map.project?.gitCommit ?? null, currentCommit: null, commitChanged: false, uncommittedSourceFiles: 0, method: 'git' };
-
-  const mtime = async rel => { try { return (await stat(join(folder, rel))).mtimeMs; } catch { return null; } };
-  const head = useGit ? (await git(folder, ['rev-parse', 'HEAD']))?.trim() : null;
-
-  if (head) {
-    out.currentCommit = head;
-    if (out.mapCommit && head !== out.mapCommit) {
-      out.commitChanged = true;
-      const diff = await git(folder, ['diff', '--name-only', '-z', out.mapCommit, head]);
-      if (diff === null) out.diffUnavailable = true;
-      else for (const f of diff.split('\0')) if (f && isSource(f)) changed.add(f);
-    } else if (!out.mapCommit) out.commitChanged = true; // mapped without git, now a repository
-    const porcelain = await git(folder, ['status', '--porcelain', '-z', '--untracked-files=all']);
-    const parts = (porcelain || '').split('\0');
-    for (let i = 0; i < parts.length; i++) {
-      const entry = parts[i];
-      if (entry.length < 4) continue;
-      const code = entry.slice(0, 2), rel = entry.slice(3);
-      if (code.includes('R') || code.includes('C')) i++; // the next field is the old path
-      if (!isSource(rel)) continue;
-      out.uncommittedSourceFiles++;
-      const t = await mtime(rel);
-      if (t === null ? mapped.has(rel) : t > mapTime) changed.add(rel);
-    }
-  } else {
-    // Not a git repository (or git unavailable): compare modification times with the map.
-    out.method = 'mtime';
-    const seen = new Set();
-    async function walk(dir, base) {
-      let entries;
-      try { entries = await readdir(dir, { withFileTypes: true }); } catch { return; }
-      for (const e of entries) {
-        const rel = base ? `${base}/${e.name}` : e.name;
-        if (e.isDirectory()) { if (!SKIP_DIRS.has(e.name)) await walk(join(dir, e.name), rel); }
-        else if (e.isFile() && isSource(rel)) {
-          seen.add(rel);
-          const t = await mtime(rel);
-          if (!mapped.has(rel) || (t !== null && t > mapTime)) changed.add(rel);
-        }
-      }
-    }
-    await walk(folder, '');
-    for (const f of mapped) if (!seen.has(f) && !f.startsWith('.')) changed.add(f);
-  }
-  out.changedFiles = changed.size;
-  out.state = changed.size || out.diffUnavailable ? 'changed' : 'current';
-  return out;
-}
 
 // ─── folder suggestions ──────────────────────────────────────────────────────
 const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -205,28 +107,6 @@ async function suggestFolders(names) {
 
 // ─── mapper run ──────────────────────────────────────────────────────────────
 const running = new Set();
-
-function runMapper(folder, slug, useGit) {
-  return new Promise((res, rej) => {
-    const child = spawn(process.execPath, [MAPPER, folder, slug], {
-      cwd: DOT,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, ...(useGit ? {} : { MAPPER_NO_GIT: '1' }) },
-    });
-    let stdout = '', stderr = '', timedOut = false;
-    child.stdout.on('data', d => { stdout += d; });
-    child.stderr.on('data', d => { stderr += d; });
-    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, MAP_TIMEOUT_MS);
-    child.on('error', e => { clearTimeout(timer); rej(fail(500, `Could not start the mapper: ${e.message}`)); });
-    child.on('close', code => {
-      clearTimeout(timer);
-      if (timedOut) return rej(fail(504, 'Mapping took longer than 60 seconds and was stopped.'));
-      if (code === NO_JS_EXIT) return rej(fail(422, NO_JS_MESSAGE));
-      if (code !== 0) return rej(fail(500, `Mapper failed: ${(stderr || stdout).trim().split('\n')[0] || `exit ${code}`}`));
-      res(stdout);
-    });
-  });
-}
 
 // ─── routes ──────────────────────────────────────────────────────────────────
 export function registerCodeMapRoutes(app, { gitAvailable }) {
@@ -307,10 +187,23 @@ export function registerCodeMapRoutes(app, { gitAvailable }) {
       const folder = await validateFolder(linked);
       const m = await readMap(slug);
       if (!m) throw fail(404, 'This project has not been mapped yet.');
-      const mappedFolder = m.map.project?.path;
-      const st = await changeStatus(folder, m.map, await gitAvailable());
-      if (mappedFolder && (await realOrSelf(mappedFolder)) !== folder) { st.state = 'other-folder'; st.mappedFolder = tilde(mappedFolder); }
-      res.json(st);
+      res.json(await mapStatus(folder, m.map, await gitAvailable()));
     } catch (e) { send(res, e); }
+  });
+
+  // "Enable for assistants": preview the marked block and where it would go, then add or remove it.
+  const agentsFolder = async req => {
+    const linked = await linkedFolder(slugOf(req));
+    if (!linked) throw fail(400, 'No code folder linked.');
+    return validateFolder(linked);
+  };
+  app.get('/api/code/:slug/assistants', async (req, res) => {
+    try { res.json(await assistantsPreview(await agentsFolder(req))); } catch (e) { send(res, e); }
+  });
+  app.post('/api/code/:slug/assistants', async (req, res) => {
+    try { res.json(await enableAssistants(await agentsFolder(req), req.body?.expect)); } catch (e) { send(res, e); }
+  });
+  app.delete('/api/code/:slug/assistants', async (req, res) => {
+    try { res.json(await removeAssistants(await agentsFolder(req), req.body?.expect)); } catch (e) { send(res, e); }
   });
 }
