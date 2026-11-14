@@ -82,8 +82,14 @@ answering it runs the same "code changed since last map" check as the panel and 
 paths, names and numbers only, never file contents. `install.sh` links it next to `brainpack`
 (`~/.brain/brainmap.sh`, symlinked into `/opt/homebrew/bin` or `/usr/local/bin`).
 
-**Enable for assistants** (panel, linked projects) shows a short block and, after confirmation, adds it between
-`<!-- brainmap:start … -->` and `<!-- brainmap:end -->` markers to the project's AGENTS.md (or CLAUDE.md when there
-is no AGENTS.md, unless CLAUDE.md only points to AGENTS.md). The start marker records `created-file=yes|no`.
-**Remove** deletes only that block; it deletes the file only when the app created it and nothing else is in it.
+**Enable for assistants** (panel, linked projects) adds a short marked block, between `<!-- brainmap:start … -->` and
+`<!-- brainmap:end -->`, that tells coding assistants to run `brainmap overview` at the start of a code task and the
+matching brainmap command (`callers`, `impact`, `screen`, `collection`, `file`) before searching the repository. It goes
+into every one of CLAUDE.md and AGENTS.md that exists in the code folder, because Claude Code loads CLAUDE.md by itself
+while other assistants read AGENTS.md; when neither exists, both are created. The preview shows, per file, whether it
+exists and the exact text added. An existing block (older wording included) is updated in place, never duplicated, and
+the panel says "needs an update" until every file has the current block. Each file's marker records
+`created-file=yes|no`. **Remove** takes the block out of every file that has it and deletes a file only when its marker
+says the app created it and nothing else is in it. Both actions are refused if either file changed after the preview.
+Nothing is committed in the project.
 

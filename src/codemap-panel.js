@@ -219,39 +219,54 @@ async function loadAgents() {
   renderAgents();
 }
 
+const ACTION_TEXT = {
+  create: 'does not exist; it is created with the text below (marked as created by the app, so Remove deletes it again if nothing else is added).',
+  add: 'exists; the text below is added at the end. Nothing else in the file changes, and Remove will never delete this file.',
+  update: 'already has a brainmap block in older wording; it is replaced in place by the text below.',
+  current: 'already has the current block; nothing changes.',
+  skip: 'does not exist and is not created, because the other file exists.',
+};
+
 function renderAgents() {
   const box = el?.querySelector('.cm-agents');
   if (!box) return;
   if (!agents) { box.innerHTML = ''; return; }
   if (agents.error) { box.innerHTML = `<div style="${MUTED}">Assistants: ${esc(agents.error)}</div>`; return; }
+  const files = agents.files || [];
+  const pre = text => `<pre style="margin:4px 0 0; padding:7px 8px; background:#0b0e1c; border:1px solid rgba(100,120,200,0.15); border-radius:4px; font-size:10.5px;
+    line-height:1.45; color:#a8b4d4; white-space:pre-wrap; word-break:break-word; max-height:200px; overflow:auto">${esc(text)}</pre>`;
   if (agentsConfirm) {
     const enable = agentsConfirm === 'enable';
-    const where = `${esc(agents.path)}${enable && !agents.exists ? ' (new file)' : ''}`;
-    box.innerHTML = `<div style="border:1px solid rgba(100,120,200,0.22); border-radius:6px; padding:8px 10px;">
-        <div style="font-size:11.5px; color:#c8d0e8; margin-bottom:5px">${enable
-          ? `This adds the text below to ${where}. ${esc(agents.reason)} ${agents.exists
-              ? 'Nothing else in the file changes. The file existed before, so Remove will never delete it.'
-              : 'The marker records that the app created the file, so Remove deletes it again if nothing else has been added to it.'} Nothing is committed.`
-          : `This removes only the marked brainmap block from ${where}. ${agents.removeDeletesFile
-              ? 'The app created this file and nothing else is in it, so the file is deleted.'
-              : agents.removeLeavesEmpty
-                ? 'The file existed before the block was added, so it is kept, even though it will be empty.'
-                : 'The rest of the file stays as it is.'} Nothing is committed.`}</div>
-        ${enable ? `<pre style="margin:0 0 7px; padding:7px 8px; background:#0b0e1c; border:1px solid rgba(100,120,200,0.15); border-radius:4px; font-size:10.5px;
-          line-height:1.45; color:#a8b4d4; white-space:pre-wrap; word-break:break-word; max-height:220px; overflow:auto">${esc(agents.block)}</pre>` : ''}
-        <div style="display:flex; gap:6px; align-items:center">
-          <button class="cm-agents-ok" style="${BTN}">${enable ? `Add to ${esc(agents.file)}` : `Remove from ${esc(agents.file)}`}</button>
+    const rows = files.map(f => {
+      if (f.action === 'shared') return `<div style="margin-top:6px"><b>${esc(f.name)}</b> is a link to ${esc(f.sharedWith)}, so it gets the block once, through that file.</div>`;
+      if (enable) return `<div style="margin-top:6px"><b>${esc(f.path)}</b> ${esc(ACTION_TEXT[f.action] || '')}${f.text ? pre(f.text) : ''}</div>`;
+      if (!f.enabled) return '';
+      return `<div style="margin-top:6px"><b>${esc(f.path)}</b>: the marked brainmap block is removed. ${f.removeDeletes
+        ? 'The app created this file and nothing else is in it, so the file is deleted.'
+        : f.removeLeavesEmpty ? 'The file existed before the block was added, so it is kept, even though it will be empty.'
+        : 'The rest of the file stays as it is.'}</div>`;
+    }).join('');
+    const changing = files.filter(f => ['create', 'add', 'update'].includes(f.action)).map(f => f.name);
+    const okLabel = enable ? `Write to ${changing.join(' and ')}` : `Remove from ${files.filter(f => f.enabled && f.action !== 'shared').map(f => f.name).join(' and ')}`;
+    box.innerHTML = `<div style="border:1px solid rgba(100,120,200,0.22); border-radius:6px; padding:8px 10px; font-size:11.5px; color:#c8d0e8;">
+        <div>${enable ? 'Claude Code reads CLAUDE.md by itself and other assistants read AGENTS.md, so the block goes into each.' : 'Only the marked block is taken out.'} Nothing is committed.</div>
+        ${rows}
+        <div style="display:flex; gap:6px; align-items:center; margin-top:8px">
+          <button class="cm-agents-ok" style="${BTN}">${esc(okLabel)}</button>
           <button class="cm-agents-cancel" style="${BTN2}">Cancel</button>
         </div></div>`;
     box.querySelector('.cm-agents-ok').addEventListener('click', () => (enable ? enableAgents() : removeAgents()));
     box.querySelector('.cm-agents-cancel').addEventListener('click', () => { agentsConfirm = null; renderAgents(); });
     return;
   }
+  const inFiles = files.filter(f => f.enabled && f.action !== 'shared').map(f => f.name);
   box.innerHTML = agents.enabled
     ? `<div style="${MUTED} display:flex; gap:8px; align-items:baseline; flex-wrap:wrap">
-        <span style="color:#6FE3D0">Enabled for assistants</span><span>in ${esc(agents.file)}</span>
+        <span style="color:${agents.upToDate ? '#6FE3D0' : '#e0a040'}">${agents.upToDate ? 'Enabled for assistants' : 'Assistants block needs an update'}</span>
+        <span>in ${esc(inFiles.join(' and '))}</span>
+        ${agents.upToDate ? '' : `<button class="cm-agents-enable" style="${LINK} font-size:11px">Update</button>`}
         <button class="cm-agents-remove" style="${LINK} font-size:11px; color:#8090b0">Remove</button></div>`
-    : `<button class="cm-agents-enable" style="${BTN2}" title="Adds a short block to the project's ${esc(agents.file)} that tells coding assistants to use the brainmap command">Enable for assistants</button>`;
+    : `<button class="cm-agents-enable" style="${BTN2}" title="Adds a short block to the project's CLAUDE.md and AGENTS.md that tells coding assistants to use the brainmap command">Enable for assistants</button>`;
   box.querySelector('.cm-agents-enable')?.addEventListener('click', () => askAgents('enable'));
   box.querySelector('.cm-agents-remove')?.addEventListener('click', () => askAgents('remove'));
 }
@@ -264,12 +279,13 @@ async function askAgents(kind) {
   renderAgents();
 }
 
+const VERB = { create: 'created', add: 'added to', update: 'updated in' };
 async function enableAgents() {
   try {
     const r = await api('POST', '/assistants', { expect: agents.expect });
     agentsConfirm = null;
     await loadAgents();
-    setMsg(r.already ? `Already enabled in ${r.file}.` : `${r.created ? 'Created' : 'Updated'} ${r.file} with the brainmap block.`, '#6FE3D0');
+    setMsg(r.files.length ? `Block ${r.files.map(f => `${VERB[f.action]} ${f.file}`).join(', ')}.` : 'Already up to date.', '#6FE3D0');
   } catch (e) { agentsConfirm = null; await loadAgents(); setMsg(e.message, '#c0503a'); }
 }
 
@@ -278,9 +294,7 @@ async function removeAgents() {
     const r = await api('DELETE', '/assistants', { expect: agents.expect });
     agentsConfirm = null;
     await loadAgents();
-    setMsg(r.already ? 'The block was already gone.'
-      : r.deleted ? `Removed the block and deleted ${r.file}, which the app had created.`
-      : r.leftEmpty ? `Removed the block; ${r.file} existed before, so it was kept (now empty).`
-      : `Removed the brainmap block from ${r.file}.`, '#6FE3D0');
+    setMsg(r.files.length ? r.files.map(f => (f.deleted ? `${f.file} deleted (the app had created it)`
+      : f.leftEmpty ? `block removed from ${f.file} (kept, now empty)` : `block removed from ${f.file}`)).join('; ') + '.' : 'The block was already gone.', '#6FE3D0');
   } catch (e) { agentsConfirm = null; await loadAgents(); setMsg(e.message, '#c0503a'); }
 }
