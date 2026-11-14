@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // brainmap: read-only answers about a mapped code project, for coding assistants. Reads
-// ~/.brain/maps/<slug>/map.json (schemaVersion 2); refreshes it first when the code changed (the same check
+// ~/.brain/maps/<slug>/map.json (schemaVersion 3); refreshes it first when the code changed (the same check
 // as the Brain app's "Map is current"). Prints paths, names and numbers only, never file contents.
 // No network, no model calls.
 import { stat } from 'fs/promises';
@@ -19,7 +19,7 @@ Usage: brainmap <command> [argument] [--all] [--project <name>] [--no-refresh]
   file <path>           exports, imports, importers, navigation, collections and functions of one file
   impact <path>         files that depend on it through imports, up to 3 steps away, grouped by depth
   screen <name>         a navigation screen: its file, where it navigates to and where it is reached from
-  collection <name>     files that read and write a Firestore collection
+  collection <name>     files that read and write a collection or subcollection (name or path, e.g. users/{uid}/workoutLogs)
   function <name>       a cloud function: where it is defined and who calls it
   find <text>           matches in file paths, exported names, screens and collections
   unused                files not imported from the entry file, screens with no incoming navigation found
@@ -97,7 +97,15 @@ Or name a project: brainmap overview --project <name>`);
   let folderOk = false;
   if (p.folder) { try { folderOk = (await stat(p.folder)).isDirectory(); } catch { } }
   let m;
-  try { m = await readMap(p.slug); } catch (e) { die(`${e.message}\nIn the Brain app, open the project and click "Re-map".`); }
+  try { m = await readMap(p.slug); } catch (e) {
+    // A map in an older format is replaced right away when the folder is available.
+    if (!e.outdated || !folderOk) die(`${e.message}\nIn the Brain app, open the project and click "Re-map".`);
+    const t0 = Date.now();
+    try { await runMapper(p.folder, p.slug, await gitAvailable()); m = await readMap(p.slug); }
+    catch (e2) { die(`The map is in an older format and could not be re-made (${e2.message}).\nIn the Brain app, open the project and click "Re-map".`); }
+    say(`Map refreshed: it was in an older format (${((Date.now() - t0) / 1000).toFixed(1)} s).`);
+    opts = { ...opts, refresh: false }; // just made from the current code
+  }
   if (!m) {
     die(p.folder
       ? `Project "${p.slug}" is linked to ${tilde(p.folder)} but has not been mapped yet.\nTo create the map: in the Brain app, open the project and click "Map project".`
@@ -143,7 +151,8 @@ function index(map) {
   }
   const screens = map.navigation?.screens || [];
   const collections = map.nodes.filter(n => n.kind === 'collection');
-  return { files, byPath, out, inn, screens, collections };
+  const subs = map.nodes.filter(n => n.kind === 'subcollection');
+  return { files, byPath, out, inn, screens, collections, subs };
 }
 
 const folderOf = f => (f.rootGroup !== 'app' ? f.rootGroup : f.topFolder === '(root)' ? '(root)' : f.topFolder);
@@ -191,8 +200,9 @@ function overview(P, ix) {
     say(`  ${String(f.importedBy || 0).padStart(3)}  ${f.path}`);
   }
   wrapList(`Screens (${ix.screens.length}): `, [...new Set(ix.screens.map(s => s.name))], Infinity);
-  wrapList(`Collections (${ix.collections.length}, used in app files): `, [...ix.collections].sort((a, b) => (b.readers + b.writers) - (a.readers + a.writers))
+  wrapList(`Collections (${ix.collections.length}, all folders): `, [...ix.collections].sort((a, b) => (b.readers + b.writers) - (a.readers + a.writers))
     .map(n => `${n.name} (${n.readers}r/${n.writers}w)`), Infinity);
+  if (ix.subs.length) wrapList(`Subcollections (${ix.subs.length}): `, ix.subs.map(n => n.pattern), 12);
   const called = map.functions?.names || {};
   wrapList(`Cloud functions (${fnNames.length}${Object.keys(called).length ? `, ${Object.keys(called).length} called from code` : ''}): `,
     fnNames.map(n => (called[n]?.callers?.length ? `${n} ←${called[n].callers.length}` : n)), Infinity);
@@ -237,9 +247,12 @@ function fileCmd(P, ix, q) {
   if (navTo.size) { say(`Navigates to ${plural(navTo.size, 'screen')}:`); items([...navTo].map(([k, es]) => `${k}${linesOf(es)}`)); }
   const navFrom = groupBy(inn.filter(e => e.kind === 'navigate'), e => e.from);
   if (navFrom.size) { say(`Navigated to from ${plural(navFrom.size, 'file')}:`); items([...navFrom].sort().map(([k, es]) => `${k} (${[...new Set(es.map(e => e.screen))].join(', ')})${linesOf(es)}`)); }
+  const subPattern = id => P.map.nodes.find(n => n.id === id)?.pattern ?? id.replace(/^subcollection:/, '');
   for (const kind of ['reads', 'writes']) {
     const es = out.filter(e => e.kind === kind);
-    if (es.length) wrapList(`${kind === 'reads' ? 'Reads' : 'Writes'}: `, es.map(e => `${e.to.replace(/^collection:/, '')} (${plural(e.count || 1, 'use')})`));
+    const top = es.filter(e => e.to.startsWith('collection:')), sub = es.filter(e => e.to.startsWith('subcollection:'));
+    if (top.length) wrapList(`${kind === 'reads' ? 'Reads' : 'Writes'}: `, top.map(e => `${e.to.slice(11)} (${plural(e.count || 1, 'use')})`), 15);
+    if (sub.length) wrapList(`  of which subcollections: `, sub.map(e => `${subPattern(e.to)} (${plural(e.count || 1, 'use')})`), 10);
   }
   const unknown = (P.map.data?.usesWithUnknownOperation || []).filter(u => u.file === f.path);
   if (unknown.length) wrapList('Firestore use, read or write unknown: ', unknown.map(u => `${u.collection} line ${u.line}`));
@@ -314,23 +327,77 @@ function screenCmd(P, ix, q) {
   if (!to.size) say('  none found');
 }
 
-function collectionCmd(P, ix, q) {
-  if (!q) die('Give a collection name, for example: brainmap collection users');
-  const col = ix.collections.find(c => c.name === q) || ix.collections.find(c => c.name.toLowerCase() === q.toLowerCase());
-  if (!col) die(`No collection "${q}". Collections: ${ix.collections.map(c => c.name).join(', ') || 'none found'}`);
-  const es = ix.inn.get(col.id) || [];
-  const unknown = (P.map.data?.usesWithUnknownOperation || []).filter(u => u.collection === col.name);
-  const unknownFiles = new Set(unknown.map(u => u.file)).size;
-  say(`Collection ${col.name}: read by ${plural(col.readers, 'file')}, written by ${plural(col.writers, 'file')}${unknown.length ? `; read or write unknown: ${plural(unknown.length, 'use')} in ${plural(unknownFiles, 'file')}` : ''}`);
-  wrapList(`Paths (${(col.paths || []).length}): `, col.paths || [], 12);
-  for (const kind of ['writes', 'reads']) {
-    const list = es.filter(e => e.kind === kind).sort((a, b) => a.from.localeCompare(b.from));
-    say(`${kind === 'writes' ? 'Written by' : 'Read by'} (${list.length}):`);
-    items(list.map(e => `${e.from}  ${plural(e.count || 1, 'use')}${linesOf([e])}${e.paths?.length ? `  ${e.paths.slice(0, 3).join(' ')}${e.paths.length > 3 ? ' …' : ''}` : ''}`), 15);
+// The folder a file is listed under: its own root (functions/, scripts/) or its top-level app folder.
+const folderLabel = f => (!f ? '?' : f.rootGroup !== 'app' ? `${f.rootGroup}/` : f.topFolder === '(root)' ? '(root files)' : `${f.topFolder}/`);
+
+// Lines grouped under folder headings, cut after `limit` lines in all with "(+N more, use --all)".
+function groupedByFolder(ix, rows, limit = 15) {
+  const by = groupBy(rows, r => folderLabel(ix.byPath.get(r.file)));
+  const rank = k => (k === 'functions/' || k === 'scripts/' ? 1 : 0); // app folders first, then the separate roots
+  const order = [...by.keys()].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+  let shown = 0;
+  for (const k of order) {
+    if (!ALL && shown >= limit) break;
+    const list = by.get(k).sort((x, y) => x.file.localeCompare(y.file));
+    say(`  ${k} (${list.length})`);
+    for (const r of list) { if (!ALL && shown >= limit) break; say(`    ${r.text}`); shown++; }
   }
-  if (unknown.length) { say(`Read or write unknown (${unknown.length}):`); items(unknown.map(u => `${u.file}:${u.line}  ${u.path || ''}`)); }
-  const others = (P.map.rootGroups || []).filter(g => g.name !== 'app').map(g => `${g.dir || g.name}/`);
-  if (others.length) say(`Note: Firestore use is mapped in app files only; ${others.join(' and ')} ${others.length === 1 ? 'is' : 'are'} not scanned for it.`);
+  if (shown < rows.length) say(`  (+${rows.length - shown} more, use --all)`);
+}
+
+// A path the user typed, as the mapper keys it: users/{uid}/workoutLogs/{id} -> users/{}/workoutLogs.
+function patternKey(q) {
+  const parts = q.split('/').filter(Boolean);
+  const col = parts.length % 2 === 0 ? parts.slice(0, -1) : parts;
+  return col.map((p, i) => (i % 2 ? '{}' : p)).join('/');
+}
+
+function collectionTargets(ix, q) {
+  const low = q.toLowerCase();
+  if (q.includes('/')) {
+    const key = patternKey(q);
+    return [...ix.collections.filter(c => c.name === key), ...ix.subs.filter(n => n.key === key || n.key.toLowerCase() === key.toLowerCase())];
+  }
+  let hits = [...ix.collections.filter(c => c.name === q), ...ix.subs.filter(n => n.name === q)];
+  if (!hits.length) hits = [...ix.collections.filter(c => c.name.toLowerCase() === low), ...ix.subs.filter(n => n.name.toLowerCase() === low)];
+  return hits;
+}
+
+function collectionCmd(P, ix, q) {
+  if (!q) die('Give a collection name, subcollection name or path, for example: brainmap collection users');
+  const hits = collectionTargets(ix, q);
+  if (!hits.length) {
+    const names = [...new Set([...ix.collections.map(c => c.name), ...ix.subs.map(n => n.pattern)])];
+    const near = names.filter(n => n.toLowerCase().includes(q.toLowerCase()));
+    die(`No collection or subcollection "${q}".${near.length ? ` Similar: ${near.slice(0, 15).join(', ')}` : ` Known: ${names.slice(0, 40).join(', ')}`}`);
+  }
+  const label = n => (n.kind === 'subcollection' ? n.pattern : n.name);
+  if (hits.length > 1) say(`"${q}" matches ${hits.length} patterns: ${hits.map(label).join(', ')}`);
+  const unknownAll = P.map.data?.usesWithUnknownOperation || [];
+  hits.forEach((n, i) => {
+    if (i) say('');
+    const sub = n.kind === 'subcollection';
+    const unknown = unknownAll.filter(u => (sub ? u.subcollection === n.key : u.collection === n.name));
+    const uf = new Set(unknown.map(u => u.file)).size;
+    say(`${sub ? 'Subcollection' : 'Collection'} ${label(n)}: read by ${plural(n.readers, 'file')}, written by ${plural(n.writers, 'file')}${unknown.length ? `; read or write unknown: ${plural(unknown.length, 'use')} in ${plural(uf, 'file')}` : ''}${n.collectionGroup ? ' (also queried as a collection group)' : ''}`);
+    if (!sub) {
+      const children = ix.subs.filter(x => x.parent === n.name);
+      if (children.length) wrapList(`Counts include its ${plural(children.length, 'subcollection')}: `, children.map(x => `${x.pattern} (${x.readers}r/${x.writers}w)`), 10);
+    }
+    wrapList(`Paths (${(n.paths || []).length}): `, n.paths || [], 8);
+    const es = ix.inn.get(n.id) || [];
+    for (const kind of ['writes', 'reads']) {
+      const list = es.filter(e => e.kind === kind);
+      say(`${kind === 'writes' ? 'Written by' : 'Read by'} ${plural(list.length, 'file')}${list.length ? ', by folder:' : ''}`);
+      groupedByFolder(ix, list.map(e => ({ file: e.from, text: `${e.from}  ${plural(e.count || 1, 'use')}${linesOf([e])}` })), hits.length > 1 ? 10 : 15);
+    }
+    if (unknown.length) {
+      say(`Read or write unknown (${unknown.length}), by folder:`);
+      groupedByFolder(ix, unknown.map(u => ({ file: u.file, text: `${u.file}:${u.line}  ${u.path || ''}` })), 10);
+    }
+  });
+  const partial = (P.map.unresolved || []).filter(u => u.kind === 'data' && u.path).length;
+  say(`Firestore use is mapped in every folder (app, functions/, scripts/).${partial ? ` ${plural(partial, 'path')} with a subcollection name the map could not work out ${partial === 1 ? 'is' : 'are'} counted as unresolved.` : ''}`);
 }
 
 function functionCmd(P, ix, q) {
@@ -355,12 +422,13 @@ function findCmd(P, ix, q) {
   const paths = ix.files.filter(f => f.path.toLowerCase().includes(low));
   const exp = ix.files.flatMap(f => (f.exports || []).filter(x => x.toLowerCase().includes(low)).map(x => `${x}  ${f.path}`));
   const scr = ix.screens.filter(s => s.name.toLowerCase().includes(low));
-  const cols = ix.collections.filter(c => c.name.toLowerCase().includes(low));
-  say(`"${q}": ${plural(paths.length, 'path')}, ${plural(exp.length, 'export')}, ${plural(scr.length, 'screen')}, ${plural(cols.length, 'collection')}`);
+  const cols = [...ix.collections.filter(c => c.name.toLowerCase().includes(low)).map(c => c.name),
+    ...ix.subs.filter(n => n.pattern.toLowerCase().includes(low)).map(n => n.pattern)];
+  say(`"${q}": ${plural(paths.length, 'path')}, ${plural(exp.length, 'export')}, ${plural(scr.length, 'screen')}, ${plural(cols.length, 'collection or subcollection', 'collections or subcollections')}`);
   if (paths.length) { say('Paths:'); items(paths.map(f => f.path)); }
   if (exp.length) { say('Exports:'); items(exp); }
   if (scr.length) { say('Screens:'); items(scr.map(s => `${s.name}  ${s.file || ''}`)); }
-  if (cols.length) wrapList('Collections: ', cols.map(c => c.name));
+  if (cols.length) wrapList('Collections: ', cols);
 }
 
 function unusedCmd(P, ix) {

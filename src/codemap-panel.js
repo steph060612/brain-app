@@ -2,6 +2,7 @@
 import { openCodeMap, closeCodeMap, isCodeMapOpen } from './codemap.js';
 
 let el = null, current = null, info = null, busy = false, linking = false;
+const autoRemapped = new Set();
 let agents = null, agentsConfirm = null; // assistants block preview; 'enable' | 'remove' while asking
 const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
@@ -46,6 +47,8 @@ async function refresh() {
     if (current?.slug !== slug) return;
     info = d;
     render();
+    // A map in an older format is re-made once, automatically, when the linked folder is there.
+    if (d.mapOutdated && d.folderExists && !busy && !autoRemapped.has(slug)) { autoRemapped.add(slug); runMap('The map was in an older format; re-mapping…'); return; }
     if (d.folder && d.map) loadStatus();
     if (d.folder && d.folderExists) loadAgents();
   } catch (e) {
@@ -157,10 +160,10 @@ function setBusy(on) {
   if (run && on) run.textContent = 'Mapping…';
 }
 
-async function runMap() {
+async function runMap(note) {
   const slug = current.slug;
   setBusy(true);
-  setMsg('Mapping the code folder (up to 60 seconds)…');
+  setMsg(typeof note === 'string' ? note : 'Mapping the code folder (up to 60 seconds)…');
   try {
     const d = await api('POST', '/map');
     busy = false;

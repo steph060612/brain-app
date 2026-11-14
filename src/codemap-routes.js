@@ -119,9 +119,9 @@ export function registerCodeMapRoutes(app, { gitAvailable }) {
       const folder = await linkedFolder(slug);
       let folderExists = false;
       if (folder) { try { folderExists = (await stat(folder)).isDirectory(); } catch { } }
-      let map = null, mapError = null;
-      try { const m = await readMap(slug); map = m && mapSummary(m.map); } catch (e) { mapError = e.message; }
-      res.json({ slug, folder, display: folder && tilde(folder), folderExists, map, mapError, running: running.has(slug) });
+      let map = null, mapError = null, mapOutdated = false;
+      try { const m = await readMap(slug); map = m && mapSummary(m.map); } catch (e) { mapError = e.message; mapOutdated = !!e.outdated; }
+      res.json({ slug, folder, display: folder && tilde(folder), folderExists, map, mapError, mapOutdated, running: running.has(slug) });
     } catch (e) { send(res, e); }
   });
 

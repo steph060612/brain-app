@@ -1,4 +1,4 @@
-// Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (schemaVersion 2).
+// Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (schemaVersion 3; subcollection nodes and their edges are not drawn).
 // Replaces the brain visual on the left while open. Canvas 2D with pre-rendered glow sprites, so it
 // stays smooth at around 1,000 nodes; d3-force is bundled by Vite, so nothing is fetched from outside.
 //
@@ -8,7 +8,7 @@
 import { forceSimulation, forceManyBody, forceLink, forceX, forceY, forceCollide } from 'd3-force';
 import { setBrainPaused } from './brain.js';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const BG = '#05070F';
 const PANEL_W = 380;
 let TOP = 96;             // below the toolbar; follows its height when it wraps

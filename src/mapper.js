@@ -13,10 +13,10 @@ import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { parse } from '@babel/parser';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const IMPORT_KINDS = ['import', 're-export', 'require', 'dynamic'];
 const KINDS = {
-  nodes: ['file', 'collection'],
+  nodes: ['file', 'collection', 'subcollection'],
   edges: [...IMPORT_KINDS, 'navigate', 'calls-function', 'reads', 'writes'],
   unresolved: ['load', 'navigate', 'function', 'data'],
 };
@@ -249,11 +249,13 @@ function analyze(ast) {
         break;
       case 'VariableDeclaration':
         for (const d of node.declarations) {
-          for (const id of patternIds(d.id)) declare(scope, id, d.id.type === 'Identifier' ? { kind: node.kind, init: d.init } : { kind: 'pattern' });
+          // `for (const x of list)`: remember the list, so x's possible values can be read from it.
+          const forOf = par?.type === 'ForOfStatement' && key === 'left' ? par.right : null;
+          for (const id of patternIds(d.id)) declare(scope, id, d.id.type === 'Identifier' ? { kind: node.kind, init: d.init, ...(forOf ? { forOf } : {}) } : { kind: 'pattern' });
         }
         break;
       case 'FunctionDeclaration': case 'ClassDeclaration':
-        if (node.id) declare(scope, node.id, { kind: 'function' });
+        if (node.id) declare(scope, node.id, { kind: 'function', fn: node });
         break;
       case 'CatchClause':
         for (const id of patternIds(node.param)) declare(inner, id, { kind: 'param' });
@@ -351,6 +353,10 @@ function stringValues(node, A, depth = 0) {
     case 'Identifier': {
       const b = A.lookup(node.name, node);
       if (!b || !['const', 'let', 'var'].includes(b.kind)) return null;
+      if (b.forOf) {
+        const arr = objectOf(b.forOf, A, depth + 1);
+        return arr?.type === 'ArrayExpression' && arr.elements.length ? union(...arr.elements.map((e) => stringValues(e, A, depth + 1))) : null;
+      }
       const parts = [];
       if (b.init) parts.push(stringValues(b.init, A, depth + 1));
       else if (b.kind === 'const') return null;
@@ -640,12 +646,43 @@ function isDbLike(node, A) {
   return false;
 }
 
-const segOf = (arg) => {
-  if (!arg) return { text: '{}', node: null };
-  const lit = literalValue(arg);
-  if (lit !== null) return { text: lit, node: arg };
-  if (arg.type === 'TemplateLiteral') return { text: arg.quasis.map((q) => q.value.cooked).join('{}'), node: arg };
-  return { text: '{}', node: arg };
+// A placeholder named after the expression that fills a path segment: uid, user.uid -> {uid}, else {id}.
+function placeholder(node) {
+  let n = node;
+  while (n && (n.type === 'TSNonNullExpression' || n.type === 'ParenthesizedExpression')) n = n.expression;
+  if (n?.type === 'Identifier') return `{${n.name}}`;
+  if (isMember(n) && !n.computed && n.property.type === 'Identifier') return `{${n.property.name}}`;
+  return '{id}';
+}
+const MAX_VARIANTS = 8;
+const cartesian = (a, b) => { const out = []; for (const x of a) for (const y of b) out.push(x + y); return out.slice(0, MAX_VARIANTS); };
+
+// The possible texts of one path argument: a literal, a template or '+' concatenation (with named
+// placeholders for the parts it cannot know), or the few string values a variable or conditional can hold.
+function segValues(node, A) {
+  if (!node) return { values: ['{id}'], inferred: false };
+  const lit = literalValue(node);
+  if (lit !== null) return { values: [lit], inferred: false };
+  if (node.type === 'TemplateLiteral') {
+    let vals = [''], inferred = false;
+    node.quasis.forEach((q, i) => {
+      vals = vals.map((v) => v + q.value.cooked);
+      if (i < node.expressions.length) { const e = segValues(node.expressions[i], A); inferred ||= e.inferred; vals = cartesian(vals, e.values); }
+    });
+    return { values: vals, inferred };
+  }
+  if (node.type === 'BinaryExpression' && node.operator === '+') {
+    const l = segValues(node.left, A), r = segValues(node.right, A);
+    return { values: cartesian(l.values, r.values), inferred: l.inferred || r.inferred };
+  }
+  const v = stringValues(node, A);
+  if (v?.length && v.length <= MAX_VARIANTS) return { values: v, inferred: true };
+  return { values: [placeholder(node)], inferred: false };
+}
+const segOf = (arg, A) => {
+  if (!arg) return { text: '{id}', values: ['{id}'], node: null };
+  const { values, inferred } = segValues(arg, A);
+  return { text: values[0], values, inferred, node: arg };
 };
 
 // The path segments a Firestore reference expression points at.
@@ -659,15 +696,20 @@ function refPath(node, A, depth = 0) {
   if (node.type === 'AwaitExpression') return null;
   if (!isCall(node)) return null;
   const fn = fsFn(node, FS_REF_FNS, A) ?? fsFn(node, FS_QUERY_FNS, A);
+  // A helper defined in this file that returns a reference, such as workoutLogsRef(uid).
+  if (!fn && node.callee.type === 'Identifier') {
+    const ret = returnedExpr(localFunction(node.callee, A));
+    if (ret) return refPath(ret, A, depth + 1);
+  }
   const args = node.arguments;
   if (fn === 'query') return refPath(args[0], A, depth + 1);
-  if (fn === 'collectionGroup') return { segs: [segOf(args[1])], group: true };
+  if (fn === 'collectionGroup') return { segs: [segOf(args[1], A)], group: true };
   if (fn === 'collection' || fn === 'doc') {
     if (!args.length) return null;
     const base = refPath(args[0], A, depth + 1);
-    const rest = args.slice(1).map(segOf);
+    const rest = args.slice(1).map((a) => segOf(a, A));
     if (base?.unresolved) return base;
-    if (base) return { segs: [...base.segs, ...(rest.length ? rest : [{ text: '{}', node: null }])] };
+    if (base) return { segs: [...base.segs, ...(rest.length ? rest : [segOf(null, A)])] };
     if (isDbLike(args[0], A) && rest.length) return { segs: rest };
     return { unresolved: true };
   }
@@ -677,15 +719,29 @@ function refPath(node, A, depth = 0) {
   if (prop === 'collection' || prop === 'collectionGroup') {
     const base = refPath(recv, A, depth + 1);
     if (base?.unresolved) return base;
-    if (base) return { segs: [...base.segs, segOf(args[0])] };
-    return isDbLike(recv, A) ? { segs: [segOf(args[0])], group: prop === 'collectionGroup' } : null;
+    if (base) return { segs: [...base.segs, segOf(args[0], A)] };
+    return isDbLike(recv, A) ? { segs: [segOf(args[0], A)], group: prop === 'collectionGroup' } : null;
   }
   if (prop === 'doc' || CHAIN_QUERY.has(prop)) {
     const base = refPath(recv, A, depth + 1);
     if (!base || base.unresolved) return base;
-    return prop === 'doc' ? { segs: [...base.segs, segOf(args[0])] } : base;
+    return prop === 'doc' ? { segs: [...base.segs, segOf(args[0], A)] } : base;
   }
   return null;
+}
+
+// The function a name refers to when it is declared in this file (function declaration or const arrow).
+function localFunction(id, A) {
+  const b = A.lookup(id.name, id);
+  if (b?.fn) return b.fn;
+  if (b?.kind === 'const' && b.init && (b.init.type === 'ArrowFunctionExpression' || b.init.type === 'FunctionExpression')) return b.init;
+  return null;
+}
+// What a function returns: an arrow's expression body, or the first top-level `return x;`.
+function returnedExpr(f) {
+  if (!f) return null;
+  if (f.body?.type !== 'BlockStatement') return f.body ?? null;
+  return f.body.body.find((st) => st.type === 'ReturnStatement' && st.argument)?.argument ?? null;
 }
 
 // Is this call a reference constructor (the start of a Firestore path)?
@@ -760,8 +816,14 @@ function opsFor(node, A, depth = 0, seen = new Set()) {
   return ['unknown'];
 }
 
+const isHole = (seg) => seg.includes('{');
+// One key per subcollection, whatever the document ids are called: users/{uid}/workoutLogs -> users/{}/workoutLogs.
+const subKey = (colParts) => colParts.map((p, i) => (i % 2 ? '{}' : p)).join('/');
+
+// Firestore references in one file. Each use names its top-level collection (as in schema 2) and, when the
+// path goes deeper, the subcollection pattern it reaches (a document path counts as its collection's).
 function collectData(A) {
-  const uses = [], unresolvedLines = [];
+  const uses = [], unresolvedLines = [], partial = [];
   for (const n of A.nodes()) {
     if (!isCall(n) || !isRefCtor(n, A)) continue;
     let ops = [...new Set(opsFor(n, A))];
@@ -771,21 +833,27 @@ function collectData(A) {
     const line = n.loc.start.line;
     const r = refPath(n, A);
     if (!r || r.unresolved || !r.segs.length) { unresolvedLines.push(line); continue; }
-    const pathText = r.segs.map((s) => s.text).join('/').split('/').filter(Boolean).join('/');
-    let tops, inferred = false;
-    const first = r.segs[0];
-    const head = first.text.split('/')[0];
-    if (head && !head.includes('{')) tops = [head];
-    else if (first.node && first.node.type !== 'TemplateLiteral') {
-      const v = stringValues(first.node, A);
-      if (v) { tops = [...new Set(v.map((x) => x.split('/')[0]).filter((x) => x && !x.includes('{')))]; inferred = true; }
+    // Every combination of the segments' possible values (a conditional subcollection name gives several).
+    let variants = [''];
+    for (const sg of r.segs) variants = cartesian(variants.map((v) => (v ? `${v}/` : v)), sg.values);
+    const inferred = r.segs.some((sg) => sg.inferred);
+    let any = false;
+    for (const raw of new Set(variants)) {
+      const parts = raw.split('/').filter(Boolean);
+      if (!parts.length || isHole(parts[0])) continue;
+      any = true;
+      const pathText = parts.join('/');
+      const colParts = r.group ? parts : parts.length % 2 === 0 ? parts.slice(0, -1) : parts;
+      let sub = null;
+      if (!r.group && colParts.length > 1) {
+        if (colParts.some((p, i) => i % 2 === 0 && isHole(p))) partial.push({ line, path: pathText });
+        else sub = { key: subKey(colParts), pattern: colParts.join('/') };
+      }
+      for (const op of ops) uses.push({ collection: parts[0], path: pathText, op, line, inferred, group: !!r.group, sub });
     }
-    if (!tops?.length) { unresolvedLines.push(line); continue; }
-    for (const collection of tops) {
-      for (const op of ops) if (op !== 'base') uses.push({ collection, path: inferred ? pathText.replace(/^[^/]*/, collection) : pathText, op, line, inferred, group: !!r.group });
-    }
+    if (!any) unresolvedLines.push(line);
   }
-  return { uses, unresolvedLines };
+  return { uses, unresolvedLines, partial };
 }
 
 // --- resolution ---------------------------------------------------------------
@@ -907,8 +975,12 @@ function main() {
 
     if (rel === functionsEntry) functionDefs = functionDefinitions(ast, rel, resolve);
 
+    // Firestore use is read in every root group (app, functions/, scripts/); the rest is app only.
+    const A = analyze(ast);
+    const data = collectData(A);
+    if (data.uses.length || data.unresolvedLines.length || data.partial.length) dataByFile.set(rel, data);
+
     if (node.rootGroup === 'app') {
-      const A = analyze(ast);
       const found = collectScreens(ast);
       if (found.length) {
         const b = bindings(ast.program);
@@ -926,8 +998,6 @@ function main() {
       if (calls.length) navCallsByFile.set(rel, calls);
       const callables = collectCallables(A);
       if (callables.length) callablesByFile.set(rel, callables);
-      const data = collectData(A);
-      if (data.uses.length || data.unresolvedLines.length) dataByFile.set(rel, data);
     }
   }
 
@@ -991,28 +1061,69 @@ function main() {
   }
   fnStats.exported = [...functionDefs.keys()];
 
-  // --- Firestore: collection nodes and reads / writes edges (one per file, collection and kind)
-  const dataEdges = new Map(), collections = new Map(), dataOpUnknown = [];
+  // --- Firestore: collection and subcollection nodes, reads / writes edges (one per file, target and kind).
+  // Top-level collection nodes count every use under them, subcollections included (as in schema 2);
+  // subcollection nodes are one per path pattern. Each edge says which root group and folder its file is in.
+  const fileByPath = new Map(nodes.map((n) => [n.path, n]));
+  const dataEdges = new Map(), collections = new Map(), subs = new Map(), dataOpUnknown = [];
+  const newTarget = () => ({ readers: new Set(), writers: new Set(), unknown: new Set(), paths: new Set(), group: false });
+  const addEdge = (from, to, u) => {
+    const key = `${from}\0${to}\0${u.op}`;
+    const f = fileByPath.get(from);
+    const e = dataEdges.get(key) ?? dataEdges.set(key, { from, to, kind: u.op, count: 0, lines: [], paths: [], group: f.rootGroup, folder: f.topFolder }).get(key);
+    e.count++;
+    if (!e.lines.includes(u.line)) e.lines.push(u.line);
+    if (!e.paths.includes(u.path)) e.paths.push(u.path);
+    if (u.inferred) e.inferred = true;
+  };
   for (const [from, data] of dataByFile) {
     for (const line of data.unresolvedLines) unresolved.push({ file: from, line, kind: 'data' });
+    const seenPartial = new Set();
+    for (const p of data.partial) {
+      if (seenPartial.has(`${p.line}\0${p.path}`)) continue;
+      seenPartial.add(`${p.line}\0${p.path}`);
+      unresolved.push({ file: from, line: p.line, kind: 'data', path: p.path, reason: 'subcollection name not resolved' });
+    }
     for (const u of data.uses) {
-      const col = collections.get(u.collection) ?? collections.set(u.collection, { readers: new Set(), writers: new Set(), unknown: new Set(), paths: new Set(), group: false }).get(u.collection);
+      const col = collections.get(u.collection) ?? collections.set(u.collection, newTarget()).get(u.collection);
       col.paths.add(u.path);
       if (u.group) col.group = true;
-      if (u.op === 'unknown') { col.unknown.add(from); dataOpUnknown.push({ file: from, line: u.line, collection: u.collection, path: u.path }); continue; }
+      let sub = null;
+      if (u.sub) {
+        sub = subs.get(u.sub.key) ?? subs.set(u.sub.key, { ...newTarget(), parent: u.collection, patterns: new Map() }).get(u.sub.key);
+        sub.paths.add(u.path);
+        sub.patterns.set(u.sub.pattern, (sub.patterns.get(u.sub.pattern) || 0) + 1);
+      }
+      if (u.op === 'unknown') {
+        col.unknown.add(from); sub?.unknown.add(from);
+        dataOpUnknown.push({ file: from, line: u.line, collection: u.collection, path: u.path, ...(u.sub ? { subcollection: u.sub.key } : {}) });
+        continue;
+      }
       (u.op === 'reads' ? col.readers : col.writers).add(from);
-      const key = `${from}\0${u.collection}\0${u.op}`;
-      const e = dataEdges.get(key) ?? dataEdges.set(key, { from, to: `collection:${u.collection}`, kind: u.op, count: 0, lines: [], paths: [] }).get(key);
-      e.count++;
-      if (!e.lines.includes(u.line)) e.lines.push(u.line);
-      if (!e.paths.includes(u.path)) e.paths.push(u.path);
-      if (u.inferred) e.inferred = true;
+      addEdge(from, `collection:${u.collection}`, u);
+      if (sub) { (u.op === 'reads' ? sub.readers : sub.writers).add(from); addEdge(from, `subcollection:${u.sub.key}`, u); }
     }
   }
   edges.push(...dataEdges.values());
   for (const [name, c] of [...collections].sort((a, b) => a[0].localeCompare(b[0]))) {
     nodes.push({ id: `collection:${name}`, kind: 'collection', name, readers: c.readers.size, writers: c.writers.size,
       usedWithUnknownOperation: c.unknown.size, paths: [...c.paths].sort(), ...(c.group ? { collectionGroup: true } : {}) });
+  }
+  // The pattern shown for a subcollection: at each document position, the placeholder name used most often.
+  const displayPattern = (key, patterns) => {
+    const parts = key.split('/');
+    return parts.map((p, i) => {
+      if (p !== '{}') return p;
+      const counts = new Map();
+      for (const [pat, n] of patterns) { const seg = pat.split('/')[i]; counts.set(seg, (counts.get(seg) || 0) + n); }
+      return [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0][0];
+    }).join('/');
+  };
+  for (const [key, c] of [...subs].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const parts = key.split('/');
+    nodes.push({ id: `subcollection:${key}`, kind: 'subcollection', name: parts[parts.length - 1], key,
+      pattern: displayPattern(key, c.patterns), parent: c.parent, depth: (parts.length - 1) / 2,
+      readers: c.readers.size, writers: c.writers.size, usedWithUnknownOperation: c.unknown.size, paths: [...c.paths].sort() });
   }
 
   // --- reachability over import edges only
@@ -1059,7 +1170,7 @@ function main() {
       unresolved: unresolved.length, unresolvedByKind: countBy(unresolved, (u) => u.kind),
       missingRelative: missing.length, assets: assetTotals.total, parseFailures: parseFailures.length,
       screens: screens.length, navigationCalls: navStats.calls, functionCalls: fnStats.calls,
-      collections: collections.size, dataUsesWithUnknownOperation: dataOpUnknown.length,
+      collections: collections.size, subcollections: subs.size, dataUsesWithUnknownOperation: dataOpUnknown.length,
     },
     nodes, edges, unresolved, missingRelative: missing, assetTotals, parseFailures,
     navigation: { screens, ...navStats },
@@ -1107,9 +1218,11 @@ function main() {
       console.log(`  ${n.name}: ${n.readers} / ${n.writers} / ${n.usedWithUnknownOperation}${n.collectionGroup ? ' (collection group)' : ''}`);
     }
     const touch = new Map();
-    for (const e of edges) if (e.kind === 'reads' || e.kind === 'writes') (touch.get(e.from) ?? touch.set(e.from, new Set()).get(e.from)).add(e.to);
+    for (const e of edges) if ((e.kind === 'reads' || e.kind === 'writes') && e.to.startsWith('collection:')) (touch.get(e.from) ?? touch.set(e.from, new Set()).get(e.from)).add(e.to);
     console.log('Files touching the most collections:');
     for (const [f, s] of [...touch].sort((a, b) => b[1].size - a[1].size || a[0].localeCompare(b[0])).slice(0, 10)) console.log(`  ${s.size}  ${f}`);
+    console.log(`Subcollections: ${subs.size} (readers / writers / used with unknown operation)`);
+    for (const n of nodes.filter((x) => x.kind === 'subcollection')) console.log(`  ${n.pattern}: ${n.readers} / ${n.writers} / ${n.usedWithUnknownOperation}`);
     console.log(`Data uses with unknown read/write: ${dataOpUnknown.length}; unresolved data paths: ${map.counts.unresolvedByKind.data ?? 0}`);
   }
   console.log(`Parse failures: ${parseFailures.length}`);

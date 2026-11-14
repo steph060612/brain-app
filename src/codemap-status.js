@@ -13,7 +13,7 @@ export const DOT   = join(HOME, '.brain');
 export const LINKS = join(DOT, 'code-folders.json');
 export const MAPS  = join(DOT, 'maps');
 export const BRAIN = join(HOME, 'Brain');
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 export const MAP_TIMEOUT_MS = 60_000;
 const MAPPER = join(dirname(fileURLToPath(import.meta.url)), 'mapper.js');
 
@@ -38,7 +38,10 @@ export async function readMap(slug) {
   let map;
   try { map = JSON.parse(text); } catch { throw fail(422, 'The saved map could not be read. Re-map the project.'); }
   if (map?.schemaVersion !== SCHEMA_VERSION) {
-    throw fail(422, `This map uses schema version ${map?.schemaVersion ?? 'unknown'}; this app reads only version ${SCHEMA_VERSION}. Re-map the project to replace it.`);
+    // An older map is replaced automatically (brainmap and the panel re-map when they see `outdated`).
+    const e = fail(422, `This map uses schema version ${map?.schemaVersion ?? 'unknown'}; this app reads only version ${SCHEMA_VERSION}. Re-map the project to replace it.`);
+    e.outdated = typeof map?.schemaVersion === 'number' && map.schemaVersion < SCHEMA_VERSION;
+    throw e;
   }
   return { text, map };
 }
