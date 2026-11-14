@@ -23,6 +23,7 @@ const LAYERS = [
   { id: 'calls-function', label: 'Cloud functions', kinds: ['calls-function'], color: '#FFB84D', on: false },
   { id: 'reads',          label: 'Reads',          kinds: ['reads'],          color: '#4DFFC3', on: false },
   { id: 'writes',         label: 'Writes',         kinds: ['writes'],         color: '#FF7A59', on: false },
+  { id: 'calls',          label: 'Calls',          kinds: ['calls'],          color: '#C3A6FF', on: false },
 ];
 const LAYER_OF = Object.fromEntries(LAYERS.flatMap(l => l.kinds.map(k => [k, l.id])));
 const LAYER_BY_ID = Object.fromEntries(LAYERS.map(l => [l.id, l]));
@@ -31,6 +32,7 @@ const LAYER_BY_ID = Object.fromEntries(LAYERS.map(l => [l.id, l]));
 const FOLDER_PALETTE = ['#4F8DFF', '#FF9F43', '#3DDC84', '#D36BFF', '#3FD5E8', '#FF5C5C', '#E8E04A', '#8C7CFF', '#A5E86B', '#FF6FB5'];
 const OTHER_COLOR = '#7D8597';
 const COLLECTION_COLOR = '#4DFFC3';
+const SUBCOLLECTION_COLOR = '#A8FFE6';
 
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const base = p => p.split('/').pop();
@@ -46,7 +48,7 @@ let mode = 'folders', expanded = new Set();
 let sim = null, view = { x: 0, y: 0, k: 1 }, dpr = 1, width = 0, height = 0;
 let layerOn = {};
 let hovered = null, selected = null, neighbors = new Set(), searchHits = new Set(), searchMatches = [], searchQuery = '';
-let lastLabels = [];
+let lastLabels = [], tethers = [];
 let dirty = true, raf = 0, panelOpen = true, legendOpen = null;
 const sprites = new Map();
 
@@ -76,7 +78,7 @@ export async function openCodeMap(proj, { onBack } = {}) {
   dirty = true;
   loop();
   // Dev server only (stripped from the build): lets a test script find nodes on screen.
-  if (import.meta.env?.DEV) window.__codemapDebug = { nodes: () => nodes, view: () => view, visible: nodeVisible, drawEdges: () => drawEdges, labels: () => lastLabels, mode: () => mode, expanded: () => expanded };
+  if (import.meta.env?.DEV) window.__codemapDebug = { nodes: () => nodes, view: () => view, visible: nodeVisible, drawEdges: () => drawEdges, labels: () => lastLabels, mode: () => mode, expanded: () => expanded, selectById };
 }
 
 export function closeCodeMap() {
@@ -223,8 +225,13 @@ function prepare() {
   rankedFolders.sort((a, b) => fileCount.get(b.key) - fileCount.get(a.key) || a.label.localeCompare(b.label));
   rankedFolders.forEach((F, i) => { F.colored = i < FOLDER_PALETTE.length; F.color = F.colored ? FOLDER_PALETTE[i] : OTHER_COLOR; });
 
-  const fileNodes = [], colNodes = [];
+  const fileNodes = [], colNodes = [], subNodes = [];
   for (const n of map.nodes) {
+    if (n.kind === 'subcollection') {
+      subNodes.push({ id: n.id, kind: 'subcollection', raw: n, key: 'collection', color: SUBCOLLECTION_COLOR,
+        r: Math.min(7.5, 3.2 + Math.sqrt((n.readers || 0) + (n.writers || 0)) * 0.9), label: n.name, x: 0, y: 0 });
+      continue;
+    }
     if (n.kind === 'collection') {
       colNodes.push({ id: n.id, kind: 'collection', raw: n, key: 'collection', color: COLLECTION_COLOR,
         r: Math.min(11, 5 + Math.sqrt((n.readers || 0) + (n.writers || 0)) * 1.2), label: n.name, x: 0, y: 0 });
@@ -242,8 +249,18 @@ function prepare() {
       r: 7 + Math.sqrt(F.files.length) * 3.4, label: F.label, x: 0, y: 0 };
     return F.bubble;
   });
-  nodes = [...bubbles, ...fileNodes, ...colNodes];
+  nodes = [...bubbles, ...fileNodes, ...colNodes, ...subNodes];
   byId = new Map(nodes.map(n => [n.id, n]));
+  // A subcollection hangs off its nearest mapped ancestor: users/{}/myWorkouts/{}/sessions off
+  // users/{}/myWorkouts when that is mapped, otherwise off the top-level collection (users).
+  for (const sub of subNodes) {
+    const parts = sub.raw.key.split('/');
+    let parent = null;
+    for (let n = parts.length - 2; n >= 1 && !parent; n -= 2) parent = byId.get(`subcollection:${parts.slice(0, n).join('/')}`) ?? null;
+    sub.parent = parent ?? byId.get(`collection:${sub.raw.parent}`) ?? null;
+  }
+  const subsWithParent = subNodes.filter(n => n.parent);
+  for (const sub of subsWithParent) sub.parent.subCount = (sub.parent.subCount || 0) + 1; // longer tethers when crowded
 
   edges = map.edges.filter(e => byId.has(e.from) && byId.has(e.to)).map(e => ({ ...e, layer: LAYER_OF[e.kind] })).filter(e => e.layer);
 
@@ -251,6 +268,9 @@ function prepare() {
   spiralAnchors(fileNodes.concat(colNodes), 70 + Math.sqrt(fileNodes.length + colNodes.length) * 4, (n, a) => { n.fax = a.x; n.fay = a.y; });
   // Folders view anchors: one per bubble (already in size order), collections share one.
   spiralAnchors(bubbles.concat(colNodes), 120, (n, a) => { n.bax = a.x; n.bay = a.y; });
+  // Subcollections share their top-level collection's anchor; the tether link keeps them next to the parent.
+  const topOf = n => (n.kind === 'subcollection' && n.parent ? topOf(n.parent) : n);
+  for (const sub of subsWithParent) { const t = topOf(sub); sub.fax = t.fax; sub.fay = t.fay; sub.bax = t.bax; sub.bay = t.bay; }
   for (const n of nodes) {
     const [ax, ay] = n.kind === 'file' ? [n.fax, n.fay] : [n.bax, n.bay];
     n.x = ax + (Math.random() - 0.5) * 60; n.y = ay + (Math.random() - 0.5) * 60;
@@ -279,6 +299,8 @@ function applyAnchors() {
 
 function nodeVisible(n) {
   if (n.kind === 'collection') return !!(layerOn.reads || layerOn.writes);
+  // In the folder overview a subcollection is folded into its parent collection (whose counts include it).
+  if (n.kind === 'subcollection') return !!(layerOn.reads || layerOn.writes) && !!n.parent && mode === 'files';
   if (n.kind === 'folder') return mode === 'folders' && !expanded.has(n.folder);
   return mode === 'files' || expanded.has(n.folder);
 }
@@ -297,11 +319,13 @@ function rebuildEdges() {
     const s = repOf(byId.get(e.from)), t = repOf(byId.get(e.to));
     if (s === t) continue;
     const key = `${e.layer}|${s.id}|${t.id}`;
-    const m = merged.get(key);
-    if (m) m.count++;
-    else merged.set(key, { layer: e.layer, source: s, target: t, count: 1 });
+    const m = merged.get(key) ?? merged.set(key, { layer: e.layer, source: s, target: t, count: 0, value: 0 }).get(key);
+    m.count++;
+    if (e.via === 'value') m.value++;
   }
   drawEdges = [...merged.values()].filter(e => nodeVisible(e.source) && nodeVisible(e.target));
+  for (const e of drawEdges) e.dashed = e.value > 0 && e.value === e.count; // only calls through a value passed on
+  tethers = nodes.filter(n => n.kind === 'subcollection' && nodeVisible(n) && nodeVisible(n.parent)).map(n => ({ source: n, target: n.parent, tether: true }));
   degree = new Map();
   for (const e of drawEdges) {
     degree.set(e.source, (degree.get(e.source) || 0) + e.count);
@@ -324,15 +348,15 @@ function layout({ warm = false, refit = false } = {}) {
     const p = pairs.get(k);
     if (p) p.count += e.count; else pairs.set(k, { source: e.source, target: e.target, count: e.count });
   }
-  const links = [...pairs.values()];
+  const links = [...pairs.values(), ...tethers];
   if (!sim) sim = forceSimulation().stop().alphaDecay(0.03);
   sim.nodes(visible)
     .force('charge', forceManyBody()
-      .strength(n => (n.kind === 'folder' ? -(120 + n.r * 5) : n.kind === 'collection' ? -140 : -38))
+      .strength(n => (n.kind === 'folder' ? -(120 + n.r * 5) : n.kind === 'collection' ? -140 : n.kind === 'subcollection' ? -45 : -38))
       .distanceMax(mode === 'folders' ? 500 : 420).theta(0.9))
     .force('link', forceLink(links)
-      .distance(l => (isBubbleEdge(l) ? l.source.r + l.target.r + 45 : 34))
-      .strength(l => (isBubbleEdge(l) ? Math.min(0.12, 0.03 + 0.012 * Math.log2(1 + l.count)) : 0.35)))
+      .distance(l => (l.tether ? l.source.r + l.target.r + 12 + 1.8 * (l.target.subCount || 0) : isBubbleEdge(l) ? l.source.r + l.target.r + 45 : 34))
+      .strength(l => (l.tether ? 0.9 : isBubbleEdge(l) ? Math.min(0.12, 0.03 + 0.012 * Math.log2(1 + l.count)) : 0.35)))
     .force('x', forceX(n => n.ax).strength(anchorStrength))
     .force('y', forceY(n => n.ay).strength(anchorStrength))
     .force('collide', forceCollide(n => (n.kind === 'folder' ? n.r + 10 : n.r + 1.5)).iterations(mode === 'folders' ? 2 : 1));
@@ -467,29 +491,45 @@ function draw() {
     ctx.beginPath();
     let any = false;
     for (const e of drawEdges) {
-      if (e.layer !== L.id || touchesSel(e) || isBubbleEdge(e)) continue;
+      if (e.layer !== L.id || touchesSel(e) || isBubbleEdge(e) || e.dashed) continue;
       ctx.moveTo(e.source.x, e.source.y); ctx.lineTo(e.target.x, e.target.y); any = true;
     }
-    if (!any) continue;
     ctx.strokeStyle = hexA(L.color, focus ? 0.05 : 0.2);
     ctx.lineWidth = 0.9 / k;
-    ctx.stroke();
+    if (any) ctx.stroke();
+    // Calls made through a function handed over as a value: dashed.
+    ctx.beginPath(); any = false;
+    for (const e of drawEdges) {
+      if (e.layer !== L.id || touchesSel(e) || isBubbleEdge(e) || !e.dashed) continue;
+      ctx.moveTo(e.source.x, e.source.y); ctx.lineTo(e.target.x, e.target.y); any = true;
+    }
+    if (any) { ctx.strokeStyle = hexA(L.color, focus ? 0.08 : 0.4); ctx.setLineDash([4 / k, 3 / k]); ctx.stroke(); ctx.setLineDash([]); }
+  }
+  // Subcollections: a short tether to the collection they belong to.
+  if (tethers.length) {
+    ctx.beginPath();
+    for (const t of tethers) { ctx.moveTo(t.source.x, t.source.y); ctx.lineTo(t.target.x, t.target.y); }
+    ctx.strokeStyle = hexA(SUBCOLLECTION_COLOR, focus ? 0.15 : 0.45); ctx.lineWidth = 1 / k; ctx.setLineDash([2 / k, 2 / k]); ctx.stroke(); ctx.setLineDash([]);
   }
   for (const e of drawEdges) {
     if (!isBubbleEdge(e) || touchesSel(e)) continue;
     ctx.strokeStyle = hexA(LAYER_BY_ID[e.layer].color, focus ? 0.06 : 0.3);
+    if (e.dashed) ctx.setLineDash([5 / k, 4 / k]);
     strokeOffset(e, edgeWidth(e.count), onLayers.indexOf(e.layer));
+    ctx.setLineDash([]);
   }
   if (selected) {
     for (const e of drawEdges) {
       if (!touchesSel(e)) continue;
       const L = LAYER_BY_ID[e.layer];
       ctx.strokeStyle = hexA(L.color, 0.9);
+      if (e.dashed) ctx.setLineDash([5 / k, 4 / k]);
       if (isBubbleEdge(e)) strokeOffset(e, edgeWidth(e.count) + 0.6, onLayers.indexOf(e.layer));
       else {
         ctx.lineWidth = (1.3 + Math.min(2, Math.log2(e.count))) / k;
         ctx.beginPath(); ctx.moveTo(e.source.x, e.source.y); ctx.lineTo(e.target.x, e.target.y); ctx.stroke();
       }
+      ctx.setLineDash([]);
       arrow(e, L.color);
     }
   }
@@ -509,6 +549,13 @@ function draw() {
     } else {
       const R = n.r * (n === hovered || n === selected ? 4.6 : 3.6);
       ctx.drawImage(sprite(n.color), n.x - R, n.y - R, R * 2, R * 2);
+    }
+    if (n.kind === 'subcollection') {
+      const s = n.r * 1.2;
+      ctx.beginPath();
+      ctx.moveTo(n.x, n.y - s); ctx.lineTo(n.x + s, n.y); ctx.lineTo(n.x, n.y + s); ctx.lineTo(n.x - s, n.y); ctx.closePath();
+      ctx.fillStyle = hexA(n.color, 0.12); ctx.fill();
+      ctx.strokeStyle = n.color; ctx.lineWidth = 1.1 / k; ctx.stroke();
     }
     if (n.kind === 'collection') {
       const s = n.r * 1.25;
@@ -550,12 +597,24 @@ function labelCandidates() {
   if (selected) {
     list.push(selected);
     const ns = [...neighbors];
-    list.push(...ns.filter(n => n.kind === 'collection').sort(byDegree));
-    list.push(...ns.filter(n => n.kind !== 'collection').sort(byDegree).slice(0, MAX_NEIGHBOR_LABELS));
+    const isData = n => n.kind === 'collection' || n.kind === 'subcollection';
+    // A selected collection labels the subcollections tethered to it (and a subcollection its parent and children).
+    if (isData(selected)) {
+      for (let p = selected.parent; p; p = p.parent) if (nodeVisible(p)) list.push(p);   // the chain up to the collection
+      const kids = t => tethers.filter(x => x.target === t).map(x => x.source);
+      const children = kids(selected);
+      list.push(...children, ...children.flatMap(kids));                                 // subcollections, then theirs
+    }
+    list.push(...ns.filter(isData).sort(byDegree));
+    list.push(...ns.filter(n => !isData(n)).sort(byDegree).slice(0, MAX_NEIGHBOR_LABELS));
   } else if (searchHits.size) {
     list.push(...[...searchHits].sort(byDegree).slice(0, 40));
   } else {
-    list.push(...nodes.filter(n => n.kind !== 'collection' && nodeVisible(n) && degree.get(n)).sort(byDegree).slice(0, DEFAULT_LABELS));
+    const plain = nodes.filter(n => n.kind !== 'collection' && n.kind !== 'subcollection' && nodeVisible(n));
+    const linked = plain.filter(n => degree.get(n));
+    // With every layer off nothing is linked: the same number of labels goes to the largest nodes instead.
+    const size = n => (n.kind === 'folder' ? n.F.files.length * 1000 : n.raw?.lines || 0);
+    list.push(...(linked.length ? linked.sort(byDegree) : plain.sort((a, b) => size(b) - size(a) || a.label.localeCompare(b.label))).slice(0, DEFAULT_LABELS));
   }
   return list;
 }
@@ -591,7 +650,7 @@ function drawLabels() {
     ctx.lineWidth = 3.5;
     ctx.strokeStyle = 'rgba(3,5,12,0.92)';
     ctx.strokeText(q.text, q.x, q.y);
-    ctx.fillStyle = q.big ? '#ffffff' : q.n.kind === 'collection' ? '#bfffe9' : 'rgba(215,222,242,0.92)';
+    ctx.fillStyle = q.big ? '#ffffff' : q.n.kind === 'collection' || q.n.kind === 'subcollection' ? '#bfffe9' : 'rgba(215,222,242,0.92)';
     ctx.fillText(q.text, q.x, q.y);
   }
 }
@@ -614,6 +673,40 @@ function hit(sx, sy) {
     if (d < n.r + 5 / view.k && d - n.r < bestD) { best = n; bestD = d - n.r; }
   }
   return best;
+}
+
+// The drawn edge under the pointer (within a few pixels), for its tooltip.
+function hitEdge(sx, sy) {
+  const [wx, wy] = toWorld(sx, sy), tol = 4 / view.k;
+  let best = null, bestD = tol;
+  for (const e of drawEdges) {
+    const { source: a, target: b } = e;
+    const dx = b.x - a.x, dy = b.y - a.y, len2 = dx * dx + dy * dy;
+    if (!len2) continue;
+    const t = Math.max(0, Math.min(1, ((wx - a.x) * dx + (wy - a.y) * dy) / len2));
+    const d = Math.hypot(wx - (a.x + t * dx), wy - (a.y + t * dy));
+    if (d < bestD) { best = e; bestD = d; }
+  }
+  return best;
+}
+
+const nodeName = n => (n.kind === 'file' ? n.raw.path : n.kind === 'subcollection' ? n.raw.pattern : n.kind === 'collection' ? `◆ ${n.raw.name}` : n.label);
+
+// Every visible layer between the two nodes of the edge under the pointer (lines of different layers overlap).
+function showEdgeTooltip(e, x, y) {
+  const same = drawEdges.filter(d => (d.source === e.source && d.target === e.target) || (d.source === e.target && d.target === e.source));
+  same.sort((a, b) => LAYERS.findIndex(l => l.id === a.layer) - LAYERS.findIndex(l => l.id === b.layer));
+  tooltip.innerHTML = same.map(d => {
+    const L = LAYER_BY_ID[d.layer];
+    const what = d.layer === 'calls'
+      ? `${plural(d.count, 'call')}${d.value ? ` (${d.value} through a function passed as a value)` : ''}`
+      : plural(d.count, 'link');
+    return `<div><span style="color:${L.color}">●</span> ${esc(L.label)}: ${esc(what)} <span style="color:#8090b0;word-break:break-all">${esc(nodeName(d.source))} → ${esc(nodeName(d.target))}</span></div>`;
+  }).join('');
+  tooltip.style.display = 'block';
+  const tw = tooltip.offsetWidth, th = tooltip.offsetHeight;
+  tooltip.style.left = `${Math.max(8, Math.min(x + 16, width - tw - 8))}px`;
+  tooltip.style.top = `${Math.max(8, Math.min(y + 16, height - th - 8))}px`;
 }
 
 function bindPointer() {
@@ -641,7 +734,8 @@ function bindPointer() {
     const n = hit(e.offsetX, e.offsetY);
     if (n !== hovered) { hovered = n; dirty = true; }
     canvas.style.cursor = n ? 'pointer' : 'grab';
-    if (n) showTooltip(n, e.offsetX, e.offsetY); else hideTooltip();
+    if (n) showTooltip(n, e.offsetX, e.offsetY);
+    else { const ed = hitEdge(e.offsetX, e.offsetY); if (ed) showEdgeTooltip(ed, e.offsetX, e.offsetY); else hideTooltip(); }
   });
   const end = () => {
     if (!drag) return;
@@ -671,6 +765,8 @@ function bindPointer() {
 function neighborsOf(n) {
   const s = new Set();
   for (const e of drawEdges) { if (e.source === n) s.add(e.target); else if (e.target === n) s.add(e.source); }
+  // A collection and its subcollections belong together: tethered nodes count as connected.
+  for (const t of tethers) { if (t.source === n) s.add(t.target); else if (t.target === n) s.add(t.source); }
   return s;
 }
 
@@ -679,8 +775,12 @@ function select(n, { center = false } = {}) {
   neighbors = selected ? neighborsOf(selected) : new Set();
   if (selected && center) {
     const k = Math.max(view.k, 1.3);
-    const left = SIDE_W + 30, right = width > 3 * SIDE_W ? SIDE_W + 30 : 0;
-    const cx = left + (width - left - right) / 2, cy = TOP + (height - TOP) / 2;
+    // Centre in the free area beside the selection card (top right); keep clear of the findings column too
+    // when that still leaves room, which it may not next to the half-width panel.
+    let left = SIDE_W + 30;
+    const right = SIDE_W + 30;
+    if (width - left - right < 220) left = 0;
+    const cx = left + Math.max(0, width - left - right) / 2, cy = TOP + (height - TOP) / 2;
     view = { k, x: cx - selected.x * k, y: cy - selected.y * k };
   }
   for (const el of findingsEl.querySelectorAll('.cm-item')) el.classList.toggle('cm-active', !!selected && el.dataset.id === selected.id);
@@ -691,7 +791,8 @@ function select(n, { center = false } = {}) {
 function selectById(id) {
   const n = byId.get(id);
   if (!n) return;
-  if (n.kind === 'collection' && !nodeVisible(n)) { layerOn.reads = true; layout(); renderToolbar(); renderLegend(); }
+  if ((n.kind === 'collection' || n.kind === 'subcollection') && !(layerOn.reads || layerOn.writes)) { layerOn.reads = true; layout(); renderToolbar(); renderLegend(); }
+  if (n.kind === 'subcollection' && mode === 'folders') setMode('files');
   if (n.kind === 'file' && !nodeVisible(n)) expandFolder(n.folder);
   if (!nodeVisible(n)) return;
   select(n, { center: true });
@@ -705,6 +806,7 @@ function linkSummary(n) {
   const per = {};
   for (const e of edges) {
     if (e.from !== n.id && e.to !== n.id) continue;
+    if (byId.get(e.to)?.kind === 'subcollection') continue; // already counted in its top-level collection
     const p = per[e.layer] ||= { outLinks: 0, out: new Set(), inLinks: 0, in: new Set() };
     if (e.from === n.id) { p.outLinks++; p.out.add(e.to); }
     if (e.to === n.id) { p.inLinks++; p.in.add(e.from); }
@@ -743,8 +845,14 @@ function fileDetailsHtml(n) {
 
 function collectionDetailsHtml(n) {
   const r = n.raw;
+  const subs = n.kind === 'collection' ? nodes.filter(x => x.kind === 'subcollection' && x.raw.parent === r.name) : [];
+  if (n.kind === 'subcollection') {
+    return `<div style="color:#fff;font-weight:600;word-break:break-all">◇ ${esc(r.pattern)}</div>
+      <div style="color:#5a6890">Firestore subcollection of ${esc(r.parent)}</div>
+      <div>Read by ${plural(r.readers, 'file')}, written by ${r.writers}${r.usedWithUnknownOperation ? `, ${r.usedWithUnknownOperation} unknown` : ''}</div>`;
+  }
   return `<div style="color:#fff;font-weight:600">◆ ${esc(r.name)}</div>
-    <div style="color:#5a6890">Firestore collection</div>
+    <div style="color:#5a6890">Firestore collection${subs.length ? `; counts include its ${plural(subs.length, 'subcollection')}` : ''}</div>
     <div>Read by ${plural(r.readers, 'file')}, written by ${r.writers}${r.usedWithUnknownOperation ? `, ${r.usedWithUnknownOperation} unknown` : ''}</div>
     ${r.paths?.length ? `<div style="color:#8090b0;margin-top:3px">${r.paths.slice(0, 6).map(esc).join('<br>')}${r.paths.length > 6 ? '<br>…' : ''}</div>` : ''}`;
 }
@@ -756,7 +864,7 @@ function folderLinks(key) {
   let inside = 0, totalIn = 0, totalOut = 0;
   const row = g => rows.get(g) || (rows.set(g, { g, in: 0, out: 0 }), rows.get(g));
   for (const e of edges) {
-    if (!layerOn[e.layer]) continue;
+    if (!layerOn[e.layer] || byId.get(e.to)?.kind === 'subcollection') continue; // subcollections count in their parent
     const a = groupOf(e.from), b = groupOf(e.to);
     if (a === key && b === key) inside++;
     else if (a === key) { row(b).out++; totalOut++; }
@@ -798,7 +906,7 @@ function folderCardHtml(n) {
 function showTooltip(n, x, y) {
   tooltip.innerHTML = n.kind === 'folder'
     ? `${folderSummaryHtml(n)}<div style="color:#5a6890">Click for its links · double-click to show its files</div>`
-    : n.kind === 'collection' ? collectionDetailsHtml(n) : fileDetailsHtml(n);
+    : n.kind === 'collection' || n.kind === 'subcollection' ? collectionDetailsHtml(n) : fileDetailsHtml(n);
   tooltip.style.display = 'block';
   const tw = tooltip.offsetWidth, th = tooltip.offsetHeight;
   tooltip.style.left = `${Math.max(8, Math.min(x + 16, width - tw - 8))}px`;
@@ -814,8 +922,10 @@ function renderCard() {
   else {
     const ns = [...neighbors].sort((a, b) => a.label.localeCompare(b.label));
     const inExpanded = selected.kind === 'file' && mode === 'folders' && expanded.has(selected.folder);
-    const nName = n => (n.kind === 'collection' ? `◆ ${n.raw.name}` : n.kind === 'folder' ? `● ${n.label} (${plural(n.F.files.length, 'file')})` : n.raw.path);
-    cardEl.innerHTML = `${selected.kind === 'collection' ? collectionDetailsHtml(selected) : fileDetailsHtml(selected)}
+    const nName = n => (n.kind === 'collection' ? `◆ ${n.raw.name}` : n.kind === 'subcollection' ? `◇ ${n.raw.pattern}` : n.kind === 'folder' ? `● ${n.label} (${plural(n.F.files.length, 'file')})` : n.raw.path);
+    const isData = selected.kind === 'collection' || selected.kind === 'subcollection';
+    cardEl.innerHTML = `${isData ? collectionDetailsHtml(selected) : fileDetailsHtml(selected)}
+      ${isData ? throughFunctionsHtml(selected) : functionsHtml(selected)}
       <div style="display:flex;gap:6px;align-items:center;margin-top:7px">
         <span style="color:#5a6890">Connected on visible layers: ${ns.length}</span>
         ${inExpanded ? `<button class="cm-btn" data-act="collapse" data-key="${esc(selected.folder)}" style="margin-left:auto;padding:1px 7px;font-size:11px">Collapse ${esc(folders.get(selected.folder).label)}</button>` : ''}
@@ -824,6 +934,67 @@ function renderCard() {
   }
   cardEl.style.display = 'block';
   sizeCard();
+}
+
+// ─── function calls in the card ──────────────────────────────────────────────
+const fileItem = (id, text) => `<button class="cm-item" data-id="${esc(id)}" title="${esc(id)}">${text}</button>`;
+const callsInto = (file, fn) => edges.filter(e => e.kind === 'calls' && e.to === file && (e.function === fn || e.local === fn || e.export === fn));
+// Caller rows as brainmap shows them: file (lines) in function, via value from file:line.
+function callerRows(list, limit) {
+  const by = new Map();
+  for (const e of list) { const k = e.via === 'value' ? `${e.from}\0${e.passedFrom}:${e.passedLine}` : e.from; (by.get(k) || by.set(k, []).get(k)).push(e); }
+  const rows = [...by.values()].sort((a, b) => a[0].from.localeCompare(b[0].from)).map(es => {
+    const e0 = es[0], ls = [...new Set(es.map(e => e.line))].sort((a, b) => a - b);
+    const callers = [...new Set(es.map(e => e.caller).filter(Boolean))];
+    return fileItem(e0.from, `${esc(e0.from)} <span style="color:#5a6890">(line${ls.length > 1 ? 's' : ''} ${ls.slice(0, 4).join(', ')})${callers.length ? ` in ${esc(callers.slice(0, 2).join(', '))}` : ''}${e0.via === 'value' ? ` · via value from ${esc(e0.passedFrom)}:${e0.passedLine}` : ''}</span>`);
+  });
+  return rows.slice(0, limit).join('') + (rows.length > limit ? `<div class="cm-note" style="padding-left:4px">+${rows.length - limit} more</div>` : '');
+}
+
+// A file: its exported functions with how many files call each, and the functions it calls in other files.
+function functionsHtml(n) {
+  if (n.kind !== 'file') return '';
+  const inc = edges.filter(e => e.kind === 'calls' && e.to === n.id);
+  const byFn = new Map();
+  for (const e of inc) (byFn.get(e.function) || byFn.set(e.function, new Set()).get(e.function)).add(e.from);
+  const exported = (n.raw.exports || []).filter(x => x !== 'default' && !x.startsWith('* from'));
+  const rows = [...new Set([...byFn.keys(), ...exported])].map(fn => ({ fn, files: byFn.get(fn)?.size || 0 }))
+    .sort((a, b) => b.files - a.files || a.fn.localeCompare(b.fn));
+  const called = rows.filter(r => r.files), silent = rows.length - called.length;
+  const out = new Map();
+  for (const e of edges) if (e.kind === 'calls' && e.from === n.id) { const k = `${e.to}\0${e.function}`; (out.get(k) || out.set(k, { to: e.to, fn: e.function, n: 0, value: 0 }).get(k)).n++; if (e.via === 'value') out.get(k).value++; }
+  const outRows = [...out.values()].sort((a, b) => b.n - a.n || a.fn.localeCompare(b.fn));
+  if (!rows.length && !outRows.length) return '';
+  return `${rows.length ? `<div class="cm-h">Exported functions, files calling each</div>
+      ${called.slice(0, 12).map(r => `<div style="display:flex;gap:6px"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.fn)}</span><span style="color:#c8d0e8">${r.files}</span></div>`).join('')}
+      ${called.length > 12 ? `<div style="color:#5a6890">+${called.length - 12} more called</div>` : ''}
+      ${silent ? `<div style="color:#5a6890">${plural(silent, 'other export')} not called from other files</div>` : ''}` : ''}
+    ${outRows.length ? `<div class="cm-h">Calls functions in other files</div>
+      ${outRows.slice(0, 12).map(r => fileItem(r.to, `${esc(r.fn)} <span style="color:#5a6890">(${esc(r.to)})${r.n > 1 ? ` ×${r.n}` : ''}${r.value ? ' · via value' : ''}</span>`)).join('')}
+      ${outRows.length > 12 ? `<div style="color:#5a6890">+${outRows.length - 12} more</div>` : ''}` : ''}`;
+}
+
+// A collection or subcollection: the functions that read or write it and who calls them (depth 1), as brainmap collection.
+function throughFunctionsHtml(n) {
+  const fns = new Map();
+  for (const e of edges) {
+    if (e.to !== n.id || (e.kind !== 'reads' && e.kind !== 'writes')) continue;
+    for (const st of e.sites || []) {
+      if (!st.function) continue;
+      const k = `${e.from}\0${st.function}`;
+      (fns.get(k) || fns.set(k, { file: e.from, fn: st.function, ops: new Set() }).get(k)).ops.add(e.kind);
+    }
+  }
+  const list = [...fns.values()].sort((a, b) => a.file.localeCompare(b.file) || a.fn.localeCompare(b.fn));
+  if (!list.length) return '';
+  const shown = list.slice(0, 10);
+  return `<div class="cm-h">Through functions (${list.length})</div>
+    ${shown.map(f => {
+      const calls = callsInto(f.file, f.fn);
+      return `<div style="margin-top:4px"><span style="color:#fff">${esc(f.fn)}</span> <span style="color:#5a6890">(${esc(f.file)}, ${[...f.ops].join(' and ')}) ← ${calls.length ? plural(new Set(calls.map(e => e.from)).size, 'file') : 'no calls from other files'}</span></div>
+        ${calls.length ? `<div style="padding-left:10px">${callerRows(calls, 4)}</div>` : ''}`;
+    }).join('')}
+    ${list.length > shown.length ? `<div style="color:#5a6890">+${list.length - shown.length} more functions (brainmap collection lists all)</div>` : ''}`;
 }
 
 function sizeCard() {
@@ -836,7 +1007,8 @@ function renderToolbar() {
   const fileCount = map.counts?.nodesByKind?.file ?? nodes.filter(n => n.kind === 'file').length;
   const colCount = map.counts?.nodesByKind?.collection ?? 0;
   const when = map.generatedAt ? new Date(map.generatedAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '';
-  const layerCount = id => edges.filter(e => e.layer === id).length;
+  // Subcollection edges are inside their top-level collection's, so they are not counted again here.
+  const layerCount = id => edges.filter(e => e.layer === id && byId.get(e.to)?.kind !== 'subcollection').length;
   toolbarEl.innerHTML = `
     <button class="cm-btn cm-back">← Back to brain</button>
     <div style="font-size:13px;color:#fff;font-weight:600">${esc(project.name)}</div>
@@ -895,8 +1067,8 @@ function placeBelowToolbar() {
 function runSearch(q) {
   searchQuery = q;
   const s = q.trim().toLowerCase();
-  searchMatches = s ? nodes.filter(n => (n.kind === 'file' || (n.kind === 'collection' && nodeVisible(n)))
-    && (n.kind === 'collection' ? n.raw.name : n.raw.path).toLowerCase().includes(s)) : [];
+  searchMatches = s ? nodes.filter(n => (n.kind === 'file' || ((n.kind === 'collection' || n.kind === 'subcollection') && nodeVisible(n)))
+    && (n.kind === 'collection' ? n.raw.name : n.kind === 'subcollection' ? n.raw.pattern : n.raw.path).toLowerCase().includes(s)) : [];
   searchHits = new Set(searchMatches.map(repOf).filter(nodeVisible));
   updateHits();
   dirty = true;
@@ -923,6 +1095,11 @@ function renderLegend() {
       <div style="display:flex;align-items:center;gap:7px;margin-top:6px;${showCols ? '' : 'opacity:0.45'}">
         <span style="width:9px;height:9px;transform:rotate(45deg);border:1.4px solid ${COLLECTION_COLOR};background:${hexA(COLLECTION_COLOR, 0.35)};margin:0 2px"></span>
         <span>Firestore collection${showCols ? '' : ' (turn on Reads or Writes)'}</span></div>
+      <div style="display:flex;align-items:center;gap:7px;margin-top:4px;${showCols && mode === 'files' ? '' : 'opacity:0.45'}">
+        <span style="width:7px;height:7px;transform:rotate(45deg);border:1.2px solid ${SUBCOLLECTION_COLOR};margin:0 3px"></span>
+        <span>Subcollection, tied to its collection${mode === 'files' ? '' : ' (Files view; counted in its collection here)'}</span></div>
+      ${layerOn.calls ? `<div style="display:flex;align-items:center;gap:7px;margin-top:4px">
+        <span style="width:14px;border-top:1.5px dashed ${LAYER_BY_ID.calls.color}"></span><span>Call through a function passed as a value</span></div>` : ''}
       <div style="color:#5a6890;margin-top:6px;line-height:1.45">${mode === 'folders'
         ? 'Bubble size: number of files. Line thickness: number of file links, per layer. Double-click a bubble to show its files.'
         : 'Dot size: lines of code.'} Click a node to see its connections.</div></div>` : ''}`;
