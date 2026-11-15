@@ -1,4 +1,4 @@
-// Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (schemaVersion 9; subcollection nodes and function call edges are not drawn).
+// Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (schemaVersion 10; subcollection nodes and function call edges are not drawn).
 // Replaces the brain visual on the left while open. Canvas 2D with pre-rendered glow sprites, so it
 // stays smooth at around 1,000 nodes; d3-force is bundled by Vite, so nothing is fetched from outside.
 //
@@ -9,7 +9,7 @@ import { forceSimulation, forceManyBody, forceLink, forceX, forceY, forceCollide
 import { setBrainPaused } from './brain.js';
 import { computeReport, callerTree, callIndex } from './map-report.js';
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 const BG = '#05070F';
 let TOP = 96;             // below the toolbar; follows its height when it wraps
 const SIDE_W = 300;       // findings column and selection card
@@ -25,6 +25,7 @@ const LAYERS = [
   { id: 'reads',          label: 'Reads',          kinds: ['reads'],          color: '#4DFFC3', on: false },
   { id: 'writes',         label: 'Writes',         kinds: ['writes'],         color: '#FF7A59', on: false },
   { id: 'calls',          label: 'Calls',          kinds: ['calls'],          color: '#C3A6FF', on: false },
+  { id: 'types',          label: 'Type imports',   kinds: ['type-import'],    color: '#8FA3C8', on: false },
 ];
 const LAYER_OF = Object.fromEntries(LAYERS.flatMap(l => l.kinds.map(k => [k, l.id])));
 const LAYER_BY_ID = Object.fromEntries(LAYERS.map(l => [l.id, l]));

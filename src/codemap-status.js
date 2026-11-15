@@ -6,20 +6,20 @@ import { spawn, execFile } from 'child_process';
 import { homedir } from 'os';
 import { join, sep, dirname, extname } from 'path';
 import { fileURLToPath } from 'url';
-import { JS_EXT, SKIP_DIRS, NO_JS_EXIT, NO_JS_MESSAGE } from './mapper.js';
+import { JS_EXT, SKIP_DIRS, NO_JS_EXIT, NO_JS_MESSAGE, vendoredReason } from './mapper.js';
 
 export const HOME  = homedir();
 export const DOT   = join(HOME, '.brain');
 export const LINKS = join(DOT, 'code-folders.json');
 export const MAPS  = join(DOT, 'maps');
 export const BRAIN = join(HOME, 'Brain');
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 export const MAP_TIMEOUT_MS = 60_000;
 const MAPPER = join(dirname(fileURLToPath(import.meta.url)), 'mapper.js');
 
 export const fail = (status, message) => Object.assign(new Error(message), { status });
 export const tilde = p => (p === HOME || p.startsWith(HOME + sep) ? '~' + p.slice(HOME.length) : p);
-export const isSource = rel => JS_EXT.includes(extname(rel).toLowerCase()) && !rel.split('/').some(s => SKIP_DIRS.has(s));
+export const isSource = rel => JS_EXT.includes(extname(rel).toLowerCase()) && !rel.split('/').some(s => SKIP_DIRS.has(s)) && !vendoredReason(rel);
 export const mapFile = slug => join(MAPS, slug, 'map.json');
 export const realOrSelf = async p => { try { return await realpath(p); } catch { return p; } };
 export const inside = (p, dir) => p === dir || p.startsWith(dir + sep);

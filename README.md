@@ -58,7 +58,7 @@ Starts Vite on port 5174 (with hot reload) and the API on port 3001 in parallel.
 
 A project's panel can link a code folder (stored in `~/.brain/code-folders.json`, never in `~/Brain`) and
 **Map project**: the server runs `node src/mapper.js <folder> <slug>` (spawned with an argument list, 60 second
-limit) and writes `~/.brain/maps/<slug>/map.json` (schemaVersion 9). Literal document IDs in Firestore paths (generated-looking
+limit) and writes `~/.brain/maps/<slug>/map.json` (schemaVersion 10). Literal document IDs in Firestore paths (generated-looking
 values, UUIDs, email addresses, long numbers) are replaced by `{id}` before anything is stored, so they never appear in
 the map, the diagram or brainmap; short fixed document names such as `stats/exercisePRs` are kept. Firestore use is read in every folder (app,
 functions/, scripts/): one node per top-level collection (counting everything under it) and one per subcollection
@@ -75,7 +75,14 @@ The diagram draws calls per file pair only and lists same-file calls in the file
 force-directed diagram of that map: a Folders view by default (one bubble per top-level folder, links weighted
 by the file links between them, Show files expands a folder in place) and a Files view. Linked folders are only read (the one exception is the assistants block below); git is called with
 `--no-optional-locks` and nothing is ever committed in them.
-Only JavaScript projects are supported.
+JavaScript and TypeScript are supported (.js .jsx .mjs .cjs .ts .tsx), parsed with Babel (typescript plugin for
+TS). Imports resolve to the JS and TS extensions and index files (`./x.js` may mean `x.ts`), and through the nearest
+tsconfig.json or jsconfig.json (with its `extends` chain) for `paths` aliases and `baseUrl`. `.d.ts` files are used only
+to resolve imports. Type-only imports and exports (`import type`, `export type`, and imports of interfaces or type
+aliases) are `type-import` links: hidden in the diagram by default (the "Type imports" layer), left out of calls, and
+followed by `brainmap impact --types`. Vendored code is never mapped: folders named vendor, vendors or third_party,
+`.min.js`, `.bundle.js` and `.global.js` files, and files over 20,000 lines that no project file imports; the map
+lists each skipped file with the reason.
 
 The mapper also runs on its own: `node src/mapper.js <project folder> <output name>`.
 

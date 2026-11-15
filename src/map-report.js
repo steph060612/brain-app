@@ -1,4 +1,4 @@
-// Path between two things, and a project report, computed from a map (schemaVersion 9). Pure functions with no
+// Path between two things, and a project report, computed from a map (schemaVersion 10). Pure functions with no
 // Node or browser dependencies: used by the brainmap command (and its tools) and by the diagram. Deterministic.
 
 const IMPORT_KINDS = new Set(['import', 'require', 're-export', 'dynamic']);

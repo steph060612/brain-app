@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // brainmap: read-only answers about a mapped code project, for coding assistants. Reads
-// ~/.brain/maps/<slug>/map.json (schemaVersion 9); refreshes it first when the code changed (the same check
+// ~/.brain/maps/<slug>/map.json (schemaVersion 10); refreshes it first when the code changed (the same check
 // as the Brain app's "Map is current"). Prints paths, names and numbers only, never file contents.
 // No network, no model calls.
 import { stat } from 'fs/promises';
@@ -12,13 +12,14 @@ import {
 const LIST = 10;          // default items per section; --all shows everything
 const WIDTH = 110;
 const IMPORT_KINDS = new Set(['import', 'require', 're-export', 'dynamic']);
-const HELP = `brainmap: read-only map of a JavaScript project linked in the Brain app.
+const HELP = `brainmap: read-only map of a JavaScript or TypeScript project linked in the Brain app.
 
-Usage: brainmap <command> [argument] [--all] [--depth 2] [--project <name>] [--no-refresh]
+Usage: brainmap <command> [argument] [--all] [--depth 2] [--types] [--project <name>] [--no-refresh]
   overview              project summary: entry files, folders, most imported files, screens, collections, functions
   files <folder>        files in a folder, with line counts and exported names
   file <path>           exports, imports, importers, navigation, collections and functions of one file
-  impact <path>         files that depend on it through imports, up to 3 steps away (impact file:function: through calls)
+  impact <path>         files that depend on it through imports, up to 3 steps away (--types: type imports too;
+                        impact file:function: through calls)
   screen <name>         a navigation screen: its file, where it navigates to and where it is reached from
   callers <name>        files and lines that call an exported function (or file:name)
   path <A> <B>          shortest path between two files, functions, screens or collections (--all-shortest: up to 5)
@@ -37,7 +38,7 @@ Each list shows its first items with "(+N more, use --all)"; --all shows everyth
 
 // ─── output ──────────────────────────────────────────────────────────────────
 const lines = [];
-let ALL = false, DEPTH = 1, ALL_SHORTEST = false;
+let ALL = false, DEPTH = 1, ALL_SHORTEST = false, TYPES = false;
 const say = (s = '') => { for (const l of String(s).split('\n')) lines.push(l); };
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 // A comma-separated list wrapped to WIDTH, continuation lines indented.
@@ -74,6 +75,7 @@ function parseArgs(argv) {
     else if (a === '--project' || a === '-p') o.project = argv[++i] ?? '';
     else if (a.startsWith('--project=')) o.project = a.slice(10);
     else if (a === '--all-shortest') o.allShortest = true;
+    else if (a === '--types') o.types = true;
     else if (a === '--depth') o.depth = Number(argv[++i]);
     else if (a.startsWith('--depth=')) o.depth = Number(a.slice(8));
     else if (a === '--help' || a === '-h') o.pos.unshift('help');
@@ -202,6 +204,8 @@ function overview(P, ix) {
   say(`${P.slug}  ${tilde(map.project?.path || P.folder || '')}  mapped ${when(map.generatedAt)}${map.project?.gitCommit ? ` (commit ${map.project.gitCommit.slice(0, 7)})` : ''}`);
   const fnNames = map.functions?.exported || [];
   say(`${plural(ix.files.length, 'file')}, ${plural(c.edges ?? map.edges.length, 'link')}, ${plural(ix.screens.length, 'screen')}, ${plural(ix.collections.length, 'collection')}, ${plural(fnNames.length, 'cloud function')}`);
+  const langs = map.counts?.filesByLanguage || {};
+  if (Object.keys(langs).length) say(`Languages: ${Object.entries(langs).map(([l, n]) => `${n} ${l === 'typescript' ? 'TypeScript' : 'JavaScript'}`).join(', ')}${map.skippedFiles?.length ? `; skipped ${plural(map.skippedFiles.length, 'file')} (${[...new Set(map.skippedFiles.map(x => x.reason.split(' (')[0]))].join(', ')})` : ''}`);
   const groups = map.rootGroups || [];
   wrapList('Entry files: ', groups.map(g => (g.entry ? `${g.entry} (${g.name})` : `${g.dir || g.name}/ has no entry file (${plural(g.fileCount, 'file')})`)));
   const fc = new Map();
@@ -251,6 +255,8 @@ function fileCmd(P, ix, q) {
   const impTo = groupBy(imp, e => e.to), impFrom = groupBy(impBy, e => e.from);
   say(`Imports ${plural(impTo.size, 'file')}${imp.length !== impTo.size ? ` (${imp.length} statements)` : ''}${impTo.size ? ':' : ''}`);
   items([...impTo].map(([p, es]) => `${p}${es.some(e => e.kind !== 'import') ? ` [${[...new Set(es.map(e => e.kind))].join(', ')}]` : ''}`));
+  const tOut = [...new Set(out.filter(e => e.kind === 'type-import').map(e => e.to))], tIn = [...new Set(inn.filter(e => e.kind === 'type-import').map(e => e.from))];
+  if (tOut.length || tIn.length) say(`Type imports: uses types from ${plural(tOut.length, 'file')}${tOut.length ? ` (${tOut.slice(0, 4).join(', ')}${tOut.length > 4 ? ', …' : ''})` : ''}; its types are used by ${plural(tIn.length, 'file')}`);
   if (f.packages?.length) wrapList('Packages: ', f.packages);
   say(`Imported by ${plural(impFrom.size, 'file')}${impBy.length !== impFrom.size ? ` (${impBy.length} statements)` : ''}${f.reachableFromAppEntry === false && f.rootGroup === 'app' ? ' · not reached from the entry file' : ''}${impFrom.size ? ':' : ''}`);
   items([...impFrom.keys()].sort((a, b) => a.localeCompare(b)));
@@ -310,7 +316,7 @@ function impactCmd(P, ix, q) {
     const next = [];
     for (const p of frontier) {
       for (const e of ix.inn.get(p) || []) {
-        if (!IMPORT_KINDS.has(e.kind) || seen.has(e.from)) continue;
+        if (!(IMPORT_KINDS.has(e.kind) || (TYPES && e.kind === 'type-import')) || seen.has(e.from)) continue;
         seen.set(e.from, { depth: d, via: p });
         next.push(e.from);
       }
@@ -321,7 +327,7 @@ function impactCmd(P, ix, q) {
   let beyond = 0;
   for (const p of frontier) for (const e of ix.inn.get(p) || []) if (IMPORT_KINDS.has(e.kind) && !seen.has(e.from)) beyond++;
   const total = seen.size - 1;
-  say(`${f.path}: ${plural(total, 'file')} depend on it through imports (${[1, 2, 3].map(d => `depth ${d}: ${byDepth.get(d)?.length || 0}`).join(', ')})${beyond ? `; more beyond depth 3` : ''}`);
+  say(`${f.path}: ${plural(total, 'file')} depend on it through imports${TYPES ? ' and type imports' : ''} (${[1, 2, 3].map(d => `depth ${d}: ${byDepth.get(d)?.length || 0}`).join(', ')})${beyond ? `; more beyond depth 3` : ''}`);
   for (const d of [1, 2, 3]) {
     const list = byDepth.get(d);
     if (!list) continue;
@@ -772,6 +778,7 @@ async function main() {
   if (![1, 2].includes(opts.depth)) die('--depth takes 1 or 2.');
   DEPTH = opts.depth;
   ALL_SHORTEST = opts.allShortest;
+  TYPES = !!opts.types;
   const P = await loadProject(opts);
   run(P, index(P.map), cmd === 'path' ? rest : rest.join(' '));  // query takes the words, quoted or not
   flush();

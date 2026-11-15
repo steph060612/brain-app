@@ -14,21 +14,34 @@ import { pathToFileURL } from 'node:url';
 import { parse } from '@babel/parser';
 import { detectGroups, nameGroups, SEED as GROUP_SEED, WEIGHTS as GROUP_WEIGHTS } from './map-groups.js';
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 const IMPORT_KINDS = ['import', 're-export', 'require', 'dynamic'];
 const KINDS = {
   nodes: ['file', 'collection', 'subcollection'],
-  edges: [...IMPORT_KINDS, 'navigate', 'calls-function', 'reads', 'writes', 'calls'],
+  edges: [...IMPORT_KINDS, 'type-import', 'navigate', 'calls-function', 'reads', 'writes', 'calls'],
   unresolved: ['load', 'navigate', 'function', 'data', 'call'],
 };
 
-export const JS_EXT = ['.js', '.jsx', '.mjs', '.cjs'];
-const ASSET_EXT = new Set(['.png', '.webp', '.jpg', '.jpeg', '.mp4', '.ttf', '.otf', '.csv', '.json']);
+export const JS_EXT = ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts'];
+export const isTypeDeclaration = (p) => /\.d\.[mc]?ts$/i.test(p);
+// Vendored code is never mapped: folders named vendor / vendors / third_party (lib/vendor, public/vendor included),
+// minified or bundled files; files over MAX_LINES are skipped when read. The reason is kept in the map.
+const VENDOR_DIRS = new Set(['vendor', 'vendors', 'third_party']);
+const MAX_LINES = 20000;
+export function vendoredReason(rel) {
+  const segs = rel.split('/');
+  if (segs.slice(0, -1).some((x) => VENDOR_DIRS.has(x.toLowerCase()))) return 'vendored folder';
+  const name = segs[segs.length - 1].toLowerCase();
+  if (name.endsWith('.min.js') || name.endsWith('.bundle.js') || name.includes('.global.js')) return 'minified or bundled file';
+  return null;
+}
+const ASSET_EXT = new Set(['.png', '.webp', '.jpg', '.jpeg', '.gif', '.svg', '.mp4', '.mp3', '.wav', '.ttf', '.otf', '.woff', '.woff2', '.csv', '.json', '.css', '.scss', '.sass', '.less']);
 export const SKIP_DIRS = new Set(['node_modules', 'ios', 'android', 'build', 'dist', '.git', '.claude',
   'cache', '.cache', '.expo', '.next', '.turbo', 'coverage', 'web-build']);
 // Resolution order for an extensionless relative path. Platform variants are what Metro tries.
-const RESOLVE_SUFFIXES = ['', '.js', '.jsx', '.mjs', '.cjs', '.ios.js', '.android.js', '.native.js',
-  '/index.js', '/index.jsx', '/index.ios.js', '/index.native.js'];
+const RESOLVE_SUFFIXES = ['', '.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.ios.js', '.android.js', '.native.js',
+  '.ios.ts', '.ios.tsx', '.native.ts', '.native.tsx', '.d.ts',
+  '/index.js', '/index.jsx', '/index.ts', '/index.tsx', '/index.ios.js', '/index.native.js', '/index.d.ts'];
 const SEPARATE_ROOTS = ['functions', 'scripts'];
 
 function usage(msg) {
@@ -44,7 +57,7 @@ const isMember = (n) => n?.type === 'MemberExpression' || n?.type === 'OptionalM
 const propName = (m) => (isMember(m) && !m.computed && m.property.type === 'Identifier' ? m.property.name : null);
 
 export const NO_JS_EXIT = 3;
-export const NO_JS_MESSAGE = 'No JavaScript files found. Other languages are not supported yet.';
+export const NO_JS_MESSAGE = 'No JavaScript or TypeScript files found. Other languages are not supported yet.';
 
 function git(root, args) {
   if (process.env.MAPPER_NO_GIT === '1') return null; // the caller knows git is unavailable
@@ -100,7 +113,12 @@ function listFiles(root) {
 
 // --- AST helpers --------------------------------------------------------------
 
+// TypeScript wrappers around an expression ('Home' as never, x!, y satisfies T, <T>z) and parentheses.
+const TS_WRAPPERS = new Set(['TSAsExpression', 'TSSatisfiesExpression', 'TSNonNullExpression', 'TSTypeAssertion', 'TSInstantiationExpression', 'ParenthesizedExpression']);
+export function unwrapTS(node) { while (node && TS_WRAPPERS.has(node.type)) node = node.expression; return node; }
+
 function literalValue(node) {
+  node = unwrapTS(node);
   if (!node) return null;
   if (node.type === 'StringLiteral') return node.value;
   if (node.type === 'TemplateLiteral' && node.expressions.length === 0) return node.quasis[0].value.cooked;
@@ -166,13 +184,16 @@ function exportNames(program) {
   return [...names];
 }
 
-function parseFile(code) {
+// JavaScript with JSX; TypeScript (.ts, .mts, .cts) with the typescript plugin, .tsx with typescript and JSX.
+function parseFile(code, rel = '') {
+  const ext = path.extname(rel).toLowerCase();
+  const plugins = ext === '.tsx' ? ['typescript', 'jsx'] : ['.ts', '.mts', '.cts'].includes(ext) ? ['typescript'] : ['jsx'];
   return parse(code, {
     sourceType: 'unambiguous',
     allowReturnOutsideFunction: true,
     allowImportExportEverywhere: true,
     allowAwaitOutsideFunction: true,
-    plugins: ['jsx'],
+    plugins,
   });
 }
 
@@ -181,12 +202,19 @@ function collectLoads(ast) {
   const loads = [];
   walkAst(ast.program, (n) => {
     switch (n.type) {
-      case 'ImportDeclaration':
-        loads.push({ kind: 'import', spec: n.source.value, line: n.loc.start.line });
+      case 'ImportDeclaration': {
+        // import type {A} / import {type A, type B}: types only, no runtime dependency.
+        const typeOnly = n.importKind === 'type' || (n.specifiers.length > 0 && n.specifiers.every((x) => x.importKind === 'type'));
+        const names = n.specifiers.map((x) => (x.type === 'ImportDefaultSpecifier' ? 'default' : x.type === 'ImportNamespaceSpecifier' ? '*' : (x.imported.name ?? x.imported.value)));
+        loads.push({ kind: typeOnly ? 'type-import' : 'import', spec: n.source.value, line: n.loc.start.line, names });
         break;
+      }
       case 'ExportNamedDeclaration':
       case 'ExportAllDeclaration':
-        if (n.source) loads.push({ kind: 're-export', spec: n.source.value, line: n.loc.start.line });
+        if (n.source) {
+          const typeOnly = n.exportKind === 'type' || (n.specifiers?.length > 0 && n.specifiers.every((x) => x.exportKind === 'type'));
+          loads.push({ kind: typeOnly ? 'type-import' : 're-export', spec: n.source.value, line: n.loc.start.line });
+        }
         break;
       case 'ImportExpression': // Babel 8 dynamic import()
         loads.push({ kind: 'dynamic', spec: literalValue(n.source), line: n.loc.start.line });
@@ -346,6 +374,7 @@ function memberValues(obj, keys) {
 
 // Every string an expression can evaluate to, if all of them are literals in this file; else null.
 function stringValues(node, A, depth = 0) {
+  node = unwrapTS(node);
   if (!node || depth > 8) return null;
   const lit = literalValue(node);
   if (lit !== null) return [lit];
@@ -582,11 +611,11 @@ function functionDefinitions(ast, rel, resolve) {
     if (isMember(e)) e = e.object;
     if (e?.type === 'CallExpression' && e.callee.name === 'require') {
       const spec = literalValue(e.arguments[0]);
-      return spec?.startsWith('.') ? resolve(rel, spec) ?? rel : rel;
+      return spec ? resolve(rel, spec) ?? rel : rel;
     }
     if (e?.type === 'Identifier') {
       const spec = b.get(e.name)?.spec;
-      return spec?.startsWith('.') ? resolve(rel, spec) ?? rel : rel;
+      return spec ? resolve(rel, spec) ?? rel : rel;
     }
     return rel;
   };
@@ -669,30 +698,35 @@ function enclosingFunction(node, A) {
   return null;
 }
 
-const isFnNode = (n) => n && (n.type === 'ArrowFunctionExpression' || n.type === 'FunctionExpression' || n.type === 'FunctionDeclaration');
+const isFnNode = (n0) => { const n = unwrapTS(n0); return !!n && (n.type === 'ArrowFunctionExpression' || n.type === 'FunctionExpression' || n.type === 'FunctionDeclaration'); };
 
 // What a file exports: name -> { local, fn } for its own values, or { file, name } for a re-export; plus `export *`.
 function exportTable(program, rel, resolve) {
-  const localFns = new Set(), locals = new Set();
+  const localFns = new Set(), locals = new Set(), localTypes = new Set();
   for (const st of program.body) {
     const d = st.type === 'ExportNamedDeclaration' || st.type === 'ExportDefaultDeclaration' ? st.declaration : st;
+    if ((d?.type === 'TSInterfaceDeclaration' || d?.type === 'TSTypeAliasDeclaration') && d.id) localTypes.add(d.id.name);
     if (d?.type === 'FunctionDeclaration' && d.id) { localFns.add(d.id.name); locals.add(d.id.name); }
     if (d?.type === 'ClassDeclaration' && d.id) locals.add(d.id.name);
     if (d?.type === 'VariableDeclaration') for (const x of d.declarations) if (x.id.type === 'Identifier') { locals.add(x.id.name); if (isFnNode(x.init)) localFns.add(x.id.name); }
   }
   const names = new Map(), stars = [];
-  const own = (exp, local, fnNode) => names.set(exp, { local, fn: fnNode ? isFnNode(fnNode) : localFns.has(local) });
-  const target = (spec) => (spec && (spec.startsWith('.') || spec.startsWith('/')) ? resolve(rel, spec) : null);
+  const own = (exp, local, fnNode) => names.set(exp, { local, fn: fnNode ? isFnNode(fnNode) : localFns.has(local), ...(localTypes.has(local) ? { type: true } : {}) });
+  const target = (spec) => (spec ? resolve(rel, spec) : null);
   let cjs = false;
   for (const st of program.body) {
     if (st.type === 'ExportNamedDeclaration') {
       const d = st.declaration;
       if (d?.type === 'FunctionDeclaration') own(d.id.name, d.id.name, d);
       else if (d?.type === 'ClassDeclaration') own(d.id.name, d.id.name, null);
+      else if ((d?.type === 'TSInterfaceDeclaration' || d?.type === 'TSTypeAliasDeclaration') && d.id) names.set(d.id.name, { local: d.id.name, fn: false, type: true });
+      else if (d?.type === 'TSDeclareFunction' && d.id && !names.has(d.id.name)) names.set(d.id.name, { local: d.id.name, fn: true }); // overload signature
+      else if (d?.type === 'TSEnumDeclaration' && d.id) own(d.id.name, d.id.name, null);
       else if (d?.type === 'VariableDeclaration') for (const x of d.declarations) for (const id of patternIds(x.id)) own(id.name, id.name, x.id.type === 'Identifier' ? x.init : null);
       for (const sp of st.specifiers || []) {
         const exp = sp.exported.name ?? sp.exported.value;
         if (st.source) { const f = target(st.source.value); if (f) names.set(exp, { file: f, name: sp.type === 'ExportNamespaceSpecifier' ? '*' : (sp.local?.name ?? sp.local?.value ?? 'default') }); }
+        else if (st.exportKind === 'type' || sp.exportKind === 'type') names.set(exp, { local: sp.local.name, fn: false, type: true });
         else own(exp, sp.local.name, null);
       }
     } else if (st.type === 'ExportDefaultDeclaration') {
@@ -732,7 +766,7 @@ function exportTable(program, rel, resolve) {
 // forms const x = require('./y'), const { a, b: c } = require('./y'), const a = require('./y').a.
 function importBindings(ast, A, rel, resolve) {
   const out = new Map(); // binding -> { file, imported }
-  const fileOf = (spec) => (spec && (spec.startsWith('.') || spec.startsWith('/')) ? resolve(rel, spec) : null);
+  const fileOf = (spec) => (spec ? resolve(rel, spec) : null);
   const declared = (id) => A.lookup(id.name, id);
   walkAst(ast.program, (n) => {
     if (n.type === 'ImportDeclaration') {
@@ -908,6 +942,7 @@ function collectCalls(ast, A, rel, resolve) {
         continue; // fn.length, Component.propTypes, ...: not a call
       }
       if (p?.type === 'UnaryExpression' && p.operator === 'typeof') continue;
+      if (p?.type?.startsWith('TS') && !TS_WRAPPERS.has(p.type)) continue; // a type position (x: Foo, typeof Foo in a type)
       if (p?.type === 'ExportSpecifier') continue;
       values.push({ file: imp.file, name: imp.imported, local: ref.name, line, reason: imp.imported === '*' ? 'module object used as a value' : 'function used as a value', passed: passedTo(ref) });
     }
@@ -963,6 +998,7 @@ const cartesian = (a, b) => { const out = []; for (const x of a) for (const y of
 // The possible texts of one path argument: a literal, a template or '+' concatenation (with named
 // placeholders for the parts it cannot know), or the few string values a variable or conditional can hold.
 function segValues(node, A) {
+  node = unwrapTS(node);
   if (!node) return { values: ['{id}'], inferred: false };
   const lit = literalValue(node);
   if (lit !== null) return { values: [lit], inferred: false };
@@ -991,6 +1027,7 @@ const segOf = (arg, A) => {
 // The path segments a Firestore reference expression points at.
 // Returns null (not a reference), { unresolved: true }, or { segs: [{ text, node }] }.
 function refPath(node, A, depth = 0) {
+  node = unwrapTS(node);
   if (!node || depth > 10) return null;
   if (node.type === 'Identifier') {
     const b = A.lookup(node.name, node);
@@ -1115,7 +1152,7 @@ function opsFor(node, A, depth = 0, seen = new Set()) {
     return calls.length ? merge(calls.flatMap((c) => opsFor(c, A, depth + 1, seen))) : ['unknown'];
   }
   if (p.type === 'AwaitExpression') return opsFor(p, A, depth + 1, seen);
-  if (['ConditionalExpression', 'LogicalExpression', 'ParenthesizedExpression', 'SequenceExpression'].includes(p.type)) return opsFor(p, A, depth + 1, seen);
+  if (['ConditionalExpression', 'LogicalExpression', 'SequenceExpression'].includes(p.type) || TS_WRAPPERS.has(p.type)) return opsFor(p, A, depth + 1, seen);
   return ['unknown'];
 }
 
@@ -1199,20 +1236,86 @@ function collectData(A) {
 
 // --- resolution ---------------------------------------------------------------
 
+// tsconfig.json / jsconfig.json, with comments and trailing commas allowed (as TypeScript reads them).
+function readJsonc(file) {
+  try {
+    const text = fs.readFileSync(file, 'utf8').replace(/\/\*[\s\S]*?\*\/|(^|[^:"'])\/\/.*$/gm, '$1').replace(/,(\s*[}\]])/g, '$1');
+    return JSON.parse(text);
+  } catch { return null; }
+}
+
+// Resolves a module specifier from a file: relative paths (with the JS and TS extensions, index files and
+// "./x.js" meaning x.ts), then the nearest tsconfig/jsconfig "paths" and "baseUrl". Returns a project path, or
+// null for a package (or anything in node_modules). Also returns .d.ts files, which are only used for this.
 function makeResolver(root) {
-  const cache = new Map();
+  const cache = new Map(), configs = new Map(), aliasesUsed = new Map();
   const isFile = (abs) => {
     if (!cache.has(abs)) { let ok = false; try { ok = fs.statSync(abs).isFile(); } catch {} cache.set(abs, ok); }
     return cache.get(abs);
   };
-  return (fromRel, spec) => {
-    const base = spec.startsWith('/') ? spec : path.join(root, path.dirname(fromRel), spec);
+  const inProject = (abs) => { const rel = toPosix(path.relative(root, abs)); return rel && !rel.startsWith('..') && !rel.split('/').includes('node_modules') ? rel : null; };
+  const tryBase = (base) => {
     for (const suf of RESOLVE_SUFFIXES) {
       const cand = base + suf;
-      if (isFile(cand) && (suf !== '' || isJs(cand))) return toPosix(path.relative(root, cand));
+      if (isFile(cand) && (suf !== '' || isJs(cand))) return inProject(cand);
     }
+    const js = /\.(m|c)?jsx?$/i.exec(base); // TypeScript ESM style: import './x.js' for x.ts
+    if (js) for (const ext of ['.ts', '.tsx', '.mts', '.cts']) if (isFile(base.slice(0, -js[0].length) + ext)) return inProject(base.slice(0, -js[0].length) + ext);
     return null;
   };
+  // A config with its "extends" chain: { paths, pathsBase, baseUrl } (paths relative to baseUrl, else to the
+  // config that defines them).
+  const loadConfig = (file, depth = 0) => {
+    if (configs.has(file)) return configs.get(file);
+    const json = readJsonc(file), dir = path.dirname(file);
+    let out = { file: toPosix(path.relative(root, file)), paths: null, pathsBase: null, baseUrl: null };
+    if (json && depth < 8) {
+      for (const ext of [].concat(json.extends || [])) {
+        let pf = ext.startsWith('.') ? path.resolve(dir, ext) : null;
+        if (!pf) for (let d = dir; d.startsWith(root); d = path.dirname(d)) { const c = path.join(d, 'node_modules', ext); if (fs.existsSync(c) || fs.existsSync(`${c}.json`)) { pf = c; break; } if (d === root) break; }
+        if (pf && !pf.endsWith('.json') && !fs.existsSync(pf)) pf += '.json';
+        if (pf && fs.existsSync(pf) && fs.statSync(pf).isFile()) { const parent = loadConfig(pf, depth + 1); out = { ...out, paths: parent.paths, pathsBase: parent.pathsBase, baseUrl: parent.baseUrl }; }
+      }
+      const co = json.compilerOptions || {};
+      if (co.baseUrl) out.baseUrl = path.resolve(dir, co.baseUrl);
+      if (co.paths) { out.paths = co.paths; out.pathsBase = out.baseUrl || dir; }
+      else if (co.baseUrl && out.paths) out.pathsBase = out.baseUrl;
+    }
+    configs.set(file, out);
+    return out;
+  };
+  // The nearest tsconfig.json or jsconfig.json above a file, inside the project.
+  const nearest = new Map();
+  const configFor = (dirAbs) => {
+    if (nearest.has(dirAbs)) return nearest.get(dirAbs);
+    let found = null;
+    for (const name of ['tsconfig.json', 'jsconfig.json']) if (isFile(path.join(dirAbs, name))) { found = loadConfig(path.join(dirAbs, name)); break; }
+    if (!found && dirAbs !== root && dirAbs.startsWith(root)) found = configFor(path.dirname(dirAbs));
+    nearest.set(dirAbs, found);
+    return found;
+  };
+  const resolve = (fromRel, spec) => {
+    if (!spec) return null;
+    if (spec.startsWith('.') || spec.startsWith('/')) return tryBase(spec.startsWith('/') ? spec : path.join(root, path.dirname(fromRel), spec));
+    const cfg = configFor(path.join(root, path.dirname(fromRel)));
+    if (!cfg) return null;
+    for (const [pattern, targets] of Object.entries(cfg.paths || {})) {
+      const star = pattern.indexOf('*');
+      const match = star < 0 ? (spec === pattern ? '' : null)
+        : spec.startsWith(pattern.slice(0, star)) && spec.endsWith(pattern.slice(star + 1)) && spec.length >= pattern.length - 1 ? spec.slice(star, spec.length - (pattern.length - star - 1)) : null;
+      if (match === null) continue;
+      for (const t of [].concat(targets)) {
+        const hit = tryBase(path.join(cfg.pathsBase, star < 0 ? t : t.replace('*', match)));
+        if (hit) { const k = `${cfg.file}: ${pattern}`; aliasesUsed.set(k, (aliasesUsed.get(k) || 0) + 1); return hit; }
+      }
+    }
+    if (cfg.baseUrl) { const hit = tryBase(path.join(cfg.baseUrl, spec)); if (hit) { const k = `${cfg.file}: baseUrl`; aliasesUsed.set(k, (aliasesUsed.get(k) || 0) + 1); return hit; } }
+    return null;
+  };
+  resolve.aliases = () => [...configs.values()].filter((c) => c.paths || c.baseUrl).map((c) => ({ config: c.file, paths: Object.keys(c.paths || {}), baseUrl: c.baseUrl ? toPosix(path.relative(root, c.baseUrl)) || '.' : null }));
+  resolve.aliasesUsed = () => Object.fromEntries(aliasesUsed);
+  resolve.configFor = configFor;
+  return resolve;
 }
 
 const packageName = (spec) => {
@@ -1239,7 +1342,37 @@ function main() {
 
   const t0 = process.hrtime.bigint();
   const { source: listSource, files: allFiles } = listFiles(root);
-  const jsFiles = allFiles.filter(isJs).sort();
+  // Sources: JS and TS, without type declarations (.d.ts, used only to resolve imports) and without vendored
+  // code (folders, minified/bundled names, files over MAX_LINES), which is listed with the reason instead.
+  // A file over MAX_LINES is skipped unless another project file imports it: real bundles are loaded by a
+  // script tag, while a large table the app imports (a translations file) is still part of the app.
+  const resolve = makeResolver(root);
+  const skippedFiles = [], keptLarge = [], codeOf = new Map(), large = new Map();
+  const candidates = allFiles.filter(isJs).filter((f) => !isTypeDeclaration(f)).sort().filter((f) => {
+    const why = vendoredReason(f);
+    if (why) { skippedFiles.push({ file: f, reason: why }); return false; }
+    let code; try { code = fs.readFileSync(path.join(root, f), 'utf8'); } catch { return false; }
+    codeOf.set(f, code);
+    const n = code.length === 0 ? 0 : code.split('\n').length;
+    if (n > MAX_LINES) large.set(f, n);
+    return true;
+  });
+  const importedBy = new Map();
+  if (large.size) {
+    const SPEC = /(?:\bfrom\s*|\brequire\(\s*|\bimport\(\s*|^\s*import\s+)['"]([^'"]+)['"]/gm;
+    for (const f of candidates) {
+      if (large.has(f)) continue;
+      for (const m of codeOf.get(f).matchAll(SPEC)) { const to = resolve(f, m[1]); if (to && large.has(to)) importedBy.set(to, f); }
+    }
+  }
+  const jsFiles = candidates.filter((f) => {
+    if (!large.has(f)) return true;
+    const n = large.get(f).toLocaleString('en-US');
+    if (importedBy.has(f)) { keptLarge.push({ file: f, lines: large.get(f), importedBy: importedBy.get(f) }); return true; }
+    skippedFiles.push({ file: f, reason: `over ${MAX_LINES.toLocaleString('en-US')} lines (${n}) and imported by no project file` });
+    codeOf.delete(f);
+    return false;
+  });
   if (!jsFiles.length) { console.error(NO_JS_MESSAGE); process.exit(NO_JS_EXIT); }
 
   // Root groups: the project itself, plus separate roots such as functions/ and scripts/.
@@ -1261,18 +1394,17 @@ function main() {
   }
   const functionsEntry = rootGroups.find((g) => g.name === 'functions')?.entry ?? null;
 
-  const resolve = makeResolver(root);
   const nodeSet = new Set(jsFiles);
   const nodes = [], edges = [], unresolved = [], missing = [], parseFailures = [];
   const rawScreens = [], navCallsByFile = new Map(), callablesByFile = new Map(), dataByFile = new Map();
-  const exportTables = new Map(), callsByFile = new Map(), paramCallsByFile = new Map();
+  const exportTables = new Map(), callsByFile = new Map(), paramCallsByFile = new Map(), importNames = new Map();
   let localCallCount = 0;
   const notes = [];
   let navSkippedNonNav = 0, functionDefs = new Map();
   const assetTotals = { total: 0, byExtension: {} };
 
   for (const rel of jsFiles) {
-    const code = fs.readFileSync(path.join(root, rel), 'utf8');
+    const code = codeOf.get(rel);
     const lines = code.length === 0 ? 0 : code.split('\n').length - (code.endsWith('\n') ? 1 : 0);
     const segs = rel.split('/');
     const node = {
@@ -1289,7 +1421,7 @@ function main() {
     nodes.push(node);
 
     let ast;
-    try { ast = parseFile(code); }
+    try { ast = parseFile(code, rel); }
     catch (e) {
       node.parseError = true;
       parseFailures.push({ file: rel, line: e.loc?.line ?? null, reason: e.reasonCode ?? 'SyntaxError' });
@@ -1306,10 +1438,16 @@ function main() {
         assetTotals.byExtension[ext.slice(1)] = (assetTotals.byExtension[ext.slice(1)] || 0) + 1;
         continue;
       }
-      if (ld.spec.startsWith('.') || ld.spec.startsWith('/')) {
-        const to = resolve(rel, ld.spec);
-        if (to && nodeSet.has(to)) edges.push({ from: rel, to, kind: ld.kind, line: ld.line });
-        else missing.push({ file: rel, line: ld.line, ...(to ? { resolvedOutsideScan: true } : {}) });
+      const relative = ld.spec.startsWith('.') || ld.spec.startsWith('/');
+      const to = resolve(rel, ld.spec); // relative, or a tsconfig/jsconfig alias
+      if (to && nodeSet.has(to)) {
+        const edge = { from: rel, to, kind: ld.kind, line: ld.line };
+        edges.push(edge);
+        if (ld.names) importNames.set(edge, ld.names);
+      } else if (to && isTypeDeclaration(to)) {
+        // a .d.ts: type declarations only, nothing to link
+      } else if (relative || to) {
+        missing.push({ file: rel, line: ld.line, ...(to ? { resolvedOutsideScan: true, reason: vendoredReason(to) || undefined } : {}) });
       } else {
         node.packageImports++;
         pkgs.add(packageName(ld.spec));
@@ -1342,7 +1480,7 @@ function main() {
           const bind = s.component ? b.get(s.component.split('.')[0]) : null;
           const spec = s.spec ?? bind?.spec;
           let file = null;
-          if (spec && (spec.startsWith('.') || spec.startsWith('/'))) file = resolve(rel, spec);
+          if (spec) file = resolve(rel, spec);
           else if (!spec && (bind?.local || !s.component)) file = rel; // defined here, or children render
           rawScreens.push({ ...s, navigatorFile: rel, file, localComponent: !spec && !!bind?.local });
         }
@@ -1420,10 +1558,15 @@ function main() {
     const t = exportTables.get(file);
     if (!t || depth > 10) return null;
     const e = t.names.get(name);
-    if (e) return e.file ? (e.name === '*' ? null : resolveExport(e.file, e.name, depth + 1)) : { file, name, local: e.local, fn: e.fn };
+    if (e) return e.file ? (e.name === '*' ? null : resolveExport(e.file, e.name, depth + 1)) : { file, name, local: e.local, fn: e.fn, type: !!e.type };
     if (name !== 'default') for (const f of t.stars) { const r = resolveExport(f, name, depth + 1); if (r) return r; }
     return null;
   };
+  // An import whose every name is an interface or type alias in the target file is a type import too.
+  for (const [edge, names] of importNames) {
+    if (edge.kind !== 'import' || !names.length || names.includes('*')) continue;
+    if (names.every((n) => resolveExport(edge.to, n)?.type)) edge.kind = 'type-import';
+  }
   const callStats = { calls: 0, resolved: 0, unresolved: 0 };
   for (const [from, fc] of callsByFile) {
     for (const c of fc.calls) {
@@ -1555,7 +1698,8 @@ function main() {
 
   // --- reachability over import edges only
   const fileNodes = nodes.filter((n) => n.kind === 'file');
-  const importEdges = edges.filter((e) => IMPORT_KINDS.includes(e.kind));
+  // A file used only for its types is still used: type imports count for reachability and importers.
+  const importEdges = edges.filter((e) => IMPORT_KINDS.includes(e.kind) || e.kind === 'type-import');
   const out = new Map(jsFiles.map((f) => [f, []]));
   const importers = new Map(jsFiles.map((f) => [f, new Set()]));
   for (const e of importEdges) { out.get(e.from).push(e.to); importers.get(e.to).add(e.from); }
@@ -1645,6 +1789,7 @@ function main() {
       unresolved: unresolved.length, unresolvedByKind: countBy(unresolved, (u) => u.kind),
       missingRelative: missing.length, assets: assetTotals.total, parseFailures: parseFailures.length,
       screens: screens.length, navigationCalls: navStats.calls, functionCalls: fnStats.calls,
+      filesByLanguage: countBy(fileNodes, (n) => (/\.(m|c)?tsx?$/i.test(n.path) ? 'typescript' : 'javascript')), skippedFiles: skippedFiles.length,
       notes: notes.length, edgesByConfidence: countBy(edges, (e) => e.tag), functionCallsSameFile: localCallCount, functionCallSites: callStats.calls, functionCallsResolved: callStats.resolved, functionCallsViaValue: callStats.viaValue || 0, functionCallsUnresolved: callStats.unresolved,
       collections: collections.size, subcollections: subs.size, documentIdPathsMasked: maskedPaths.size, dataUsesWithUnknownOperation: dataOpUnknown.length,
     },
@@ -1655,6 +1800,8 @@ function main() {
     data: { usesWithUnknownOperation: dataOpUnknown, documentIdPathsMasked: [...maskedPaths].sort() },
     groups: groupsOut,
     notes,
+    skippedFiles, keptLargeFiles: keptLarge,
+    pathAliases: { configs: resolve.aliases(), used: resolve.aliasesUsed() },
   };
 
   fs.mkdirSync(outDir, { recursive: true });
@@ -1709,6 +1856,9 @@ function main() {
   for (const g of groupList) console.log(`  ${g.id}. [${g.root}] ${g.label}  (${g.size})  ${g.central.join(', ')}`);
   console.log(`Edges by confidence: ${kv(countBy(edges, (e) => e.tag))}; inferred by reason: ${kv(countBy(edges.filter((e) => e.why), (e) => e.why))}`);
   console.log(`Notes: ${notes.length} (${kv(countBy(notes, (n) => n.tag))})`);
+  if (keptLarge.length) console.log(`Kept despite size (imported by the app): ${keptLarge.map((x) => `${x.file} (${x.lines} lines, imported by ${x.importedBy})`).join('; ')}`);
+  console.log(`Languages: ${kv(map.counts.filesByLanguage)}; skipped: ${skippedFiles.length}${skippedFiles.length ? ` (${skippedFiles.slice(0, 5).map((x) => `${x.file}: ${x.reason}`).join('; ')}${skippedFiles.length > 5 ? '; …' : ''})` : ''}`);
+  const al = resolve.aliases(); if (al.length) console.log(`Path aliases: ${al.map((a) => `${a.config} ${[...a.paths, ...(a.baseUrl ? [`baseUrl=${a.baseUrl}`] : [])].join(', ')}`).join(' | ')}; used: ${JSON.stringify(resolve.aliasesUsed())}`);
   console.log(`Parse failures: ${parseFailures.length}`);
   for (const f of parseFailures) console.log(`  ${f.file}:${f.line ?? '?'} ${f.reason}`);
 }
