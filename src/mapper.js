@@ -14,7 +14,7 @@ import { pathToFileURL } from 'node:url';
 import { parse } from '@babel/parser';
 import { detectGroups, nameGroups, SEED as GROUP_SEED, WEIGHTS as GROUP_WEIGHTS } from './map-groups.js';
 
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 11;
 const IMPORT_KINDS = ['import', 're-export', 'require', 'dynamic'];
 const KINDS = {
   nodes: ['file', 'collection', 'subcollection'],
@@ -426,7 +426,7 @@ function nameValues(node, A) {
 
 const NAV_METHODS = new Set(['navigate', 'push', 'replace', 'reset']);
 // push/replace/reset are also String/Array/form methods, so they count only on a navigation-like receiver.
-const NAV_RECEIVER = /^(nav\w*|\w*Navigation\w*|\w*navigationRef\w*|StackActions|CommonActions|TabActions|DrawerActions)$/i;
+const NAV_RECEIVER = /^(nav\w*|\w*Navigation\w*|\w*navigationRef\w*|StackActions|CommonActions|TabActions|DrawerActions|router|history)$/i;
 
 function receiverName(obj) {
   let n = obj;
@@ -458,9 +458,83 @@ function nestedScreens(params, A) {
   return { levels, computed: false };
 }
 
+// A web path written as a template or concatenation, `/clients/${id}` → '/clients/:*' (a parameter the map
+// cannot know), or null when it is not a path.
+function pathTemplate(node) {
+  node = unwrapTS(node);
+  if (node?.type === 'TemplateLiteral' && node.expressions.length && node.quasis[0].value.cooked.startsWith('/'))
+    return node.quasis.map((q, i) => q.value.cooked + (i < node.expressions.length ? ':*' : '')).join('');
+  if (node?.type === 'BinaryExpression' && node.operator === '+') {
+    const parts = []; const flat = (n) => { n = unwrapTS(n); if (n?.type === 'BinaryExpression' && n.operator === '+') { flat(n.left); flat(n.right); } else parts.push(literalValue(n) ?? ':*'); };
+    flat(node);
+    return parts[0]?.startsWith('/') ? parts.join('') : null;
+  }
+  return null;
+}
+
+// `item.to` inside list.map((item) => …), or `path` inside list.map(({ path }) => …), over a constant array:
+// each element's value (MODULES.map(({ path }) => <NavLink to={path} />)).
+function mappedMemberValues(node, A) {
+  let name, key;
+  if (isMember(node) && node.object.type === 'Identifier') { name = node.object.name; key = propName(node); }
+  else if (node?.type === 'Identifier') name = node.name;
+  if (!name) return null;
+  const matches = (fn) => {
+    const p0 = fn.params[0];
+    if (key && p0?.type === 'Identifier') return p0.name === name;
+    if (!key && p0?.type === 'ObjectPattern') {
+      const prop = p0.properties.find((q) => q.type === 'ObjectProperty' && unwrapDefault(q.value)?.name === name);
+      if (prop) { key = prop.key.name ?? prop.key.value; return true; }
+    }
+    return false;
+  };
+  let fn = A.parent(node);
+  while (fn && !(FUNC_TYPES.has(fn.type) && matches(fn))) fn = A.parent(fn);
+  const call = fn && A.parent(fn);
+  if (!key || !isCall(call) || call.arguments[0] !== fn || !/^(map|forEach|flatMap)$/.test(propName(call.callee) ?? '')) return null;
+  const arr = objectOf(call.callee.object, A);
+  if (arr?.type !== 'ArrayExpression' || !arr.elements.length) return null;
+  const vals = arr.elements.map((e) => literalValue(objProp(objectOf(e, A) ?? e, key)));
+  return vals.every((v) => v != null) ? [...new Set(vals)] : null;
+}
+const unwrapDefault = (n) => (n?.type === 'AssignmentPattern' ? n.left : n);
+
+// The web paths a `to` / navigate() / redirect() argument can take. Conditionals give each branch; a constant
+// or a list element gives its values (inferred); a template gives a pattern. Absolute URLs (other sites) give
+// nothing; a value the map cannot know gives { computed }. A non-path string gives { nonPath } (a screen name).
+// A short label for a value the map cannot know: `url`, `location.state.from`, `getPath()`.
+function exprLabel(node) {
+  node = unwrapTS(node);
+  if (node?.type === 'Identifier') return node.name;
+  if (isMember(node)) { const o = exprLabel(node.object); const p = propName(node); return o && p ? `${o}.${p}` : null; }
+  if (isCall(node)) { const c = exprLabel(node.callee); return c ? `${c}()` : null; }
+  return null;
+}
+const computedTarget = (node, line) => ({ computed: true, line, expr: exprLabel(node) });
+
+function webTargets(node, A, line, depth = 0) {
+  node = unwrapTS(node);
+  if (!node || depth > 6) return [computedTarget(node, line)];
+  if (node.type === 'ConditionalExpression') return [...webTargets(node.consequent, A, line, depth + 1), ...webTargets(node.alternate, A, line, depth + 1)];
+  if (node.type === 'LogicalExpression' && node.operator !== '&&') return [...webTargets(node.left, A, line, depth + 1), ...webTargets(node.right, A, line, depth + 1)];
+  if (node.type === 'ObjectExpression' && objProp(node, 'pathname')) return webTargets(objProp(node, 'pathname'), A, line, depth + 1);
+  const one = (v, inferred) => (/^[a-z][a-z0-9+.-]*:/i.test(v) || v.startsWith('//') ? null : v.startsWith('/') ? { name: v, via: [], inferred, line } : { nonPath: true, name: v, line });
+  const lit = literalValue(node);
+  if (lit != null) return [one(lit, false)].filter(Boolean);
+  const tpl = pathTemplate(node);
+  if (tpl) return [{ name: tpl, via: [], inferred: true, template: true, line }];
+  const vals = mappedMemberValues(node, A) ?? stringValues(node, A);
+  if (vals?.length) return vals.map((v) => one(v, true)).filter(Boolean);
+  return [computedTarget(node, line)];
+}
+
 function makeTargets(nameNode, paramsNode, A, line) {
+  const un = unwrapTS(nameNode);
+  if (un?.type === 'NumericLiteral' || (un?.type === 'UnaryExpression' && un.argument.type === 'NumericLiteral')) return []; // navigate(-1): back
+  const web = webTargets(nameNode, A, line);
+  if (web.some((t) => t.name?.startsWith('/')) && !web.some((t) => t.nonPath)) return web;
   const first = nameValues(nameNode, A);
-  if (!first.values) return [{ computed: true, line }];
+  if (!first.values) return [computedTarget(nameNode, line)];
   const { levels, computed } = nestedScreens(paramsNode, A);
   const out = [];
   if (levels.length) {
@@ -512,6 +586,160 @@ function collectNavCalls(A) {
     calls.push({ method, line, targets });
   }
   return { calls, skippedNonNav };
+}
+
+// --- web routes (React Router) ---------------------------------------------------
+const jsxName = (n) => (n?.type === 'JSXIdentifier' ? n.name : n?.type === 'JSXMemberExpression' ? n.property.name : null);
+const jsxAttr = (el, name) => el.openingElement.attributes.find((a) => a.type === 'JSXAttribute' && a.name.name === name);
+const attrExpr = (a) => (!a ? undefined : a.value == null ? { type: 'BooleanLiteral', value: true } : a.value.type === 'JSXExpressionContainer' ? a.value.expression : a.value);
+const joinPath = (base, p) => (p.startsWith('/') ? p : `${base.replace(/\/$/, '')}/${p}`).replace(/\/+/g, '/').replace(/(.)\/$/, '$1') || '/';
+// The module a component name comes from: an import, a const X = lazy(() => import('./X')), or this file.
+function componentSpec(name, node, A) {
+  const b = A.lookup(name, node);
+  if (!b) return null;
+  if (b.kind === 'import') return { spec: b.spec };
+  if (b.init) {
+    let spec = null;
+    walkAst(b.init, (n) => { if (spec) return; if (n.type === 'ImportExpression') spec = literalValue(n.source); else if (isCall(n) && n.callee.type === 'Import') spec = literalValue(n.arguments[0]); });
+    if (spec) return { spec, lazy: true };
+  }
+  return { local: true };
+}
+// The page an element renders: the deepest element among the children (not props) that is a known component
+// (<ProtectedRoute><ClientsPage /></ProtectedRoute> → ClientsPage). A <Navigate to> instead marks a redirect route.
+function pageOfElement(expr, A) {
+  let best = null, redirect = null;
+  const visit = (n, depth) => {
+    n = unwrapTS(n);
+    if (n?.type === 'JSXFragment') { for (const c of n.children) visit(c, depth + 1); return; }
+    if (n?.type === 'JSXExpressionContainer') return visit(n.expression, depth);
+    if (n?.type !== 'JSXElement') return;
+    const name = jsxName(n.openingElement.name);
+    if (name === 'Navigate') { const to = attrExpr(jsxAttr(n, 'to')); redirect = to ?? null; return; }
+    if (name && /^[A-Z]/.test(name)) { const src = componentSpec(name, n.openingElement.name, A); if (src && (!best || depth >= best.depth)) best = { name, ...src, depth }; }
+    for (const c of n.children) visit(c, depth + 1);
+  };
+  visit(expr, 0);
+  return { page: best, redirect };
+}
+// <Route path element> trees (nested, index, layout routes without a path) and route objects passed to
+// createBrowserRouter / createHashRouter / createMemoryRouter / useRoutes ({ path, element, Component, lazy, children }).
+function collectWebRoutes(ast, A) {
+  const routes = [], redirects = [];
+  const add = (path, page, line, extra = {}) => routes.push({ path, component: page?.name ?? null, spec: page?.spec ?? null, local: !!page?.local, line, ...extra });
+  const fromElement = (el, base) => {
+    const p = literalValue(attrExpr(jsxAttr(el, 'path')));
+    const isIndex = !!attrExpr(jsxAttr(el, 'index'));
+    const path = p != null ? joinPath(base, p) : base;
+    const line = el.loc.start.line;
+    const elem = attrExpr(jsxAttr(el, 'element')), comp = attrExpr(jsxAttr(el, 'Component')), lazyA = attrExpr(jsxAttr(el, 'lazy'));
+    if ((p != null || isIndex) && p !== '*') {
+      if (elem) { const r = pageOfElement(elem, A); if (r.redirect) redirects.push({ to: r.redirect, line, from: path }); else add(path, r.page, line, isIndex ? { index: true } : {}); }
+      else if (comp?.type === 'Identifier') add(path, { name: comp.name, ...componentSpec(comp.name, comp, A) }, line);
+      else if (lazyA) { let spec = null; walkAst(lazyA, (n) => { if (!spec && n.type === 'ImportExpression') spec = literalValue(n.source); }); add(path, spec ? { name: null, spec } : null, line); }
+    } else if (p === '*' && elem) { const r = pageOfElement(elem, A); if (r.redirect) redirects.push({ to: r.redirect, line, from: '*' }); }
+    for (const c of el.children) if (c.type === 'JSXElement' && jsxName(c.openingElement.name) === 'Route') fromElement(c, path);
+  };
+  const fromObject = (obj, base) => {
+    obj = objectOf(obj, A) ?? obj;
+    if (obj?.type !== 'ObjectExpression') return;
+    const p = literalValue(objProp(obj, 'path')), isIndex = !!objProp(obj, 'index');
+    const path = p != null ? joinPath(base, p) : base;
+    const line = obj.loc.start.line;
+    if ((p != null || isIndex) && p !== '*') {
+      const elem = objProp(obj, 'element'), comp = objProp(obj, 'Component'), lazyP = objProp(obj, 'lazy');
+      if (elem) { const r = pageOfElement(elem, A); if (r.redirect) redirects.push({ to: r.redirect, line, from: path }); else add(path, r.page, line, isIndex ? { index: true } : {}); }
+      else if (comp?.type === 'Identifier') add(path, { name: comp.name, ...componentSpec(comp.name, comp, A) }, line, isIndex ? { index: true } : {});
+      else if (lazyP) { let spec = null; walkAst(lazyP, (n) => { if (!spec && (n.type === 'ImportExpression')) spec = literalValue(n.source); else if (!spec && isCall(n) && n.callee.type === 'Import') spec = literalValue(n.arguments[0]); }); add(path, spec ? { name: null, spec } : null, line, isIndex ? { index: true } : {}); }
+    }
+    const kids = objectOf(objProp(obj, 'children'), A) ?? objProp(obj, 'children');
+    if (kids?.type === 'ArrayExpression') for (const k of kids.elements) fromObject(k, path);
+  };
+  walkAst(ast.program, (n) => {
+    if (n.type === 'JSXElement' && jsxName(n.openingElement.name) === 'Route' && jsxName(A.parent(n)?.openingElement?.name) !== 'Route') fromElement(n, '/');
+    if (isCall(n) && /^(createBrowserRouter|createHashRouter|createMemoryRouter|useRoutes)$/.test(n.callee.name ?? '')) {
+      const arr = objectOf(n.arguments[0], A) ?? n.arguments[0];
+      if (arr?.type === 'ArrayExpression') for (const o of arr.elements) fromObject(o, '/');
+    }
+  });
+  // A layout route and its index child share a path: the index page is what that path shows.
+  const indexPaths = new Set(routes.filter((r) => r.index).map((r) => r.path));
+  return { routes: routes.filter((r) => r.index || !indexPaths.has(r.path)), redirects };
+}
+
+// Web navigation: <Link to>, <NavLink to>, <Navigate to> (outside route definitions), redirect('/x'),
+// window.location.href = '/x', location.assign('/x') / replace('/x'). Absolute URLs (other sites) are ignored.
+function collectWebNav(A) {
+  const calls = [];
+  const target = (node, line) => webTargets(node, A, line).filter((t) => !t.nonPath); // relative links are left out
+  for (const n of A.nodes()) {
+    if (n.type === 'JSXElement') {
+      const name = jsxName(n.openingElement.name);
+      if (!/^(Link|NavLink|Navigate)$/.test(name || '')) continue;
+      // A <Navigate> that is a route's element is a redirect route, handled with the routes.
+      let up = A.parent(n); while (up && (up.type === 'JSXExpressionContainer' || up.type === 'JSXElement' && !jsxAttr(up, 'path'))) up = A.parent(up);
+      if (name === 'Navigate' && (up?.type === 'JSXAttribute' && up.name.name === 'element')) continue;
+      const a = jsxAttr(n, 'to') ?? (name === 'Link' ? jsxAttr(n, 'href') : null); // Next.js <Link href>
+      if (!a) continue;
+      const t = target(attrExpr(a), n.loc.start.line);
+      if (t?.length) calls.push({ method: name === 'Navigate' ? 'redirect' : 'link', line: n.loc.start.line, targets: t });
+    } else if (isCall(n)) {
+      const c = n.callee;
+      const isRedirect = c.type === 'Identifier' && c.name === 'redirect';
+      const isLoc = isMember(c) && /^(assign|replace)$/.test(propName(c) ?? '') && /^location$/.test(receiverName(c.object) ?? '');
+      if (!isRedirect && !isLoc) continue;
+      const t = target(n.arguments[0], n.loc.start.line);
+      if (t?.length) calls.push({ method: isRedirect ? 'redirect' : 'location', line: n.loc.start.line, targets: t });
+    } else if (n.type === 'AssignmentExpression' && isMember(n.left)) {
+      const l = n.left, prop = propName(l);
+      const isLoc = (prop === 'href' && receiverName(l.object) === 'location') || (prop === 'location' && receiverName(l.object) === 'window');
+      if (!isLoc) continue;
+      const t = target(n.right, n.loc.start.line);
+      if (t?.length) calls.push({ method: 'location', line: n.loc.start.line, targets: t });
+    }
+  }
+  return calls;
+}
+
+// Next.js file routes: app/**/page.* and pages/** (not _app, _document, api/) under a folder whose package.json
+// depends on next. [id] → :id, [...slug] → :slug*, (group) folders are left out of the path.
+function nextRoutes(root, files) {
+  const out = [];
+  const pkgDirs = files.filter((f) => f.endsWith('package.json')).map((f) => path.dirname(f) === '.' ? '' : path.dirname(f)).filter((d) => {
+    try { const pj = JSON.parse(fs.readFileSync(path.join(root, d, 'package.json'), 'utf8')); return !!(pj.dependencies?.next || pj.devDependencies?.next); } catch { return false; }
+  });
+  const seg = (x) => x.replace(/^\[\.\.\.(.+)\]$/, ':$1*').replace(/^\[\[\.\.\.(.+)\]\]$/, ':$1*').replace(/^\[(.+)\]$/, ':$1');
+  for (const d of pkgDirs) {
+    const pre = d ? `${d}/` : '';
+    for (const base of ['', 'src/']) {
+      for (const f of files) {
+        if (!f.startsWith(`${pre}${base}`)) continue;
+        const rest = f.slice(`${pre}${base}`.length);
+        let m = /^app\/(.*?)\/?page\.(m?[jt]sx?)$/.exec(rest) || /^app\/page\.(m?[jt]sx?)$/.exec(rest);
+        if (m) { const parts = (m[1] && !m[1].includes('.') ? m[1] : '').split('/').filter((x) => x && !/^\(.*\)$/.test(x) && !x.startsWith('@')).map(seg); out.push({ path: `/${parts.join('/')}`, file: f }); continue; }
+        m = /^pages\/(.+)\.(m?[jt]sx?)$/.exec(rest);
+        if (m && !/(^|\/)(_app|_document|_error)$/.test(m[1]) && !m[1].startsWith('api/')) {
+          const parts = m[1].split('/').map(seg); if (parts[parts.length - 1] === 'index') parts.pop();
+          out.push({ path: `/${parts.join('/')}`, file: f });
+        }
+      }
+    }
+  }
+  return out;
+}
+
+// Does a navigation target path match a route pattern? Returns 'exact', 'param' (a parameter took a value), or null.
+function matchRoute(target, pattern) {
+  const clean = (p) => p.split(/[?#]/)[0].replace(/(.)\/$/, '$1');
+  const t = clean(target).split('/'), r = clean(pattern).split('/');
+  if (r[r.length - 1]?.endsWith('*') && r[r.length - 1].startsWith(':')) { if (t.length < r.length) return null; }
+  else if (t.length !== r.length) return null;
+  let param = false;
+  for (let i = 0; i < r.length; i++) {
+    if (r[i].startsWith(':') || r[i] === '*') { if (!t[i]) return null; if (t[i] !== r[i]) param = true; if (r[i].endsWith('*')) break; continue; }
+    if (t[i] === ':*' || t[i] !== r[i]) return null;
+  }
+  return param ? 'param' : 'exact';
 }
 
 // Local name -> { spec } (import / require) or { local: true } (defined in this file).
@@ -1396,6 +1624,7 @@ function main() {
 
   const nodeSet = new Set(jsFiles);
   const nodes = [], edges = [], unresolved = [], missing = [], parseFailures = [];
+  const webRedirects = new Map(); // redirect route path → where it sends (<Route path="/" element={<Navigate to="/clients" />} />)
   const rawScreens = [], navCallsByFile = new Map(), callablesByFile = new Map(), dataByFile = new Map();
   const exportTables = new Map(), callsByFile = new Map(), paramCallsByFile = new Map(), importNames = new Map();
   let localCallCount = 0;
@@ -1485,8 +1714,17 @@ function main() {
           rawScreens.push({ ...s, navigatorFile: rel, file, localComponent: !spec && !!bind?.local });
         }
       }
+      const web = collectWebRoutes(ast, A);
+      for (const r of web.routes) {
+        const file = r.spec ? resolve(rel, r.spec) : r.local ? rel : null;
+        rawScreens.push({ name: r.path, component: r.component, file, navigator: 'Route', navigatorFile: rel, line: r.line, route: true });
+      }
       const { calls, skippedNonNav } = collectNavCalls(A);
       navSkippedNonNav += skippedNonNav;
+      // A route whose element is <Navigate to> is a redirect from the file that defines the routes.
+      for (const r of web.redirects) { const to = literalValue(r.to); if (r.from !== '*' && to) webRedirects.set(r.from, to); }
+      for (const r of web.redirects) { const t = webTargets(r.to, A, r.line).filter((x) => !x.nonPath); if (t.length) calls.push({ method: 'redirect', line: r.line, targets: t }); }
+      calls.push(...collectWebNav(A));
       if (calls.length) navCallsByFile.set(rel, calls);
       const callables = collectCallables(A);
       if (callables.length) callablesByFile.set(rel, callables);
@@ -1494,19 +1732,22 @@ function main() {
   }
 
   // --- navigation: screens, nesting, navigate edges
+  for (const r of nextRoutes(root, allFiles)) if (nodeSet.has(r.file)) rawScreens.push({ name: r.path, component: null, file: r.file, navigator: 'Next.js', navigatorFile: r.file, line: 1, route: true });
   const screens = rawScreens.map((s) => ({
     name: s.name, component: s.component, file: s.file, navigator: s.navigator,
-    navigatorFile: s.navigatorFile, line: s.line, host: s.host, localComponent: s.localComponent,
+    navigatorFile: s.navigatorFile, line: s.line, host: s.host, localComponent: s.localComponent, ...(s.route ? { route: true } : {}),
   }));
   // A navigator hosted by component H in file F is nested under the screen that renders H
   // (defined locally in F), or under a screen whose component is imported from F.
   const hostsIn = (f) => new Set(screens.filter((x) => x.navigatorFile === f).map((x) => x.host));
   for (const s of screens) {
-    const parent = screens.find((p) => !(p.navigatorFile === s.navigatorFile && p.host === s.host)
+    if (s.route) { s.parent = null; continue; } // web routes: nesting is already in their path
+    const parent = screens.find((p) => !p.route && !(p.navigatorFile === s.navigatorFile && p.host === s.host)
       && p.file === s.navigatorFile && (p.localComponent ? p.component === s.host : hostsIn(s.navigatorFile).size === 1));
     s.parent = parent ? parent.name : null;
   }
   for (const s of screens) { delete s.host; delete s.localComponent; }
+  const webRoutes = screens.filter((s) => s.route && s.file);
   const screensByName = new Map();
   for (const s of screens) if (s.name) (screensByName.get(s.name) ?? screensByName.set(s.name, []).get(s.name)).push(s);
 
@@ -1519,16 +1760,30 @@ function main() {
       if (call.targets.some((t) => t.inferred)) navStats.inferredCalls++;
       for (const t of call.targets) {
         navStats.targets++;
-        if (t.computed) { navStats.computed++; unresolved.push({ file: from, line: t.line, kind: 'navigate' }); continue; }
-        const hits = screensByName.get(t.name);
-        if (!hits) { navStats.unmatched.push({ name: t.name, file: from, line: t.line, ...(t.inferred ? { inferred: true } : {}) }); continue; }
+        if (t.computed) { navStats.computed++; unresolved.push({ file: from, line: t.line, kind: 'navigate', reason: t.expr ? `computed target: ${t.expr}` : 'computed target' }); continue; }
+        let hits = t.template ? null : screensByName.get(t.name);
+        let paramMatch = false, redirected = null;
+        if (!hits && webRedirects.has(t.name)) { redirected = t.name; t.name = webRedirects.get(t.name); hits = screensByName.get(t.name); }
+        if (!hits && t.name.startsWith('/')) {
+          // A web path: the route it matches, preferring exact routes over ones whose parameters take values.
+          const m = webRoutes.map((r) => ({ r, how: matchRoute(t.name, r.name) })).filter((x) => x.how);
+          const exact = m.filter((x) => x.how === 'exact');
+          const best = exact.length ? exact : m.sort((a, b) => (a.r.name.match(/:/g) || []).length - (b.r.name.match(/:/g) || []).length).slice(0, 1);
+          if (best.length) { hits = best.map((x) => x.r); paramMatch = !exact.length; t.name = hits[0].name; }
+        }
+        if (!hits) {
+          navStats.unmatched.push({ name: t.name, file: from, line: t.line, ...(t.inferred ? { inferred: true } : {}) });
+          unresolved.push({ file: from, line: t.line, kind: 'navigate', reason: t.name.startsWith('/') ? `no route matches ${t.name}` : `no screen named ${t.name}` });
+          continue;
+        }
         navStats.matched++;
         if (t.inferred) navStats.matchedInferred++;
         navIncoming.set(t.name, (navIncoming.get(t.name) || 0) + 1);
         for (const via of t.via) for (const v of via.split('|')) viaIncoming.set(v, (viaIncoming.get(v) || 0) + 1);
         for (const h of hits) {
           if (h.file) edges.push({ from, to: h.file, kind: 'navigate', line: t.line, screen: t.name, method: call.method,
-            ...(t.via.length ? { via: t.via } : {}), ...(t.inferred ? { inferred: true, why: 'screen name inferred' } : {}) });
+            ...(t.via.length ? { via: t.via } : {}),
+            ...(redirected ? { inferred: true, why: `${redirected} redirects to ${t.name}` } : paramMatch || t.template ? { inferred: true, why: 'route parameter matched' } : t.inferred ? { inferred: true, why: t.name.startsWith('/') ? 'path inferred from a value' : 'screen name inferred' } : {}) });
         }
       }
     }

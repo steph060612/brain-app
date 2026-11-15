@@ -1,4 +1,4 @@
-// Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (schemaVersion 10; subcollection nodes and function call edges are not drawn).
+// Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (schemaVersion 11; subcollection nodes and function call edges are not drawn).
 // Replaces the brain visual on the left while open. Canvas 2D with pre-rendered glow sprites, so it
 // stays smooth at around 1,000 nodes; d3-force is bundled by Vite, so nothing is fetched from outside.
 //
@@ -9,7 +9,7 @@ import { forceSimulation, forceManyBody, forceLink, forceX, forceY, forceCollide
 import { setBrainPaused } from './brain.js';
 import { computeReport, callerTree, callIndex } from './map-report.js';
 
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 11;
 const BG = '#05070F';
 let TOP = 96;             // below the toolbar; follows its height when it wraps
 const SIDE_W = 300;       // findings column and selection card
@@ -952,11 +952,12 @@ function fileDetailsHtml(n) {
     if (p.inLinks) parts.push(`in ${linkPhrase(p.inLinks, p.in, 'in')}`);
     return `<div><span style="color:${L.color}">●</span> ${L.label}: ${parts.join(' · ')}</div>`;
   }).join('');
-  const screen = (map.navigation?.screens || []).filter(s => s.file === r.path).map(s => s.name);
+  const here = (map.navigation?.screens || []).filter(s => s.file === r.path);
+  const screen = here.map(s => s.name), isRoute = here.length && here.every(s => s.route);
   const F = folders.get(n.folder);
   return `<div style="color:#fff;font-weight:600;word-break:break-all">${esc(r.path)}</div>
     <div style="color:#5a6890"><span style="color:${F.color}">■</span> ${esc(F.label)} · ${r.lines} lines</div>
-    ${screen.length ? `<div style="color:#FF9FE6">Screen: ${screen.slice(0, 4).map(esc).join(', ')}${screen.length > 4 ? '…' : ''}</div>` : ''}
+    ${screen.length ? `<div style="color:#FF9FE6">${isRoute ? 'Route' : 'Screen'}: ${screen.slice(0, 4).map(esc).join(', ')}${screen.length > 4 ? '…' : ''}</div>` : ''}
     ${r.importedBy ? '' : '<div style="color:#8090b0">Imported by no file</div>'}
     ${r.importedBy && !r.reachableFromAppEntry ? '<div style="color:#8090b0">Not imported from the entry file</div>' : ''}
     ${rows}
@@ -1310,14 +1311,14 @@ function renderFindings() {
   const noNav = screens.filter(s => !s.incomingNavigation && !s.incomingAsNestedParent);
   const noNavBody = noNav.length
     ? noNav.map(s => item(s.file || '', `${s.name}${s.parent ? ` (in ${s.parent})` : ''} · ${s.file ? base(s.file) : 'no file'}`, `${s.name} → ${s.file || 'no file'}`)).join('')
-    : `<div class="cm-note">${screens.length ? 'None' : 'No React Navigation screens found.'}</div>`;
+    : `<div class="cm-note">${screens.length ? 'None' : 'No navigation screens or web routes found.'}</div>`;
 
-  const KIND_LABEL = { load: 'Module loads with a computed path', navigate: 'Navigation with a computed screen name', function: 'Cloud function calls with a computed name', data: 'Firestore paths that could not be resolved' };
+  const KIND_LABEL = { load: 'Module loads with a computed path', navigate: 'Navigation to a computed or unknown screen or route', function: 'Cloud function calls with a computed name', data: 'Firestore paths that could not be resolved' };
   const unresolved = map.unresolved || [];
   const kinds = [...new Set([...(map.kinds?.unresolved || []), ...unresolved.map(u => u.kind)])];
   const unresolvedBody = kinds.map(kind => {
     const l = unresolved.filter(u => u.kind === kind);
-    return l.length ? `<div class="cm-sub">${esc(KIND_LABEL[kind] || kind)} · ${l.length}</div>` + l.map(u => item(u.file, `${u.file}:${u.line}`)).join('') : '';
+    return l.length ? `<div class="cm-sub">${esc(KIND_LABEL[kind] || kind)} · ${l.length}</div>` + l.map(u => item(u.file, `${u.file}:${u.line}${u.reason ? ` · ${u.reason}` : ''}`)).join('') : '';
   }).join('') || '<div class="cm-note">None</div>';
   const unknownOps = map.data?.usesWithUnknownOperation || [];
   const unknownBody = unknownOps.length

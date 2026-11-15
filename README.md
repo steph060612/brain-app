@@ -58,7 +58,7 @@ Starts Vite on port 5174 (with hot reload) and the API on port 3001 in parallel.
 
 A project's panel can link a code folder (stored in `~/.brain/code-folders.json`, never in `~/Brain`) and
 **Map project**: the server runs `node src/mapper.js <folder> <slug>` (spawned with an argument list, 60 second
-limit) and writes `~/.brain/maps/<slug>/map.json` (schemaVersion 10). Literal document IDs in Firestore paths (generated-looking
+limit) and writes `~/.brain/maps/<slug>/map.json` (schemaVersion 11). Literal document IDs in Firestore paths (generated-looking
 values, UUIDs, email addresses, long numbers) are replaced by `{id}` before anything is stored, so they never appear in
 the map, the diagram or brainmap; short fixed document names such as `stats/exercisePRs` are kept. Firestore use is read in every folder (app,
 functions/, scripts/): one node per top-level collection (counting everything under it) and one per subcollection
@@ -83,6 +83,19 @@ aliases) are `type-import` links: hidden in the diagram by default (the "Type im
 followed by `brainmap impact --types`. Vendored code is never mapped: folders named vendor, vendors or third_party,
 `.min.js`, `.bundle.js` and `.global.js` files, and files over 20,000 lines that no project file imports; the map
 lists each skipped file with the reason.
+Navigation covers React Navigation screens and web routes. React Router routes are read from `<Route path element>`
+trees (nested, index and layout routes; the page is the deepest component in the element, including `lazy(() =>
+import(...))` pages) and from route objects passed to `createBrowserRouter`, `createHashRouter`, `createMemoryRouter`
+or `useRoutes` (`element`, `Component`, `lazy`, `children`). In a folder whose package.json depends on `next`,
+`app/**/page.*` and `pages/**` (not `_app`, `_document`, `api/`) become routes (`[id]` → `:id`, `(group)` folders left
+out). Each route is a screen named by its path pattern, such as `/clients/:clientUid`, tied to its page file; a route
+whose element is `<Navigate to>` is a redirect. Web navigation edges come from `navigate('/x')`, `<Link to>`,
+`<NavLink to>`, `<Navigate to>`, Next.js `<Link href>`, `router.push` / `replace`, `history.push`, `redirect()`
+and `window.location` assignments with a path. Paths are matched to routes segment by segment: a concrete or
+template path that fills a parameter (`/clients/${id}` → `/clients/:clientUid`), a path read from a constant or a
+list (`MODULES.map(({ path }) => <NavLink to={path} />)`) and a path that lands on a redirect route are tagged
+inferred. Targets the map cannot know, or no route matches, are unresolved (kind `navigate`, the same as for screens) with a reason, such as
+`computed target: href` or `no route matches /x`. Back navigation (`navigate(-1)`) and links to other sites are ignored.
 
 The mapper also runs on its own: `node src/mapper.js <project folder> <output name>`.
 
@@ -116,6 +129,9 @@ matches first, paths of up to 3 hops between matches) and three follow-up comman
 `path` finds the shortest chain of links (imports, calls including via value, navigation, cloud functions, reads,
 writes) between two files, functions, screens or collections, hop by hop with file and line; it says when only the
 reverse direction exists, tries navigation alone first between two screens, and `--all-shortest` lists up to 5.
+`screen` also takes a route path (`/clients/:clientUid`), a concrete path (`/clients/123`, matched to its route) or a
+page file; `path` takes the same, so `path /clients /clients/123` follows navigation between two pages first, and
+`query` matches route paths, page names and paths written in the question.
 `report` lists the most-connected files, most-called functions, busiest data, bridge files (articulation points of
 the import graph), rare links between folders and five ready-to-run follow-up commands; the diagram shows the same
 report in its findings. `collection` also lists the

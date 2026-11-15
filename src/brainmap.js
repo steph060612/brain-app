@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // brainmap: read-only answers about a mapped code project, for coding assistants. Reads
-// ~/.brain/maps/<slug>/map.json (schemaVersion 10); refreshes it first when the code changed (the same check
+// ~/.brain/maps/<slug>/map.json (schemaVersion 11); refreshes it first when the code changed (the same check
 // as the Brain app's "Map is current"). Prints paths, names and numbers only, never file contents.
 // No network, no model calls.
 import { stat } from 'fs/promises';
-import { findPath, computeReport, queryMap, callerTree, callIndex } from './map-report.js';
+import { findPath, computeReport, queryMap, callerTree, callIndex, routesFor } from './map-report.js';
 import {
   loadLinks, readMap, mapStatus, runMapper, gitAvailable, realOrSelf, inside, tilde,
 } from './codemap-status.js';
@@ -20,10 +20,12 @@ Usage: brainmap <command> [argument] [--all] [--depth 2] [--types] [--project <n
   file <path>           exports, imports, importers, navigation, collections and functions of one file
   impact <path>         files that depend on it through imports, up to 3 steps away (--types: type imports too;
                         impact file:function: through calls)
-  screen <name>         a navigation screen: its file, where it navigates to and where it is reached from
+  screen <name>         a navigation screen or web route (screen name, route path like /clients/:id, a concrete
+                        path like /clients/123, or the page file): its file, where it navigates and is reached from
   callers <name>        files and lines that call an exported function (or file:name)
-  path <A> <B>          shortest path between two files, functions, screens or collections (--all-shortest: up to 5)
-  query "<question>"    plain-words question: matching files, functions, screens, collections and the links around them
+  path <A> <B>          shortest path between two files, functions, screens, routes or collections (navigation first
+                        between two screens or pages; --all-shortest: up to 5)
+  query "<question>"    plain-words question: matching files, functions, screens, routes, collections and their links
   notes <file|function|--all>  NOTE / WHY / HACK / FIXME / TODO / IMPORTANT / WARNING comments (and ADR/RFC citations)
   groups                subsystems: groups of related files with a name, size, central files and links between groups
   group <label|number>  one group: its files by folder, collections, and the groups it depends on
@@ -197,13 +199,17 @@ const linesOf = list => {
 };
 const groupBy = (list, key) => { const m = new Map(); for (const x of list) { const k = key(x); (m.get(k) || m.set(k, []).get(k)).push(x); } return m; };
 
+const routeCount = ix => ix.screens.filter(s => s.route).length;
+// "screen", "route", or "screen or route" for a list of navigate edges (routes are named by their path).
+const destWord = es => { const nav = es.filter(e => e.kind === 'navigate'); const r = nav.filter(e => e.screen?.startsWith('/')).length; return !r ? 'screen' : r === nav.length ? 'route' : 'screen or route'; };
+
 // ─── commands ────────────────────────────────────────────────────────────────
 function overview(P, ix) {
   const { map } = P;
   const c = map.counts || {};
   say(`${P.slug}  ${tilde(map.project?.path || P.folder || '')}  mapped ${when(map.generatedAt)}${map.project?.gitCommit ? ` (commit ${map.project.gitCommit.slice(0, 7)})` : ''}`);
   const fnNames = map.functions?.exported || [];
-  say(`${plural(ix.files.length, 'file')}, ${plural(c.edges ?? map.edges.length, 'link')}, ${plural(ix.screens.length, 'screen')}, ${plural(ix.collections.length, 'collection')}, ${plural(fnNames.length, 'cloud function')}`);
+  say(`${plural(ix.files.length, 'file')}, ${plural(c.edges ?? map.edges.length, 'link')}, ${plural(ix.screens.filter(s => !s.route).length, 'screen')}, ${routeCount(ix) ? `${plural(routeCount(ix), 'web route')}, ` : ''}${plural(ix.collections.length, 'collection')}, ${plural(fnNames.length, 'cloud function')}`);
   const langs = map.counts?.filesByLanguage || {};
   if (Object.keys(langs).length) say(`Languages: ${Object.entries(langs).map(([l, n]) => `${n} ${l === 'typescript' ? 'TypeScript' : 'JavaScript'}`).join(', ')}${map.skippedFiles?.length ? `; skipped ${plural(map.skippedFiles.length, 'file')} (${[...new Set(map.skippedFiles.map(x => x.reason.split(' (')[0]))].join(', ')})` : ''}`);
   const groups = map.rootGroups || [];
@@ -215,7 +221,9 @@ function overview(P, ix) {
   for (const f of [...ix.files].sort((a, b) => (b.importedBy || 0) - (a.importedBy || 0) || a.path.localeCompare(b.path)).slice(0, 10)) {
     say(`  ${String(f.importedBy || 0).padStart(3)}  ${f.path}`);
   }
-  wrapList(`Screens (${ix.screens.length}): `, [...new Set(ix.screens.map(s => s.name))], Infinity);
+  const rn = ix.screens.filter(s => !s.route), web = ix.screens.filter(s => s.route);
+  if (rn.length || !web.length) wrapList(`Screens (${rn.length}): `, [...new Set(rn.map(s => s.name))], Infinity);
+  if (web.length) wrapList(`Web routes (${web.length}): `, web.map(s => `${s.name} ${s.file.split('/').pop()}`), Infinity);
   wrapList(`Collections (${ix.collections.length}, all folders): `, [...ix.collections].sort((a, b) => (b.readers + b.writers) - (a.readers + a.writers))
     .map(n => `${n.name} (${n.readers}r/${n.writers}w)`), Infinity);
   if (ix.subs.length) wrapList(`Subcollections (${ix.subs.length}): `, ix.subs.map(n => n.pattern), 12);
@@ -261,9 +269,9 @@ function fileCmd(P, ix, q) {
   say(`Imported by ${plural(impFrom.size, 'file')}${impBy.length !== impFrom.size ? ` (${impBy.length} statements)` : ''}${f.reachableFromAppEntry === false && f.rootGroup === 'app' ? ' · not reached from the entry file' : ''}${impFrom.size ? ':' : ''}`);
   items([...impFrom.keys()].sort((a, b) => a.localeCompare(b)));
   const defines = ix.screens.filter(s => s.file === f.path);
-  if (defines.length) wrapList('Defines screens: ', defines.map(s => `${s.name} (${s.navigator}${s.parent ? ` in ${s.parent}` : ''})`));
+  if (defines.length) wrapList(defines.every(s => s.route) ? 'Page of routes: ' : 'Defines screens: ', defines.map(s => (s.route ? s.name : `${s.name} (${s.navigator}${s.parent ? ` in ${s.parent}` : ''})`)));
   const navTo = groupBy(out.filter(e => e.kind === 'navigate'), e => `${e.screen} → ${e.to}`);
-  if (navTo.size) { say(`Navigates to ${plural(navTo.size, 'screen')}:`); items([...navTo].map(([k, es]) => `${k}${linesOf(es)}`)); }
+  if (navTo.size) { say(`Navigates to ${plural(navTo.size, destWord(out))}:`); items([...navTo].map(([k, es]) => `${k}${linesOf(es)}`)); }
   const navFrom = groupBy(inn.filter(e => e.kind === 'navigate'), e => e.from);
   if (navFrom.size) { say(`Navigated to from ${plural(navFrom.size, 'file')}:`); items([...navFrom].sort().map(([k, es]) => `${k} (${[...new Set(es.map(e => e.screen))].join(', ')})${linesOf(es)}`)); }
   const subPattern = id => P.map.nodes.find(n => n.id === id)?.pattern ?? id.replace(/^subcollection:/, '');
@@ -340,9 +348,16 @@ function impactCmd(P, ix, q) {
 
 function findScreens(ix, q) {
   const low = String(q || '').toLowerCase().replace(/screen$/, '');
-  if (!q) die('Give a screen name, for example: brainmap screen Home');
-  let hits = ix.screens.filter(s => s.name.toLowerCase() === q.toLowerCase());
-  if (!hits.length) hits = ix.screens.filter(s => s.name.toLowerCase() === low || s.component?.toLowerCase() === q.toLowerCase() || s.file?.toLowerCase().endsWith(`/${q.toLowerCase()}`));
+  if (!q) die('Give a screen name, a route path or a page file, for example: brainmap screen Home, brainmap screen /clients/:id');
+  if (q.startsWith('/')) {
+    // A route path, or a concrete path such as /clients/123 (matched to /clients/:clientUid).
+    const hits = routesFor(ix.screens, q);
+    if (!hits.length) die(`No route matches "${q}". Routes: ${ix.screens.filter(s => s.route).map(s => s.name).slice(0, 30).join(', ') || 'none in this map'}`);
+    return hits;
+  }
+  const page = s => s.file?.split('/').pop().replace(/\.[^.]+$/, '').toLowerCase();
+  let hits = ix.screens.filter(s => s.name.toLowerCase() === q.toLowerCase() || s.file?.toLowerCase() === q.toLowerCase().replace(/^\.\//, ''));
+  if (!hits.length) hits = ix.screens.filter(s => s.name.toLowerCase() === low || s.component?.toLowerCase() === q.toLowerCase() || s.file?.toLowerCase().endsWith(`/${q.toLowerCase()}`) || (s.route && page(s) === q.toLowerCase()));
   if (!hits.length) {
     const near = [...new Set(ix.screens.filter(s => s.name.toLowerCase().includes(low)).map(s => s.name))];
     die(`No screen "${q}".${near.length ? ` Similar: ${near.slice(0, 15).join(', ')}` : ` Screens: ${[...new Set(ix.screens.map(s => s.name))].slice(0, 30).join(', ')}…`}`);
@@ -354,7 +369,9 @@ function screenCmd(P, ix, q) {
   const hits = findScreens(ix, q);
   const names = new Set(hits.map(s => s.name));
   for (const s of hits) {
-    say(`Screen ${s.name}: ${s.file || 'no file found'}  (${s.navigator || 'navigator'}${s.parent ? ` in ${s.parent}` : ''}, declared in ${s.navigatorFile}:${s.line})`);
+    say(s.route
+      ? `Route ${s.name}: ${s.file || 'no page file found'}  (${s.navigator === 'Next.js' ? 'Next.js file route' : `declared in ${s.navigatorFile}:${s.line}`})`
+      : `Screen ${s.name}: ${s.file || 'no file found'}  (${s.navigator || 'navigator'}${s.parent ? ` in ${s.parent}` : ''}, declared in ${s.navigatorFile}:${s.line})`);
   }
   const files = new Set(hits.map(s => s.file).filter(Boolean));
   const from = P.map.edges.filter(e => e.kind === 'navigate' && (names.has(e.screen) || (files.has(e.to) && !e.screen)));
@@ -368,7 +385,7 @@ function screenCmd(P, ix, q) {
   }), 15);
   if (!from.length) say('  none found (it may be the first screen, reached through a navigator, or by a computed name)');
   const to = groupBy([...files].flatMap(fp => (ix.out.get(fp) || []).filter(e => e.kind === 'navigate')), e => `${e.screen} → ${e.to}`);
-  say(`Navigates to ${plural(to.size, 'screen')}:`);
+  say(`Navigates to ${plural(to.size, destWord([...to.values()].flat()))}:`);
   items([...to].map(([k, es]) => `${k}${linesOf(es)}`));
   if (!to.size) say('  none found');
 }

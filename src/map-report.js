@@ -1,4 +1,4 @@
-// Path between two things, and a project report, computed from a map (schemaVersion 10). Pure functions with no
+// Path between two things, and a project report, computed from a map (schemaVersion 11). Pure functions with no
 // Node or browser dependencies: used by the brainmap command (and its tools) and by the diagram. Deterministic.
 
 const IMPORT_KINDS = new Set(['import', 'require', 're-export', 'dynamic']);
@@ -61,6 +61,35 @@ function localChain(g, file, a, b) {
   return null;
 }
 
+const screenWord = name => `${String(name).startsWith('/') ? 'route' : 'screen'} ${name}`; // routes are named by their path
+const isScreenHow = how => how.startsWith('screen ') || how.startsWith('route ');
+
+// ─── web routes ──────────────────────────────────────────────────────────────
+// Does a path (/clients/123, or /clients/:id) match a route pattern (/clients/:clientUid)? 'exact', 'param'
+// (a parameter took a value) or null. The same rule as the mapper's.
+export function routeMatch(target, pattern) {
+  const clean = p => String(p).split(/[?#]/)[0].replace(/(.)\/$/, '$1');
+  const t = clean(target).split('/'), r = clean(pattern).split('/');
+  const rest = r[r.length - 1]?.startsWith(':') && r[r.length - 1].endsWith('*');
+  if (rest ? t.length < r.length : t.length !== r.length) return null;
+  let param = false;
+  for (let i = 0; i < r.length; i++) {
+    if (r[i].startsWith(':') || r[i] === '*') { if (!t[i]) return null; if (t[i] !== r[i]) param = true; if (r[i].endsWith('*')) break; continue; }
+    if (t[i] !== r[i]) return null;
+  }
+  return param ? 'param' : 'exact';
+}
+// The routes a path means: the exact route, else those its parameters fit, fewest parameters first.
+export function routesFor(screens, q) {
+  const routes = (screens || []).filter(s => s.route && s.file);
+  const exact = routes.filter(s => s.name === q || routeMatch(q, s.name) === 'exact');
+  if (exact.length) return exact;
+  const fit = routes.filter(s => routeMatch(q, s.name));
+  const params = s => (s.name.match(/:/g) || []).length;
+  const least = Math.min(...fit.map(params));
+  return fit.filter(s => params(s) === least);
+}
+
 // ─── endpoints ───────────────────────────────────────────────────────────────
 // Every node a query can mean: a file (path, suffix or name), an exported function (name or file:name),
 // a screen, a collection, or a subcollection (name or path pattern). Functions and screens resolve to the file
@@ -70,8 +99,14 @@ export function resolveEndpoint(map, q) {
   const low = String(q || '').trim().replace(/^\.\//, '').toLowerCase();
   const hits = new Map(); // node id -> { node, how }
   // One entry per node; a file that is also a screen counts as the screen (so two screens can be matched by navigation).
-  const add = (node, how) => { if (!node) return; const h = hits.get(node.id); if (!h || (h.how === 'file' && how.startsWith('screen'))) hits.set(node.id, { node, how }); };
+  const add = (node, how) => { if (!node) return; const h = hits.get(node.id); if (!h || (h.how === 'file' && isScreenHow(how))) hits.set(node.id, { node, how }); };
   if (!low) return [];
+  const screens = map.navigation?.screens || [];
+  // A web path (/clients or /clients/123): the routes it matches, as screens.
+  if (low.startsWith('/')) {
+    for (const s of routesFor(screens, q.trim())) add(files.find(f => f.path === s.file), screenWord(s.name));
+    return [...hits.values()];
+  }
   const byPath = new Map(files.map(f => [f.path.toLowerCase(), f]));
   // file:name → that file's exported function
   const colon = low.lastIndexOf(':');
@@ -81,13 +116,16 @@ export function resolveEndpoint(map, q) {
     if (f && (f.exports || []).includes(fn)) add(f, `function ${fn}`);
     return [...hits.values()];
   }
-  if (byPath.has(low)) return [{ node: byPath.get(low), how: 'file' }];
+  if (byPath.has(low)) {
+    const f = byPath.get(low), s = screens.find(x => x.file === f.path);
+    return [{ node: f, how: s ? screenWord(s.name) : 'file' }]; // a page file counts as its screen or route
+  }
   for (const f of files) {
     const name = f.path.split('/').pop().toLowerCase();
     if (f.path.toLowerCase().endsWith(`/${low}`) || name === low || name.replace(/\.[^.]+$/, '') === low) add(f, 'file');
   }
-  for (const s of map.navigation?.screens || []) {
-    if (s.file && (s.name.toLowerCase() === low || s.component?.toLowerCase() === low)) add(files.find(f => f.path === s.file), `screen ${s.name}`);
+  for (const s of screens) {
+    if (s.file && (s.name.toLowerCase() === low || s.component?.toLowerCase() === low)) add(files.find(f => f.path === s.file), screenWord(s.name));
   }
   for (const f of files) for (const x of f.exports || []) if (x.toLowerCase() === low && x !== 'default') add(f, `function ${x}`);
   for (const n of map.nodes) {
@@ -189,7 +227,7 @@ function chooseEdges(hops, local = null) {
 function edgeText(e, fn, via = null) {
   let line = firstLine(e), what = '';
   if (e.kind === 'calls') what = `${e.function}()${e.via === 'value' ? ` via value from ${e.passedFrom}:${e.passedLine}` : ''}${e.sameFile ? ` in ${e.caller ?? 'top level'}, same file` : ''}`;
-  else if (e.kind === 'navigate') what = `screen ${e.screen}`;
+  else if (e.kind === 'navigate') what = screenWord(e.screen);
   else if (e.kind === 'calls-function') what = e.function;
   else if (e.kind === 'reads' || e.kind === 'writes') {
     const site = fn && (e.sites || []).find(x => x.function === fn);
@@ -214,7 +252,7 @@ export function findPath(map, aQuery, bQuery, { allShortest = false } = {}) {
   if (a.node.id === b.node.id) return { status: 'same', ...base };
   const local = localCalls(map);
   // Two screens: a path by navigation alone answers "how do you get there"; otherwise any kind of link.
-  const screens = a.how.startsWith('screen') && b.how.startsWith('screen');
+  const screens = isScreenHow(a.how) && isScreenHow(b.how);
   const tries = [...(screens ? [[new Set(['navigate']), 'navigation']] : []), [PATH_KINDS, null]];
   for (const [kinds, only] of tries) {
     for (const [dir, from, to] of [['forward', a, b], ['reverse', b, a]]) {
@@ -394,8 +432,14 @@ export function queryMap(map, question, { maxMatches = 5 } = {}) {
     for (const x of f.exports || []) if (x !== 'default' && !x.startsWith('* from'))
       cands.push({ key: `fn:${f.id}:${x}`, kind: 'function', label: `${x} (${f.path})`, node: f.id, fn: x, full: x, name: splitWords(x), path: segs.flatMap(splitWords), folder: segs[0] });
   }
-  for (const s of map.navigation?.screens || []) if (s.file)
-    cands.push({ key: `screen:${s.name}:${s.file}`, kind: 'screen', label: `screen ${s.name} (${s.file})`, node: s.file, screen: s.name, full: s.name, name: splitWords(s.name), path: s.file.split('/').flatMap(splitWords), folder: s.file.split('/')[0] });
+  for (const s of map.navigation?.screens || []) if (s.file) {
+    // A web route: named by its path and its page (/clients/:clientUid → clients, client, uid + ClientDetailPage).
+    const page = s.route ? s.file.split('/').pop() : null;
+    cands.push({ key: `screen:${s.name}:${s.file}`, kind: 'screen', label: `${s.route ? 'route' : 'screen'} ${s.name} (${s.file})`, node: s.file, screen: s.name, route: !!s.route,
+      full: s.route ? page.replace(/\.[^.]+$/, '') : s.name, name: [...splitWords(s.name), ...(page ? splitWords(page) : [])], path: s.file.split('/').flatMap(splitWords), folder: s.file.split('/')[0] });
+  }
+  // Paths written in the question (/clients/123) point at their routes directly.
+  const asked = (question.match(/(^|\s)\/[^\s,;"'`]*/g) || []).map(x => x.trim());
   // Notes: their words count as path words (1, not 3 like a name), at three quarters.
   for (const n of map.notes || []) cands.push({ key: `note:${n.file}:${n.line}`, kind: 'note', label: `${n.tag} note in ${n.file}${n.function ? ` (${n.function})` : ''}, line ${n.line}: ${n.text.slice(0, 90)}${n.text.length > 90 ? '…' : ''}`, node: n.file, fn: n.function, full: '', name: [], path: splitWords(n.text), half: true });
   for (const g of map.groups?.list || []) cands.push({ key: `group:${g.id}`, kind: 'group', label: `group ${g.id}. ${g.label} (${g.size} files)`, node: `group:${g.id}`, full: g.label, name: g.terms.slice(0, 3), path: g.terms.slice(3), group: g });
@@ -421,6 +465,7 @@ export function queryMap(map, question, { maxMatches = 5 } = {}) {
       const k = c.kind === 'collection' || c.kind === 'subcollection' ? 'data' : c.kind === 'file' && c.folder === 'screens' ? 'screen' : c.kind;
       if (kinds.has(k)) score += 2;
     }
+    if (c.route && asked.some(a => routeMatch(a, c.screen))) { score += 8; hit.push(asked.find(a => routeMatch(a, c.screen))); }
     c.score = c.half ? score * 0.75 : score; c.hit = hit; // note words: path weight (1, not 3) and three quarters of that
   }
   const MIN = 4; // at least one exact word of a name (3 + 1), or two weaker matches
