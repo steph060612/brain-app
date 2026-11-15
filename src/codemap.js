@@ -1,4 +1,4 @@
-// Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (schemaVersion 11; subcollection nodes and function call edges are not drawn).
+// Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (schemaVersion 12; subcollection nodes and function call edges are not drawn).
 // Replaces the brain visual on the left while open. Canvas 2D with pre-rendered glow sprites, so it
 // stays smooth at around 1,000 nodes; d3-force is bundled by Vite, so nothing is fetched from outside.
 //
@@ -8,6 +8,7 @@
 import { forceSimulation, forceManyBody, forceLink, forceX, forceY, forceCollide } from 'd3-force';
 import { setBrainPaused } from './brain.js';
 import { computeReport, callerTree, callIndex } from './map-report.js';
+import { isMulti, prefixed, folderNames } from './map-folders.js';
 
 const SCHEMA_VERSION = 11;
 const BG = '#05070F';
@@ -218,8 +219,13 @@ function resize() {
 }
 
 // ─── data ────────────────────────────────────────────────────────────────────
-const folderKeyOf = f => (f.rootGroup !== 'app' ? `group:${f.rootGroup}` : `folder:${f.topFolder}`);
-const folderLabel = k => (k === 'folder:(root)' ? 'root files' : `${k.slice(k.indexOf(':') + 1)}/`);
+// With several code folders each folder key carries the code folder (cf:ptdash/folder:src → "ptdash: src/"), so the
+// same folder name in two repositories stays two bubbles. A single-folder map has the keys it always had.
+const baseKeyOf = f => (f.rootGroup !== 'app' ? `group:${f.rootGroup}` : `folder:${f.topFolder}`);
+const folderKeyOf = f => (prefixed(f) ? `cf:${f.codeFolder}/` : '') + baseKeyOf(f);
+const baseLabel = k => (k === 'folder:(root)' ? 'root files' : `${k.slice(k.indexOf(':') + 1)}/`);
+const folderLabel = k => { if (!k.startsWith('cf:')) return baseLabel(k); const i = k.indexOf('/'); return `${k.slice(3, i)}: ${baseLabel(k.slice(i + 1))}`; };
+const codeFolderColor = name => FOLDER_PALETTE[Math.max(0, folderNames(map).indexOf(name)) % FOLDER_PALETTE.length];
 
 function prepare() {
   layerOn = Object.fromEntries(LAYERS.map(l => [l.id, l.on]));
@@ -400,6 +406,7 @@ function setColorBy(c) {
   for (const n of files) {
     const gid = n.raw.group;
     if (colorBy === 'group') { n.key = gid ? `group:${gid}` : 'group:0'; n.color = gid ? GROUP_PALETTE[(gid - 1) % GROUP_PALETTE.length] : OTHER_COLOR; }
+    else if (colorBy === 'codefolder') { n.key = `cf:${n.raw.codeFolder}`; n.color = codeFolderColor(n.raw.codeFolder); }
     else { n.key = n.fkey; n.color = n.fcolor; }
   }
   const data = nodes.filter(n => n.kind === 'collection' || n.kind === 'subcollection');
@@ -414,7 +421,7 @@ function setColorBy(c) {
 
 function setMode(m) {
   if (m === mode) return;
-  if (m === 'folders' && colorBy === 'group') { colorBy = 'folder'; for (const n of nodes) if (n.kind === 'file') { n.key = n.fkey; n.color = n.fcolor; } }
+  if (m === 'folders' && colorBy !== 'folder') { colorBy = 'folder'; for (const n of nodes) if (n.kind === 'file') { n.key = n.fkey; n.color = n.fcolor; } }
   mode = m;
   expanded = new Set();
   select(null);
@@ -1160,15 +1167,15 @@ function renderToolbar() {
   toolbarEl.innerHTML = `
     <button class="cm-btn cm-back">← Back to brain</button>
     <div style="font-size:13px;color:#fff;font-weight:600">${esc(project.name)}</div>
-    <div style="font-size:11px;color:#5a6890">${fileCount} files · ${folders.size} folders${colCount ? ` · ${colCount} collections` : ''} · mapped ${esc(when)}</div>
+    <div style="font-size:11px;color:#5a6890">${isMulti(map) ? `${map.folders.length} code folders (${esc(folderNames(map).join(', '))}) · ` : ''}${fileCount} files · ${folders.size} folders${colCount ? ` · ${colCount} collections` : ''} · mapped ${esc(when)}</div>
     <input class="cm-search" type="text" placeholder="Search files…" value="${esc(searchQuery)}" />
     <span class="cm-hits" style="font-size:11px;color:#5a6890"></span>
     <div style="flex-basis:100%;height:0"></div>
     <div class="cm-seg" role="group" aria-label="View">
       <button data-mode="folders" aria-pressed="${mode === 'folders'}">Folders</button><button data-mode="files" aria-pressed="${mode === 'files'}">Files</button>
     </div>
-    ${mode === 'files' && map.groups?.list?.length ? `<span style="font-size:11px;color:#5a6890">Color by</span><div class="cm-seg cm-colorby" role="group" aria-label="Color by">
-      <button data-color="folder" aria-pressed="${colorBy === 'folder'}">Folder</button><button data-color="group" aria-pressed="${colorBy === 'group'}">Group</button></div>` : ''}
+    ${mode === 'files' && (map.groups?.list?.length || isMulti(map)) ? `<span style="font-size:11px;color:#5a6890">Color by</span><div class="cm-seg cm-colorby" role="group" aria-label="Color by">
+      <button data-color="folder" aria-pressed="${colorBy === 'folder'}">Folder</button>${map.groups?.list?.length ? `<button data-color="group" aria-pressed="${colorBy === 'group'}">Group</button>` : ''}${isMulti(map) ? `<button data-color="codefolder" aria-pressed="${colorBy === 'codefolder'}">Code folder</button>` : ''}</div>` : ''}
     ${LAYERS.map(L => `<button class="cm-chip" data-layer="${L.id}" aria-pressed="${!!layerOn[L.id]}">
       <span class="cm-dot" style="background:${L.color};box-shadow:0 0 6px ${L.color}"></span>${L.label}
       <span style="color:#5a6890">${layerCount(L.id)}</span></button>`).join('')}
@@ -1235,7 +1242,10 @@ function renderLegend() {
     `<div style="display:flex;align-items:center;gap:7px;margin:3px 0" title="${esc(title)}"><span class="cm-swatch" style="background:${color}"></span>
       <span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(name)}</span><span style="color:#5a6890">${count}</span></div>`;
   const groups = mode === 'files' && colorBy === 'group';
-  const rows = groups
+  const byCode = mode === 'files' && colorBy === 'codefolder';
+  const rows = byCode
+    ? folderNames(map).map(name => row(codeFolderColor(name), name, map.nodes.filter(n => n.kind === 'file' && n.codeFolder === name).length, map.folders.find(f => f.name === name)?.path || name)).join('')
+    : groups
     ? (map.groups.list.map(g => row(GROUP_PALETTE[(g.id - 1) % GROUP_PALETTE.length], `${g.id}. ${g.label}`, g.size)).join('')
       + (map.groups.isolated.length ? row(OTHER_COLOR, 'isolated', map.groups.isolated.length) : ''))
     : colored.map(F => row(F.color, F.label, F.files.length)).join('') +
@@ -1244,7 +1254,7 @@ function renderLegend() {
   legendEl.innerHTML = `
     <button class="cm-legend-toggle" aria-expanded="${!!legendOpen}" style="display:flex;width:100%;align-items:center;gap:6px;background:none;border:none;cursor:pointer;
       padding:8px 11px;color:#8090b0;font-size:10.5px;letter-spacing:0.05em;text-transform:uppercase">
-      <span style="font-size:10px;width:10px">${legendOpen ? '▾' : '▸'}</span>Legend<span style="margin-left:auto;text-transform:none;letter-spacing:0">${mode === 'folders' ? 'folders by folder' : colorBy === 'group' ? 'files by group' : 'files by folder'}</span></button>
+      <span style="font-size:10px;width:10px">${legendOpen ? '▾' : '▸'}</span>Legend<span style="margin-left:auto;text-transform:none;letter-spacing:0">${mode === 'folders' ? 'folders by folder' : colorBy === 'group' ? 'files by group' : colorBy === 'codefolder' ? 'files by code folder' : 'files by folder'}</span></button>
     ${legendOpen ? `<div style="padding:0 11px 9px">
       <div class="cm-scroll" style="max-height:240px;overflow-y:auto">${rows}</div>
       <div style="display:flex;align-items:center;gap:7px;margin-top:6px;${showCols ? '' : 'opacity:0.45'}">
@@ -1267,7 +1277,7 @@ function notImported() {
   for (const e of map.edges) if (LAYER_OF[e.kind] === 'import' && out.has(e.from)) out.get(e.from).push(e.to);
   const reach = start => { const seen = new Set(), st = [start]; while (st.length) { const f = st.pop(); if (!f || seen.has(f) || !out.has(f)) continue; seen.add(f); st.push(...out.get(f)); } return seen; };
   return (map.rootGroups || []).map(g => {
-    const members = files.filter(f => f.rootGroup === g.name);
+    const members = files.filter(f => f.rootGroup === g.name && (!g.codeFolder || !f.codeFolder || f.codeFolder === g.codeFolder));
     if (g.entry) {
       const seen = reach(g.entry);
       return { group: g, entry: g.entry, files: members.filter(f => !seen.has(f.path)) };
@@ -1299,10 +1309,12 @@ function renderFindings() {
 
   // "Not imported": app files only. Root groups without an entry (scripts/) are listed on their own.
   const groups = notImported();
-  const app = groups.find(g => g.group.name === 'app' && g.entry);
-  const notImportedFiles = app ? app.files : [];
+  // With several code folders, each folder's app root has its own entry file.
+  const apps = groups.filter(g => g.group.name === 'app' && g.entry);
+  const app = apps[0];
+  const notImportedFiles = apps.flatMap(a => a.files);
   const notImportedBody = app
-    ? `<div class="cm-note">App files that are not reached by imports from ${esc(app.entry)}.</div>${list(app.files)}`
+    ? `<div class="cm-note">App files that are not reached by imports from ${esc(apps.map(a => a.entry).join(' or '))}.</div>${list(notImportedFiles)}`
     : '<div class="cm-note">No app entry file found.</div>';
   const standalone = groups.filter(g => !g.entry).flatMap(g => g.files);
   const standaloneBody = `<div class="cm-note">Run by hand (for example with node), so no file imports them. That is expected.</div>${list(standalone)}`;

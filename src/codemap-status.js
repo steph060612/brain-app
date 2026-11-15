@@ -1,4 +1,5 @@
-// Shared by the server's code map routes and the brainmap command: links, saved maps, the
+// Shared by the server's code map routes and the brainmap command: links (one or more code folders per
+// project), saved maps, the
 // "code changed since the last map" check and the mapper run. Git is only read, with
 // --no-optional-locks so that `git status` never refreshes a linked folder's index.
 import { readFile, stat, realpath, readdir } from 'fs/promises';
@@ -6,14 +7,15 @@ import { spawn, execFile } from 'child_process';
 import { homedir } from 'os';
 import { join, sep, dirname, extname } from 'path';
 import { fileURLToPath } from 'url';
-import { JS_EXT, SKIP_DIRS, NO_JS_EXIT, NO_JS_MESSAGE, vendoredReason } from './mapper.js';
+import { JS_EXT, SKIP_DIRS, NO_JS_EXIT, NO_JS_MESSAGE, vendoredReason, defaultFolderName, FOLDER_NAME_RE, RESERVED_FOLDER_NAMES } from './mapper.js';
+export { defaultFolderName, FOLDER_NAME_RE, RESERVED_FOLDER_NAMES };
 
 export const HOME  = homedir();
 export const DOT   = join(HOME, '.brain');
 export const LINKS = join(DOT, 'code-folders.json');
 export const MAPS  = join(DOT, 'maps');
 export const BRAIN = join(HOME, 'Brain');
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 export const MAP_TIMEOUT_MS = 60_000;
 const MAPPER = join(dirname(fileURLToPath(import.meta.url)), 'mapper.js');
 
@@ -24,11 +26,35 @@ export const mapFile = slug => join(MAPS, slug, 'map.json');
 export const realOrSelf = async p => { try { return await realpath(p); } catch { return p; } };
 export const inside = (p, dir) => p === dir || p.startsWith(dir + sep);
 
+// The links file as stored: slug → [{ name, path }] (one entry per linked code folder). The older format,
+// slug → "/path", is still read (as one folder named after its directory) and upgraded on the next write.
 export async function loadLinks() {
   try {
     const d = JSON.parse(await readFile(LINKS, 'utf8'));
     return d && typeof d === 'object' && !Array.isArray(d) ? d : {};
   } catch { return {}; }
+}
+export function foldersOf(entry) {
+  if (typeof entry === 'string') return entry ? [{ name: defaultFolderName(entry), path: entry }] : [];
+  if (Array.isArray(entry)) return entry.filter(f => f && typeof f.path === 'string' && typeof f.name === 'string');
+  return [];
+}
+// slug → [{ name, path }], whatever the format on disk.
+export async function loadProjects() {
+  const d = await loadLinks();
+  return Object.fromEntries(Object.entries(d).map(([k, v]) => [k, foldersOf(v)]).filter(([, v]) => v.length));
+}
+// The project whose linked folder contains `cwd` (the deepest one): { slug, folders, folder }, or null.
+export async function projectFor(cwd) {
+  const here = await realOrSelf(cwd);
+  let best = null;
+  for (const [slug, folders] of Object.entries(await loadProjects())) {
+    for (const f of folders) {
+      const real = await realOrSelf(f.path);
+      if (inside(here, real) && (!best || real.length > best.folder.path.length)) best = { slug, folders, folder: { ...f, path: real } };
+    }
+  }
+  return best;
 }
 
 // { text, map } for a saved map of the supported schema, null when there is none.
@@ -65,7 +91,7 @@ export function git(folder, args) {
 // uncommitted source files modified after the map was written (or deleted since).
 export async function changeStatus(folder, map, useGit) {
   const mapTime = Date.parse(map.generatedAt) || 0;
-  const mapped = new Set(map.nodes.filter(n => n.kind === 'file').map(n => n.path));
+  const mapped = new Set(map.nodes.filter(n => n.kind === 'file').map(n => n.relPath ?? n.path));
   const changed = new Set();
   const out = { mapCommit: map.project?.gitCommit ?? null, currentCommit: null, commitChanged: false, uncommittedSourceFiles: 0, method: 'git' };
 
@@ -117,17 +143,56 @@ export async function changeStatus(folder, map, useGit) {
   return out;
 }
 
-// The full status the panel shows: changeStatus plus "the map was made from another folder".
-export async function mapStatus(folder, map, useGit) {
-  const st = await changeStatus(folder, map, useGit);
-  const mappedFolder = map.project?.path;
-  if (mappedFolder && (await realOrSelf(mappedFolder)) !== folder) { st.state = 'other-folder'; st.mappedFolder = tilde(mappedFolder); }
-  return st;
+// One linked folder's part of the map, as changeStatus reads it (paths inside the folder).
+function folderPart(map, name) {
+  const f = (map.folders || []).find(x => x.name === name);
+  if (!f) return null;
+  return { folder: f, generatedAt: f.generatedAt, project: { path: f.path, gitCommit: f.gitCommit }, nodes: map.nodes.filter(n => n.kind === 'file' && (n.codeFolder ?? name) === name) };
 }
 
-export function runMapper(folder, slug, useGit) {
+// The status the panel and brainmap show, for every linked folder: 'current', 'changed', 'other-folder' (the map
+// has this name from another folder) or 'not-mapped' (linked after the map was made); plus folders the map
+// has that are not linked any more. The project's map is current only when every folder is.
+export async function projectStatus(links, map, useGit) {
+  const folders = [];
+  for (const l of links) {
+    const part = folderPart(map, l.name);
+    const base = { name: l.name, folder: tilde(l.path) };
+    if (!part) { folders.push({ ...base, state: 'not-mapped' }); continue; }
+    let exists = false;
+    try { exists = (await stat(l.path)).isDirectory(); } catch { }
+    if (!exists) { folders.push({ ...base, state: 'missing' }); continue; }
+    const st = await changeStatus(l.path, part, useGit);
+    if ((await realOrSelf(part.folder.path)) !== (await realOrSelf(l.path))) { st.state = 'other-folder'; st.mappedFolder = tilde(part.folder.path); }
+    folders.push({ ...base, ...st });
+  }
+  const removed = (map.folders || []).filter(f => !links.some(l => l.name === f.name)).map(f => f.name);
+  const changed = folders.filter(f => f.state !== 'current' && f.state !== 'missing');
+  return {
+    state: changed.length || removed.length ? 'changed' : 'current',
+    folders, removed,
+    changedFiles: folders.reduce((s, f) => s + (f.changedFiles || 0), 0),
+  };
+}
+
+// Why a status is not current, in words: "2 source files changed in ptdash", "ptdash is not in the map yet".
+export function statusReason(st) {
+  const parts = [];
+  for (const f of st.folders) {
+    const where = st.folders.length > 1 ? ` in ${f.name}` : '';
+    if (f.state === 'changed') parts.push(f.changedFiles ? `${f.changedFiles} source file${f.changedFiles === 1 ? '' : 's'} changed${where}` : `the code changed${where}`);
+    else if (f.state === 'not-mapped') parts.push(`${f.name} (${f.folder}) is not in the map yet`);
+    else if (f.state === 'other-folder') parts.push(`the map's ${f.name} was made from ${f.mappedFolder}`);
+  }
+  if (st.removed.length) parts.push(`${st.removed.join(', ')} ${st.removed.length === 1 ? 'is' : 'are'} no longer linked`);
+  return parts.join('; ') || 'the code changed since the last map';
+}
+
+// Maps every linked folder of a project ([{ name, path }]) into one map.json.
+export function runMapper(folders, slug, useGit) {
   return new Promise((res, rej) => {
-    const child = spawn(process.execPath, [MAPPER, folder, slug], {
+    const args = folders.flatMap(f => ['--folder', `${f.name}=${f.path}`]);
+    const child = spawn(process.execPath, [MAPPER, ...args, slug], {
       cwd: DOT,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, ...(useGit ? {} : { MAPPER_NO_GIT: '1' }) },
@@ -140,7 +205,7 @@ export function runMapper(folder, slug, useGit) {
     child.on('close', code => {
       clearTimeout(timer);
       if (timedOut) return rej(fail(504, 'Mapping took longer than 60 seconds and was stopped.'));
-      if (code === NO_JS_EXIT) return rej(fail(422, NO_JS_MESSAGE));
+      if (code === NO_JS_EXIT) return rej(fail(422, stderr.trim().split('\n')[0] || NO_JS_MESSAGE));
       if (code !== 0) return rej(fail(500, `Mapper failed: ${(stderr || stdout).trim().split('\n')[0] || `exit ${code}`}`));
       res(stdout);
     });

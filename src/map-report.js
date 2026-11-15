@@ -1,12 +1,14 @@
-// Path between two things, and a project report, computed from a map (schemaVersion 11). Pure functions with no
+// Path between two things, and a project report, computed from a map (schemaVersion 12). Pure functions with no
 // Node or browser dependencies: used by the brainmap command (and its tools) and by the diagram. Deterministic.
+import { isMulti, prefixed, scopeQuery } from './map-folders.js';
 
 const IMPORT_KINDS = new Set(['import', 'require', 're-export', 'dynamic']);
 const KIND_LABEL = { import: 'imports', require: 'requires', 're-export': 're-exports', dynamic: 'imports (dynamic)',
-  calls: 'calls', navigate: 'navigates to', 'calls-function': 'calls cloud function', reads: 'reads', writes: 'writes' };
+  calls: 'calls', navigate: 'navigates to', 'calls-function': 'calls cloud function', reads: 'reads', writes: 'writes', 'read-by': 'is read by' };
 const PATH_KINDS = new Set([...IMPORT_KINDS, 'calls', 'navigate', 'calls-function', 'reads', 'writes']);
 
-export const folderOf = f => (f.rootGroup !== 'app' ? f.rootGroup : f.topFolder === '(root)' ? '(root)' : f.topFolder);
+// The folder a file is listed under; with several code folders, the code folder's name in front (ptdash:src).
+export const folderOf = f => (prefixed(f) ? `${f.codeFolder}:` : '') + (f.rootGroup !== 'app' ? f.rootGroup : f.topFolder === '(root)' ? '(root)' : f.topFolder);
 const firstLine = e => e.line ?? e.lines?.[0] ?? null;
 const nodeLabel = n => (n.kind === 'file' ? n.path : n.kind === 'subcollection' ? n.pattern : n.name);
 
@@ -95,34 +97,41 @@ export function routesFor(screens, q) {
 // a screen, a collection, or a subcollection (name or path pattern). Functions and screens resolve to the file
 // that defines them, with a note.
 export function resolveEndpoint(map, q) {
-  const files = map.nodes.filter(n => n.kind === 'file');
+  // ptdash:src/x.js or ptdash:/clients: only that folder's files and screens.
+  const scope = scopeQuery(map, String(q || '').trim());
+  const inScope = x => !scope.folder || x.codeFolder === scope.folder;
+  const files = map.nodes.filter(n => n.kind === 'file' && inScope(n));
+  const rel = f => (f.relPath ?? f.path);
+  q = scope.rest;
   const low = String(q || '').trim().replace(/^\.\//, '').toLowerCase();
   const hits = new Map(); // node id -> { node, how }
   // One entry per node; a file that is also a screen counts as the screen (so two screens can be matched by navigation).
   const add = (node, how) => { if (!node) return; const h = hits.get(node.id); if (!h || (h.how === 'file' && isScreenHow(how))) hits.set(node.id, { node, how }); };
   if (!low) return [];
-  const screens = map.navigation?.screens || [];
+  const screens = (map.navigation?.screens || []).filter(inScope);
   // A web path (/clients or /clients/123): the routes it matches, as screens.
   if (low.startsWith('/')) {
     for (const s of routesFor(screens, q.trim())) add(files.find(f => f.path === s.file), screenWord(s.name));
     return [...hits.values()];
   }
   const byPath = new Map(files.map(f => [f.path.toLowerCase(), f]));
+  const byRel = new Map(); for (const f of files) (byRel.get(rel(f).toLowerCase()) || byRel.set(rel(f).toLowerCase(), []).get(rel(f).toLowerCase())).push(f);
   // file:name → that file's exported function
   const colon = low.lastIndexOf(':');
   if (colon > 0) {
     const fq = low.slice(0, colon), fn = q.trim().slice(colon + 1);
-    const f = byPath.get(fq) || files.find(x => x.path.toLowerCase().endsWith(`/${fq}`) || x.path.split('/').pop().toLowerCase() === fq);
-    if (f && (f.exports || []).includes(fn)) add(f, `function ${fn}`);
+    const fs = byPath.has(fq) ? [byPath.get(fq)] : byRel.get(fq) || files.filter(x => rel(x).toLowerCase().endsWith(`/${fq}`) || x.path.split('/').pop().toLowerCase() === fq);
+    for (const f of fs) if ((f.exports || []).includes(fn)) add(f, `function ${fn}`);
     return [...hits.values()];
   }
-  if (byPath.has(low)) {
-    const f = byPath.get(low), s = screens.find(x => x.file === f.path);
-    return [{ node: f, how: s ? screenWord(s.name) : 'file' }]; // a page file counts as its screen or route
+  const exact = byPath.has(low) ? [byPath.get(low)] : byRel.get(low) || [];
+  if (exact.length) {
+    // a page file counts as its screen or route
+    return exact.map(f => { const s = screens.find(x => x.file === f.path); return { node: f, how: s ? screenWord(s.name) : 'file' }; });
   }
   for (const f of files) {
     const name = f.path.split('/').pop().toLowerCase();
-    if (f.path.toLowerCase().endsWith(`/${low}`) || name === low || name.replace(/\.[^.]+$/, '') === low) add(f, 'file');
+    if (rel(f).toLowerCase().endsWith(`/${low}`) || name === low || name.replace(/\.[^.]+$/, '') === low) add(f, 'file');
   }
   for (const s of screens) {
     if (s.file && (s.name.toLowerCase() === low || s.component?.toLowerCase() === low)) add(files.find(f => f.path === s.file), screenWord(s.name));
@@ -146,10 +155,13 @@ function patternKey(q) {
 
 // ─── path ────────────────────────────────────────────────────────────────────
 // Directed adjacency: from → to, one entry per node pair with every edge between them (for the hop text).
-function adjacency(map, reverse = false, kinds = PATH_KINDS) {
+// With dataFlow, a read also leads from the collection to the file that reads it ("is read by"), so a path can go
+// writer → collection → reader: how data written in one code folder reaches another.
+function adjacency(map, reverse = false, kinds = PATH_KINDS, dataFlow = false) {
   const adj = new Map();
-  for (const e of map.edges) {
-    if (!kinds.has(e.kind)) continue;
+  const list = dataFlow ? [...map.edges, ...map.edges.filter(e => e.kind === 'reads').map(e => ({ ...e, kind: 'read-by', from: e.to, to: e.from, reader: e.from }))] : map.edges;
+  for (const e of list) {
+    if (!kinds.has(e.kind) && e.kind !== 'read-by') continue;
     const [a, b] = reverse ? [e.to, e.from] : [e.from, e.to];
     if (a === b) continue;
     const m = adj.get(a) || adj.set(a, new Map()).get(a);
@@ -233,10 +245,22 @@ function edgeText(e, fn, via = null) {
     const site = fn && (e.sites || []).find(x => x.function === fn);
     if (site) line = site.line;
     what = site ? `in ${fn}` : e.sites?.[0]?.function ? `in ${e.sites[0].function}` : '';
-  }
+  } else if (e.kind === 'read-by') what = e.sites?.[0]?.function ? `in ${e.sites[0].function}` : '';
   if (via) what = `${what}${what ? ' ' : ''}(${via}, same file)`;
   if (e.tag === 'inferred') what = `${what}${what ? ' ' : ''}[inferred: ${e.why}]`;
-  return { kind: KIND_LABEL[e.kind] || e.kind, what, at: line ? `${e.from}:${line}` : e.from, inferred: e.tag === 'inferred' };
+  const file = e.kind === 'read-by' ? e.reader : e.from; // a read is written in the reading file
+  return { kind: KIND_LABEL[e.kind] || e.kind, what, at: line ? `${file}:${line}` : file, inferred: e.tag === 'inferred' };
+}
+
+// Where a path goes from one code folder to another: a cloud function defined in the other folder, or data
+// written (or read) on one side and read on the other. Text for the hop, or null.
+function crossing(hops, i) {
+  const e = hops[i].edges[0];
+  if (e.crossFolder) return `crosses from ${e.codeFolder} to ${e.toFolder} through the cloud function ${e.function}`;
+  if (e.kind !== 'read-by') return null;
+  const before = hops[i - 1]?.edges[0];
+  if (before && before.codeFolder && before.codeFolder !== e.codeFolder) return `crosses from ${before.codeFolder} to ${e.codeFolder} through shared data`;
+  return null;
 }
 
 // { status: 'ambiguous' | 'notfound' | 'none' | 'found', ... }
@@ -253,21 +277,23 @@ export function findPath(map, aQuery, bQuery, { allShortest = false } = {}) {
   const local = localCalls(map);
   // Two screens: a path by navigation alone answers "how do you get there"; otherwise any kind of link.
   const screens = isScreenHow(a.how) && isScreenHow(b.how);
-  const tries = [...(screens ? [[new Set(['navigate']), 'navigation']] : []), [PATH_KINDS, null]];
-  for (const [kinds, only] of tries) {
+  // With several code folders, a last try lets data flow from a collection to its readers, so the path can cross
+  // from the folder that writes the data to the folder that reads it.
+  const tries = [...(screens ? [[new Set(['navigate']), 'navigation']] : []), [PATH_KINDS, null], ...(isMulti(map) ? [[PATH_KINDS, null, true]] : [])];
+  for (const [kinds, only, dataFlow] of tries) {
     for (const [dir, from, to] of [['forward', a, b], ['reverse', b, a]]) {
-      const adj = adjacency(map, false, kinds);
+      const adj = adjacency(map, false, kinds, !!dataFlow);
       const paths = shortest(adj, [from.node.id], new Set([to.node.id]), limit);
       if (!paths.length) continue;
       return {
-        status: 'found', direction: dir, only, ...base, length: paths[0].length - 1,
+        status: 'found', direction: dir, only, ...base, length: paths[0].length - 1, ...(dataFlow ? { dataFlow: true } : {}),
         // A path is only as sure as its least sure hop.
         paths: paths.map(p => {
           const hops = chooseEdges(p.slice(1).map((id, i) => ({ from: nodeLabel(byId.get(p[i])), to: nodeLabel(byId.get(id)), edges: adj.get(p[i]).get(id) })), local);
           return hops.map((h, i) => {
             const prev = hops[i - 1]?.edges[0];
             const fn = prev?.kind === 'calls' ? (h.via ? h.via.split(' → ').pop() : prev.function) : null;
-            return { from: h.from, to: h.to, loose: !!h.loose, edges: h.edges.map((e, j) => edgeText(e, j === 0 ? fn : null, j === 0 ? h.via : null)) };
+            return { from: h.from, to: h.to, loose: !!h.loose, cross: crossing(hops, i), edges: h.edges.map((e, j) => edgeText(e, j === 0 ? fn : null, j === 0 ? h.via : null)) };
           });
         }),
       };

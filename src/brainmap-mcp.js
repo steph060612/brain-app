@@ -8,13 +8,14 @@ import { spawn } from 'child_process';
 import { createInterface } from 'readline';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { loadLinks, realOrSelf, inside } from './codemap-status.js';
+import { projectFor } from './codemap-status.js';
 
 const BRAINMAP = join(dirname(fileURLToPath(import.meta.url)), 'brainmap.js');
 const TIMEOUT_MS = 90_000; // a refresh can re-map (60 s limit) before answering
 const VERSION = '1.0.0';
 
-const all = { all: { type: 'boolean', description: 'Show every item instead of the first ones per section.' } };
+const all = { all: { type: 'boolean', description: 'Show every item instead of the first ones per section.' },
+  folder: { type: 'string', description: 'Only this linked code folder (short name), when the project links several.' } };
 const str = (name, description) => ({ [name]: { type: 'string', description } });
 // Short descriptions: they are what the assistant reads in its context for every session.
 const TOOLS = [
@@ -34,17 +35,8 @@ const TOOLS = [
   { name: 'unused', description: 'Files not imported from the entry file, and screens with no incoming navigation found.', props: {}, args: () => [] },
 ];
 
-// The linked project for a folder (the deepest linked folder containing it), or null.
-async function linkedProject(cwd) {
-  const links = await loadLinks();
-  const here = await realOrSelf(cwd);
-  let best = null;
-  for (const folder of Object.values(links)) {
-    const real = await realOrSelf(folder);
-    if (inside(here, real) && (!best || real.length > best.length)) best = real;
-  }
-  return best;
-}
+// The linked project for a folder: any folder linked to it (a project can link several), deepest match.
+const linkedProject = cwd => projectFor(cwd);
 
 function runBrainmap(cwd, args) {
   return new Promise(res => {
@@ -64,7 +56,7 @@ async function callTool(name, args = {}) {
   for (const r of tool.required || []) if (typeof args[r] !== 'string' || !args[r].trim()) return { text: `Missing "${r}".`, isError: true };
   const cwd = process.env.CLAUDE_PROJECT_DIR || process.cwd();
   if (!(await linkedProject(cwd))) return { text: 'No code map: this folder is not linked to a Brain project; search the code directly.' };
-  const r = await runBrainmap(cwd, [tool.name, ...tool.args(args), ...(args.all ? ['--all'] : [])]);
+  const r = await runBrainmap(cwd, [tool.name, ...tool.args(args), ...(args.all ? ['--all'] : []), ...(typeof args.folder === 'string' && args.folder.trim() ? ['--folder', args.folder.trim()] : [])]);
   return { text: r.text || '(no output)', isError: r.code !== 0 && !r.text };
 }
 
@@ -78,7 +70,7 @@ async function handle(msg) {
     case 'initialize':
       return reply({ protocolVersion: params?.protocolVersion || '2025-06-18', capabilities: { tools: {} },
         serverInfo: { name: 'brainmap', version: VERSION },
-        instructions: 'Code map of the JavaScript or TypeScript project in this folder (if it is linked in the Brain app). Use these tools before searching files for structure questions.' });
+        instructions: 'Code map of the JavaScript or TypeScript project in this folder (if it is linked in the Brain app; a project can link several folders that share one map). Use these tools before searching files for structure questions.' });
     case 'ping': return reply({});
     case 'tools/list':
       return reply({ tools: TOOLS.map(t => ({ name: t.name, description: t.description,

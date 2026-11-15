@@ -56,9 +56,10 @@ Starts Vite on port 5174 (with hot reload) and the API on port 3001 in parallel.
 
 ## Code maps
 
-A project's panel can link a code folder (stored in `~/.brain/code-folders.json`, never in `~/Brain`) and
-**Map project**: the server runs `node src/mapper.js <folder> <slug>` (spawned with an argument list, 60 second
-limit) and writes `~/.brain/maps/<slug>/map.json` (schemaVersion 11). Literal document IDs in Firestore paths (generated-looking
+A project's panel can link one or more code folders (stored in `~/.brain/code-folders.json` as
+`slug → [{ name, path }]`, never in `~/Brain`; the older `slug → "/path"` format is still read and is upgraded in
+place on the next write) and **Map project**: the server runs `node src/mapper.js --folder <name>=<folder> … <slug>`
+(spawned with an argument list, 60 second limit) and writes `~/.brain/maps/<slug>/map.json` (schemaVersion 12). Literal document IDs in Firestore paths (generated-looking
 values, UUIDs, email addresses, long numbers) are replaced by `{id}` before anything is stored, so they never appear in
 the map, the diagram or brainmap; short fixed document names such as `stats/exercisePRs` are kept. Firestore use is read in every folder (app,
 functions/, scripts/): one node per top-level collection (counting everything under it) and one per subcollection
@@ -97,7 +98,42 @@ list (`MODULES.map(({ path }) => <NavLink to={path} />)`) and a path that lands 
 inferred. Targets the map cannot know, or no route matches, are unresolved (kind `navigate`, the same as for screens) with a reason, such as
 `computed target: href` or `no route matches /x`. Back navigation (`navigate(-1)`) and links to other sites are ignored.
 
-The mapper also runs on its own: `node src/mapper.js <project folder> <output name>`.
+The mapper also runs on its own: `node src/mapper.js <project folder> <output name>`, or
+`node src/mapper.js --folder app=~/AppRepo --folder web=~/WebRepo <output name>` for several folders.
+
+### Several code folders in one project
+
+A project can link several folders, for example an app and a website that share one Firestore database
+(PowerPump: `app` = ~/PowerPumpMain, `ptdash` = ~/PowerPumpWebsite). Each linked folder has a short name (letters,
+digits, dash, underscore; default the folder's own name; `collection` and `subcollection` are not allowed). The
+panel's link section is a list: **+ Add folder** (path and optional short name), **Remove** per folder, and each
+folder's own "Map is current" / "Code changed since last map (N files)" / "Not in the map yet" status.
+
+All linked folders go into one `map.json`. Each folder is mapped on its own, so imports, calls, navigation and
+routes stay inside one folder; then the maps are merged. With more than one folder every file id and path starts
+with the folder's short name (`ptdash:ptdash-app/src/lib/clients.js`), `relPath` is the path inside the folder, and
+every node and edge has `codeFolder`; the map lists the folders in `folders` (path, commit, counts each). The data
+layer is the join: a collection or subcollection with the same path pattern is one node, with reads and writes from
+every folder, `byFolder` counts, and `shared: true` when more than one folder touches it (a shared subcollection
+shows the first linked folder's placeholder names; links from a folder that names them differently are tagged
+inferred, "placeholders merged by position"). A cloud function called in one folder and defined in another
+(`httpsCallable(…, 'createCheckoutSession')` in PTdash, `exports.createCheckoutSession` in the app's functions/)
+is a `calls-function` edge with `crossFolder: true`, tagged inferred. Groups are detected per folder (and per root
+inside it), never across folders. A project with one folder gets a map without prefixes, as before.
+
+`brainmap` and the tool server find the project from any linked folder, so an assistant working in PTdash gets
+the same merged map. Every command takes `--folder <name>` (the tools a `folder` argument) to limit the output to
+one folder. Without it, readers, writers and callers are grouped by folder with the folder's name before the path,
+`collection` says which folders touch it, and `path` can cross folders through shared data (a written collection
+"is read by" a file in the other folder) or a cross-folder cloud function, and marks that hop. `report`, `groups`,
+`query` and `unused` are computed per folder; `report` ends with an "Across folders" section listing the shared
+collections with their readers and writers on each side, collections only one folder touches, and cross-folder
+cloud function calls. The automatic refresh checks every linked folder and re-maps the project when any changed
+(or a folder was added or removed). **Enable for assistants** writes its block into every linked folder; each
+folder's files keep their own `created-file` marker, so **Remove** deletes only files the app created in that
+folder. Strict mode applies to the first linked folder. In the diagram's Files view, "Color by: Folder | Group |
+Code folder" adds the code folder as a grouping; folder bubbles carry the code folder's name. A single-folder
+project looks exactly as before.
 
 ### brainmap (for coding assistants)
 
@@ -136,7 +172,7 @@ page file; `path` takes the same, so `path /clients /clients/123` follows naviga
 the import graph), rare links between folders and five ready-to-run follow-up commands; the diagram shows the same
 report in its findings. `collection` also lists the
 functions that read or write it and who calls them ("Through functions"; `--depth 2` adds the callers of those
-callers). Run it inside a linked folder, or pass `--project <name>`. Before answering it runs the same "code changed
+callers). Run it inside a linked folder (any folder of the project), or pass `--project <name>`. Before answering it runs the same "code changed
 since last map" check as the panel and re-maps when needed. It prints paths, names and numbers only, never file
 contents. `install.sh` links it next to `brainpack` (`~/.brain/brainmap.sh`, symlinked into `/opt/homebrew/bin` or
 `/usr/local/bin`).

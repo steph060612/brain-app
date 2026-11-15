@@ -7,7 +7,7 @@
 import { readFileSync, mkdirSync, openSync, closeSync, existsSync, readdirSync, statSync, unlinkSync } from 'fs';
 import { homedir } from 'os';
 import { join, basename } from 'path';
-import { loadLinks, realOrSelf, inside, mapFile } from './codemap-status.js';
+import { projectFor, mapFile } from './codemap-status.js';
 
 export const STATE_DIR = process.env.BRAINMAP_HOOK_STATE || join(homedir(), '.brain', 'strict-sessions');
 export const MESSAGE = 'This project has a code map. Before searching the code, use the brainmap tools '
@@ -39,12 +39,10 @@ export function isCodeSearch(tool, input = {}) {
   return false;
 }
 
-// Does the folder belong to a linked project that has a map?
+// Does the folder belong to a linked project (any of its linked folders) that has a map?
 async function hasMap(cwd) {
-  const links = await loadLinks();
-  const here = await realOrSelf(cwd);
-  for (const [slug, folder] of Object.entries(links)) if (inside(here, await realOrSelf(folder)) && existsSync(mapFile(slug))) return true;
-  return false;
+  const p = await projectFor(cwd);
+  return !!p && existsSync(mapFile(p.slug));
 }
 
 // Claims "this session was reminded" atomically; true only for the first caller in a session.

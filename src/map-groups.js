@@ -119,6 +119,7 @@ export function detectGroups(files, edges) {
   let sw = active.map(id => selfW.get(id) || 0);
   for (let level = 0; level < 20; level++) {
     const n = members.length;
+    if (!n) break; // a root whose files link to nothing: every file is isolated
     const comm = refine(n, nb, moveNodes(n, nb, sw, rand));
     const count = Math.max(...comm) + 1;
     if (count === n) break;

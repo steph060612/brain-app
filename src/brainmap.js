@@ -1,20 +1,24 @@
 #!/usr/bin/env node
 // brainmap: read-only answers about a mapped code project, for coding assistants. Reads
-// ~/.brain/maps/<slug>/map.json (schemaVersion 11); refreshes it first when the code changed (the same check
-// as the Brain app's "Map is current"). Prints paths, names and numbers only, never file contents.
+// ~/.brain/maps/<slug>/map.json (schemaVersion 12); refreshes it first when the code changed in any linked
+// folder (the same check as the Brain app's "Map is current"). A project can link several code folders mapped
+// into one map: paths then start with the folder's short name (ptdash:src/x.js), --folder limits the output to
+// one folder, and report, groups, query and unused run per folder. Prints paths, names and numbers only, never
+// file contents.
 // No network, no model calls.
 import { stat } from 'fs/promises';
 import { findPath, computeReport, queryMap, callerTree, callIndex, routesFor } from './map-report.js';
 import {
-  loadLinks, readMap, mapStatus, runMapper, gitAvailable, realOrSelf, inside, tilde,
+  loadProjects, projectFor, readMap, projectStatus, statusReason, runMapper, gitAvailable, tilde,
 } from './codemap-status.js';
+import { forFolder, crossFolder, isMulti, folderNames, scopeQuery, prefixed } from './map-folders.js';
 
 const LIST = 10;          // default items per section; --all shows everything
 const WIDTH = 110;
 const IMPORT_KINDS = new Set(['import', 'require', 're-export', 'dynamic']);
 const HELP = `brainmap: read-only map of a JavaScript or TypeScript project linked in the Brain app.
 
-Usage: brainmap <command> [argument] [--all] [--depth 2] [--types] [--project <name>] [--no-refresh]
+Usage: brainmap <command> [argument] [--all] [--depth 2] [--types] [--folder <name>] [--project <name>] [--no-refresh]
   overview              project summary: entry files, folders, most imported files, screens, collections, functions
   files <folder>        files in a folder, with line counts and exported names
   file <path>           exports, imports, importers, navigation, collections and functions of one file
@@ -35,8 +39,13 @@ Usage: brainmap <command> [argument] [--all] [--depth 2] [--types] [--project <n
   find <text>           matches in file paths, exported names, screens and collections
   unused                files not imported from the entry file, screens with no incoming navigation found
 
-The project is the linked folder that contains the current folder, or --project <name>.
-Each list shows its first items with "(+N more, use --all)"; --all shows everything. Paths are relative to the project folder.`;
+The project is the one whose linked folder contains the current folder (any of its folders), or --project <name>.
+Each list shows its first items with "(+N more, use --all)"; --all shows everything. Paths are relative to the project folder.
+Several code folders: a project can link several folders (an app and a website on one database), mapped as one.
+  Paths then start with the folder's short name (ptdash:src/lib/x.js); a path without it works when it is unique.
+  Readers, writers and callers are grouped by folder; collection says which folders touch it; path can cross
+  folders through shared data or a cloud function, and marks that hop. report, groups, query and unused are
+  computed per folder (report adds the shared collections). --folder <name> limits any command to one folder.`;
 
 // ─── output ──────────────────────────────────────────────────────────────────
 const lines = [];
@@ -69,13 +78,15 @@ function die(msg, code = 1) { process.stdout.write([...lines, msg].join('\n') + 
 
 // ─── arguments ───────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const o = { all: false, refresh: true, project: null, depth: 1, allShortest: false, pos: [] };
+  const o = { all: false, refresh: true, project: null, folder: null, depth: 1, allShortest: false, pos: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--all' || a === '-a') o.all = true;
     else if (a === '--no-refresh') o.refresh = false;
     else if (a === '--project' || a === '-p') o.project = argv[++i] ?? '';
     else if (a.startsWith('--project=')) o.project = a.slice(10);
+    else if (a === '--folder' || a === '-f') o.folder = argv[++i] ?? '';
+    else if (a.startsWith('--folder=')) o.folder = a.slice(9);
     else if (a === '--all-shortest') o.allShortest = true;
     else if (a === '--types') o.types = true;
     else if (a === '--depth') o.depth = Number(argv[++i]);
@@ -88,18 +99,13 @@ function parseArgs(argv) {
 
 // ─── project, map, refresh ───────────────────────────────────────────────────
 async function findProject(name) {
-  const links = await loadLinks();
+  const projects = await loadProjects();
   if (name) {
-    const key = Object.keys(links).find(k => k.toLowerCase() === name.toLowerCase()) ?? name.toLowerCase();
-    return { slug: key, folder: links[key] ?? null };
+    const key = Object.keys(projects).find(k => k.toLowerCase() === name.toLowerCase()) ?? name.toLowerCase();
+    return { slug: key, folders: projects[key] ?? [] };
   }
-  const cwd = await realOrSelf(process.cwd());
-  let best = null;
-  for (const [slug, folder] of Object.entries(links)) {
-    const real = await realOrSelf(folder);
-    if (inside(cwd, real) && (!best || real.length > best.folder.length)) best = { slug, folder: real };
-  }
-  return best;
+  const p = await projectFor(process.cwd());
+  return p && { slug: p.slug, folders: p.folders };
 }
 
 async function loadProject(opts) {
@@ -109,35 +115,36 @@ async function loadProject(opts) {
 To create a map: in the Brain app, open the project, click "Link code folder", choose this folder, then click "Map project".
 Or name a project: brainmap overview --project <name>`);
   }
-  let folderOk = false;
-  if (p.folder) { try { folderOk = (await stat(p.folder)).isDirectory(); } catch { } }
+  const ok = [], gone = [];
+  for (const f of p.folders) { let d = false; try { d = (await stat(f.path)).isDirectory(); } catch { } (d ? ok : gone).push(f); }
+  const allThere = p.folders.length > 0 && !gone.length;
   let m;
   try { m = await readMap(p.slug); } catch (e) {
-    // A map in an older format is replaced right away when the folder is available.
-    if (!e.outdated || !folderOk) die(`${e.message}\nIn the Brain app, open the project and click "Re-map".`);
+    // A map in an older format is replaced right away when the folders are available.
+    if (!e.outdated || !allThere) die(`${e.message}\nIn the Brain app, open the project and click "Re-map".`);
     const t0 = Date.now();
-    try { await runMapper(p.folder, p.slug, await gitAvailable()); m = await readMap(p.slug); }
+    try { await runMapper(p.folders, p.slug, await gitAvailable()); m = await readMap(p.slug); }
     catch (e2) { die(`The map is in an older format and could not be re-made (${e2.message}).\nIn the Brain app, open the project and click "Re-map".`); }
     say(`Map refreshed: it was in an older format (${((Date.now() - t0) / 1000).toFixed(1)} s).`);
     opts = { ...opts, refresh: false }; // just made from the current code
   }
   if (!m) {
-    die(p.folder
-      ? `Project "${p.slug}" is linked to ${tilde(p.folder)} but has not been mapped yet.\nTo create the map: in the Brain app, open the project and click "Map project".`
+    die(p.folders.length
+      ? `Project "${p.slug}" is linked to ${p.folders.map(f => tilde(f.path)).join(' and ')} but has not been mapped yet.\nTo create the map: in the Brain app, open the project and click "Map project".`
       : `No project "${p.slug}" is linked or mapped.\nTo create one: in the Brain app, open the project, click "Link code folder", then "Map project".`);
   }
-  if (!p.folder) say(`Note: "${p.slug}" is not linked to a code folder any more; this map may be out of date.`);
-  else if (!folderOk) say(`Note: the linked folder ${tilde(p.folder)} was not found; this map may be out of date.`);
+  if (!p.folders.length) say(`Note: "${p.slug}" is not linked to a code folder any more; this map may be out of date.`);
+  else if (gone.length) say(`Note: the linked folder${gone.length > 1 ? 's' : ''} ${gone.map(f => tilde(f.path)).join(', ')} ${gone.length > 1 ? 'were' : 'was'} not found; this map may be out of date.`);
   else if (opts.refresh) {
+    // Every linked folder is checked; the whole project is re-mapped when any of them changed.
     const useGit = await gitAvailable();
     let st = null;
-    try { st = await mapStatus(p.folder, m.map, useGit); } catch (e) { say(`Note: could not check for changes (${e.message}).`); }
+    try { st = await projectStatus(p.folders, m.map, useGit); } catch (e) { say(`Note: could not check for changes (${e.message}).`); }
     if (st && st.state !== 'current') {
-      const why = st.state === 'other-folder' ? `the map was made from ${st.mappedFolder}`
-        : st.changedFiles ? `${plural(st.changedFiles, 'source file')} changed since the last map` : 'the code changed since the last map';
+      const why = statusReason(st);
       const t0 = Date.now();
       try {
-        await runMapper(p.folder, p.slug, useGit);
+        await runMapper(p.folders, p.slug, useGit);
         m = await readMap(p.slug);
         say(`Map refreshed: ${why} (${((Date.now() - t0) / 1000).toFixed(1)} s).`);
       } catch (e) {
@@ -145,7 +152,14 @@ Or name a project: brainmap overview --project <name>`);
       }
     }
   }
-  return { slug: p.slug, folder: p.folder, map: m.map };
+  const P = { slug: p.slug, folder: p.folders[0]?.path ?? null, folders: p.folders, map: m.map, full: m.map };
+  if (opts.folder !== null) {
+    const names = folderNames(m.map);
+    const name = names.find(n => n === String(opts.folder).toLowerCase());
+    if (!name) die(`No code folder "${opts.folder}" in this map. Folders: ${names.join(', ') || 'none'}.`);
+    if (isMulti(m.map)) { P.map = forFolder(m.map, name); P.only = name; }
+  }
+  return P;
 }
 
 const when = iso => {
@@ -168,28 +182,35 @@ function index(map) {
   const collections = map.nodes.filter(n => n.kind === 'collection');
   const subs = map.nodes.filter(n => n.kind === 'subcollection');
   const unresolvedCalls = (map.unresolved || []).filter(u => u.kind === 'call');
-  return { files, byPath, out, inn, screens, collections, subs, unresolvedCalls };
+  return { map, files, byPath, out, inn, screens, collections, subs, unresolvedCalls };
 }
 
-const folderOf = f => (f.rootGroup !== 'app' ? f.rootGroup : f.topFolder === '(root)' ? '(root)' : f.topFolder);
+// With several code folders, the folder's short name goes in front: ptdash:src.
+const cfPrefix = f => (prefixed(f) ? `${f.codeFolder}:` : '');
+const folderOf = f => cfPrefix(f) + (f.rootGroup !== 'app' ? f.rootGroup : f.topFolder === '(root)' ? '(root)' : f.topFolder);
 
-// A path from the user: exact, then path suffix, then file name, then name without extension.
+// A path from the user: exact, then path suffix, then file name, then name without extension. With several code
+// folders, "ptdash:src/x.js" looks only in that folder and "src/x.js" in all of them (it must be unique).
 function resolveFile(ix, q) {
   q = String(q || '').replace(/^\.\//, '');
   if (!q) die('Give a file path, for example: brainmap file src/App.js');
   if (ix.byPath.has(q)) return ix.byPath.get(q);
-  const low = q.toLowerCase();
+  const scope = scopeQuery(ix.map, q);
+  const files = scope.folder ? ix.files.filter(f => f.codeFolder === scope.folder) : ix.files;
+  const rel = f => f.relPath ?? f.path;
+  const low = scope.rest.replace(/^\.\//, '').toLowerCase();
   const tries = [
-    f => f.path.toLowerCase().endsWith('/' + low),
+    f => rel(f).toLowerCase() === low,
+    f => rel(f).toLowerCase().endsWith('/' + low),
     f => f.path.split('/').pop().toLowerCase() === low,
     f => f.path.split('/').pop().replace(/\.[^.]+$/, '').toLowerCase() === low,
   ];
   for (const t of tries) {
-    const hits = ix.files.filter(t);
+    const hits = files.filter(t);
     if (hits.length === 1) return hits[0];
     if (hits.length > 1) die(`"${q}" matches ${hits.length} files; use the full path:\n${hits.slice(0, 20).map(f => `  ${f.path}`).join('\n')}`);
   }
-  const near = ix.files.filter(f => f.path.toLowerCase().includes(low)).slice(0, 10);
+  const near = files.filter(f => f.path.toLowerCase().includes(low)).slice(0, 10);
   die(`No mapped file "${q}".${near.length ? `\nSimilar:\n${near.map(f => `  ${f.path}`).join('\n')}` : ''}\nOnly JavaScript files are mapped.`);
 }
 
@@ -207,16 +228,22 @@ const destWord = es => { const nav = es.filter(e => e.kind === 'navigate'); cons
 function overview(P, ix) {
   const { map } = P;
   const c = map.counts || {};
-  say(`${P.slug}  ${tilde(map.project?.path || P.folder || '')}  mapped ${when(map.generatedAt)}${map.project?.gitCommit ? ` (commit ${map.project.gitCommit.slice(0, 7)})` : ''}`);
+  if (isMulti(map)) {
+    say(`${P.slug}  ${map.folders.length} code folders, mapped together ${when(map.generatedAt)}`);
+    for (const f of map.folders) say(`  ${f.name}  ${tilde(f.path)}  ${plural(ix.files.filter(x => x.codeFolder === f.name).length, 'file')}${f.gitCommit ? ` (commit ${f.gitCommit.slice(0, 7)})` : ''}`);
+    const cf = crossFolder(map);
+    say(`Shared between folders: ${plural(cf.data.filter(d => d.kind === 'collection').length, 'collection')}, ${plural(cf.data.filter(d => d.kind === 'subcollection').length, 'subcollection')}${cf.calls.length ? `, ${plural(cf.calls.length, 'cloud function call')} into another folder` : ''} (brainmap report)`);
+  } else say(`${P.slug}${P.only ? ` (folder ${P.only})` : ''}  ${tilde(map.project?.path || P.folder || '')}  mapped ${when(map.generatedAt)}${map.project?.gitCommit ? ` (commit ${map.project.gitCommit.slice(0, 7)})` : ''}`);
   const fnNames = map.functions?.exported || [];
   say(`${plural(ix.files.length, 'file')}, ${plural(c.edges ?? map.edges.length, 'link')}, ${plural(ix.screens.filter(s => !s.route).length, 'screen')}, ${routeCount(ix) ? `${plural(routeCount(ix), 'web route')}, ` : ''}${plural(ix.collections.length, 'collection')}, ${plural(fnNames.length, 'cloud function')}`);
   const langs = map.counts?.filesByLanguage || {};
   if (Object.keys(langs).length) say(`Languages: ${Object.entries(langs).map(([l, n]) => `${n} ${l === 'typescript' ? 'TypeScript' : 'JavaScript'}`).join(', ')}${map.skippedFiles?.length ? `; skipped ${plural(map.skippedFiles.length, 'file')} (${[...new Set(map.skippedFiles.map(x => x.reason.split(' (')[0]))].join(', ')})` : ''}`);
   const groups = map.rootGroups || [];
-  wrapList('Entry files: ', groups.map(g => (g.entry ? `${g.entry} (${g.name})` : `${g.dir || g.name}/ has no entry file (${plural(g.fileCount, 'file')})`)));
+  const gname = g => (isMulti(map) ? `${g.codeFolder}:` : '') + (g.dir || g.name);
+  wrapList('Entry files: ', groups.map(g => (g.entry ? `${g.entry} (${g.name})` : `${gname(g)}/ has no entry file (${plural(g.fileCount, 'file')})`)));
   const fc = new Map();
   for (const f of ix.files) fc.set(folderOf(f), (fc.get(folderOf(f)) || 0) + 1);
-  wrapList('Folders: ', [...fc].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([k, n]) => `${k === '(root)' ? '(root files)' : `${k}/`} ${n}`), Infinity);
+  wrapList('Folders: ', [...fc].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([k, n]) => `${k.endsWith('(root)') ? k.replace('(root)', '(root files)') : `${k}/`} ${n}`), Infinity);
   say('Most imported:');
   for (const f of [...ix.files].sort((a, b) => (b.importedBy || 0) - (a.importedBy || 0) || a.path.localeCompare(b.path)).slice(0, 10)) {
     say(`  ${String(f.importedBy || 0).padStart(3)}  ${f.path}`);
@@ -230,10 +257,10 @@ function overview(P, ix) {
   const called = map.functions?.names || {};
   wrapList(`Cloud functions (${fnNames.length}${Object.keys(called).length ? `, ${Object.keys(called).length} called from code` : ''}): `,
     fnNames.map(n => (called[n]?.callers?.length ? `${n} ←${called[n].callers.length}` : n)), Infinity);
-  const app = groups.find(g => g.entry && g.name === 'app');
+  const apps = groups.filter(g => g.entry && g.name === 'app');
   const standalone = groups.filter(g => !g.entry).reduce((s, g) => s + (g.fileCount || 0), 0);
   const noNav = ix.screens.filter(s => !s.incomingNavigation && !s.incomingAsNestedParent).length;
-  say(`Not imported from ${app?.entry ?? 'the entry file'}: ${app?.notImportedFromOwnEntry ?? '?'} app files${standalone ? ` (+${standalone} standalone scripts)` : ''} · screens with no incoming navigation: ${noNav} · unresolved: ${(map.unresolved || []).length}`);
+  say(`Not imported from ${apps.map(a => a.entry).join(' / ') || 'the entry file'}: ${apps.length ? apps.reduce((s, a) => s + (a.notImportedFromOwnEntry || 0), 0) : '?'} app files${standalone ? ` (+${standalone} standalone scripts)` : ''} · screens with no incoming navigation: ${noNav} · unresolved: ${(map.unresolved || []).length}`);
   say('More: brainmap file <path> | impact <path> | screen <name> | collection <name> | function <name> | files <folder> | find <text> | unused');
 }
 
@@ -284,9 +311,9 @@ function fileCmd(P, ix, q) {
   const unknown = (P.map.data?.usesWithUnknownOperation || []).filter(u => u.file === f.path);
   if (unknown.length) wrapList('Firestore use, read or write unknown: ', unknown.map(u => `${u.collection} line ${u.line}`));
   const calls = groupBy(out.filter(e => e.kind === 'calls-function'), e => e.function);
-  if (calls.size) wrapList('Calls cloud functions: ', [...calls].map(([n, es]) => `${n} (${es[0].to})${linesOf(es)}`));
-  const served = Object.entries(P.map.functions?.names || {}).filter(([, v]) => v.definedIn === f.path);
-  if (served.length) wrapList('Defines called cloud functions: ', served.map(([n, v]) => `${n} ←${v.callers.length}`));
+  if (calls.size) wrapList('Calls cloud functions: ', [...calls].map(([n, es]) => `${n} (${es[0].to}${es[0].crossFolder ? `, in folder ${es[0].toFolder}` : ''})${linesOf(es)}`));
+  const served = groupBy(inn.filter(e => e.kind === 'calls-function'), e => e.function);
+  if (served.size) wrapList('Defines called cloud functions: ', [...served].map(([n, es]) => `${n} ←${es.length}${es.some(e => e.crossFolder) ? ` (${es.filter(e => e.crossFolder).length} from ${[...new Set(es.filter(e => e.crossFolder).map(e => e.codeFolder))].join(', ')})` : ''}`));
 }
 
 // impact <file:function>: everything that reaches the function through calls, up to 3 levels across files
@@ -374,7 +401,8 @@ function screenCmd(P, ix, q) {
       : `Screen ${s.name}: ${s.file || 'no file found'}  (${s.navigator || 'navigator'}${s.parent ? ` in ${s.parent}` : ''}, declared in ${s.navigatorFile}:${s.line})`);
   }
   const files = new Set(hits.map(s => s.file).filter(Boolean));
-  const from = P.map.edges.filter(e => e.kind === 'navigate' && (names.has(e.screen) || (files.has(e.to) && !e.screen)));
+  const folders = new Set(hits.map(s => s.codeFolder)); // navigation never crosses folders
+  const from = P.map.edges.filter(e => e.kind === 'navigate' && (names.has(e.screen) || (files.has(e.to) && !e.screen)) && (!e.codeFolder || folders.has(e.codeFolder)));
   const fromBy = groupBy(from, e => e.from);
   const nested = hits.reduce((s, h) => s + (h.incomingAsNestedParent || 0), 0);
   say(`Reached from ${plural(fromBy.size, 'file')} (${plural(from.length, 'call')})${nested ? `, plus ${nested} navigation calls into screens nested inside it` : ''}:`);
@@ -437,10 +465,12 @@ function pathCmd(P, ix, args) {
     path.conf = path.some(h => h.edges[0].inferred) ? 'inferred (at least one hop was derived by the mapper)' : 'extracted (every hop is written in the code)';
     path.forEach((h, j) => {
       const e = h.edges[0];
-      say(`  ${j + 1}. ${h.from} —${e.kind}${e.what ? ` ${e.what}` : ''}→ ${h.to}  (${e.at})${h.loose ? '  [files connect here, but no call reaches the next step]' : ''}`);
+      say(`  ${j + 1}. ${h.from} —${e.kind}${e.what ? ` ${e.what}` : ''}→ ${h.to}  (${e.at})${h.loose ? '  [files connect here, but no call reaches the next step]' : ''}${h.cross ? `  [${h.cross}]` : ''}`);
       if (h.edges.length > 1) say(`     also: ${h.edges.slice(1, ALL ? undefined : 3).map(x => `${x.kind}${x.what ? ` ${x.what}` : ''} (${x.at})`).join('; ')}${!ALL && h.edges.length > 3 ? `; +${h.edges.length - 3} more` : ''}`);
     });
     say(`  Confidence: ${path.conf}`);
+    const crossings = path.filter(h => h.cross).length;
+    if (crossings) say(`  Crosses code folders ${crossings === 1 ? 'once' : `${crossings} times`}: the folders share no code, only ${path.some(h => /shared data/.test(h.cross || '')) ? 'the data' : ''}${path.some(h => /shared data/.test(h.cross || '')) && path.some(h => /cloud function/.test(h.cross || '')) ? ' and ' : ''}${path.some(h => /cloud function/.test(h.cross || '')) ? 'cloud functions' : ''}.`);
   });
 }
 
@@ -517,7 +547,7 @@ function groupCmd(P, ix, q) {
 function reportCmd(P) {
   const r = computeReport(P.map);
   const kinds = o => Object.entries(o.byKind).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${n} ${k}`).join(', ');
-  say(`Report for ${P.slug} (map from ${when(P.map.generatedAt)}); links = imports, calls, navigation, cloud functions, reads, writes.`);
+  say(`Report for ${P.slug}${P.only ? `, folder ${P.only}` : ''} (map from ${when(P.map.generatedAt)}); links = imports, calls, navigation, cloud functions, reads, writes.`);
   say('Most depended-on files (incoming links):');
   items(r.dependedOn.map(x => `${String(x.total).padStart(4)}  ${x.file}  (${kinds(x)})`));
   say('Most dependent files (outgoing links):');
@@ -539,6 +569,27 @@ function reportCmd(P) {
   }
   say('Suggested next questions:');
   items(r.questions.map(q => `${q.cmd}   # ${q.why}`));
+}
+
+// The part of report that only a project with several code folders has: data both sides touch, from where, and
+// cloud function calls from one folder into another.
+function crossFolderCmd(P, ix) {
+  const r = crossFolder(P.map);
+  say(`=== Across folders (${folderNames(P.map).join(', ')}): the folders share no imports or calls; they meet in the data and in cloud functions`);
+  say(`Shared collections and subcollections (${r.data.length}), with the files that touch them on each side:`);
+  const shown = ALL ? r.data : r.data.slice(0, LIST);
+  for (const d of shown) {
+    say(`  ${d.name}${d.kind === 'subcollection' ? ' (subcollection)' : ''}`);
+    for (const f of d.byFolder) {
+      const list = (k, xs) => (xs.length ? `${k} ${xs.length}: ${xs.slice(0, ALL ? undefined : 4).map(x => x.slice(f.folder.length + 1)).join(', ')}${!ALL && xs.length > 4 ? `, +${xs.length - 4}` : ''}` : `${k} 0`);
+      say(`    ${f.folder}: ${list('read by', f.readers)}; ${list('written by', f.writers)}${f.unknown ? `; ${f.unknown} unknown` : ''}`);
+    }
+  }
+  if (shown.length < r.data.length) say(`  (+${r.data.length - shown.length} more, use --all)`);
+  for (const [k, cols] of Object.entries(r.only)) wrapList(`Collections only ${k} touches (${cols.length}): `, cols, 15);
+  say(`Cloud function calls into another folder (${r.calls.length}):`);
+  items(r.calls.length ? r.calls.map(c => `${c.from}:${c.line} → ${c.function}  (defined in ${c.to})`) : ['none']);
+  say('Next: brainmap collection <name> (readers and writers by folder) | brainmap path <file in one folder> <file in the other>');
 }
 
 // ─── function calls ──────────────────────────────────────────────────────────
@@ -573,9 +624,8 @@ function sayTree(nodes, pad, limit = 4) {
 function sayCallers(ix, nodes, limit) {
   const gs = mergeNodes(nodes), other = gs.filter(g => !g.e.sameFile), same = gs.filter(g => g.e.sameFile);
   const byFolder = groupBy(other, g => folderLabel(ix.byPath.get(g.e.from)));
-  const rank = k => (k === 'functions/' || k === 'scripts/' ? 1 : 0);
   let shown = 0;
-  for (const k of [...byFolder.keys()].sort((x, y) => rank(x) - rank(y) || x.localeCompare(y))) {
+  for (const k of [...byFolder.keys()].sort(headingOrder)) {
     if (!ALL && shown >= limit) break;
     say(`  ${k} (${byFolder.get(k).length})`);
     for (const g of byFolder.get(k)) { if (!ALL && shown >= limit) break; say(`    ${rowText(g)}`); sayTree(g.children, '      '); shown++; }
@@ -660,13 +710,19 @@ function callersCmd(P, ix, q) {
 }
 
 // The folder a file is listed under: its own root (functions/, scripts/) or its top-level app folder.
-const folderLabel = f => (!f ? '?' : f.rootGroup !== 'app' ? `${f.rootGroup}/` : f.topFolder === '(root)' ? '(root files)' : `${f.topFolder}/`);
+const folderLabel = f => (!f ? '?' : cfPrefix(f) + (f.rootGroup !== 'app' ? `${f.rootGroup}/` : f.topFolder === '(root)' ? '(root files)' : `${f.topFolder}/`));
+// Folder headings in order: by code folder (the folder's name comes first), then app folders before the separate
+// roots (functions/, scripts/), then by name.
+const headingOrder = (a, b) => {
+  const cf = k => (/^[a-z0-9_-]+:/.test(k) ? k.slice(0, k.indexOf(':')) : '');
+  const rank = k => (/(^|:)(functions|scripts)\/$/.test(k) ? 1 : 0);
+  return cf(a).localeCompare(cf(b)) || rank(a) - rank(b) || a.localeCompare(b);
+};
 
 // Lines grouped under folder headings, cut after `limit` lines in all with "(+N more, use --all)".
 function groupedByFolder(ix, rows, limit = 15) {
   const by = groupBy(rows, r => folderLabel(ix.byPath.get(r.file)));
-  const rank = k => (k === 'functions/' || k === 'scripts/' ? 1 : 0); // app folders first, then the separate roots
-  const order = [...by.keys()].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+  const order = [...by.keys()].sort(headingOrder);
   let shown = 0;
   for (const k of order) {
     if (!ALL && shown >= limit) break;
@@ -712,6 +768,10 @@ function collectionCmd(P, ix, q) {
     const unknown = unknownAll.filter(u => (sub ? u.subcollection === n.key : u.collection === n.name));
     const uf = new Set(unknown.map(u => u.file)).size;
     say(`${sub ? 'Subcollection' : 'Collection'} ${label(n)}: read by ${plural(n.readers, 'file')}, written by ${plural(n.writers, 'file')}${unknown.length ? `; read or write unknown: ${plural(unknown.length, 'use')} in ${plural(uf, 'file')}` : ''}${n.collectionGroup ? ' (also queried as a collection group)' : ''}`);
+    if (isMulti(P.map)) {
+      const by = Object.entries(n.byFolder || {});
+      say(`Touched by ${by.length === 1 ? `only the ${by[0][0]} folder` : `${by.length} folders (shared data)`}: ${by.map(([k, v]) => `${k} (${v.readers} read, ${v.writers} write${v.unknown ? `, ${v.unknown} unknown` : ''})`).join('; ')}`);
+    }
     if (!sub) {
       const children = ix.subs.filter(x => x.parent === n.name);
       if (children.length) wrapList(`Counts include its ${plural(children.length, 'subcollection')}: `, children.map(x => `${x.pattern} (${x.readers}r/${x.writers}w)`), 10);
@@ -744,8 +804,8 @@ function functionCmd(P, ix, q) {
   say(`Cloud function ${name}: defined in ${defined || 'unknown file'}${(fn.exported || []).includes(name) ? ' (exported)' : ''}`);
   const calls = P.map.edges.filter(e => e.kind === 'calls-function' && e.function === name);
   const by = groupBy(calls, e => e.from);
-  say(`Called from ${plural(by.size, 'file')}:`);
-  items([...by].map(([p, es]) => `${p}${linesOf(es)}`), 20);
+  say(`Called from ${plural(by.size, 'file')}${isMulti(P.map) ? ', by folder' : ''}:`);
+  items([...by].sort((a, b) => headingOrder(a[0], b[0])).map(([p, es]) => `${p}${linesOf(es)}${es[0].crossFolder ? `  [from another folder: ${es[0].codeFolder} → ${es[0].toFolder}]` : ''}`), 20);
   if (!by.size) say('  none found in the code (it may run on a schedule, an HTTP request or a database trigger)');
 }
 
@@ -775,7 +835,7 @@ function unusedCmd(P, ix) {
     say(`Not imported from ${g.entry} (${g.name}): ${list.length}`);
     items(list.map(f => `${f.path}${f.importedBy ? `  (imported by ${f.importedBy} unreached file${f.importedBy === 1 ? '' : 's'})` : ''}`), 25);
   }
-  for (const g of groups.filter(g => !g.entry)) say(`${g.dir || g.name}/: ${plural(g.fileCount, 'file')} with no entry file (standalone scripts, run by hand); not listed`);
+  for (const g of groups.filter(g => !g.entry)) say(`${g.codeFolder && P.only ? `${g.codeFolder}:` : ''}${g.dir || g.name}/: ${plural(g.fileCount, 'file')} with no entry file (standalone scripts, run by hand); not listed`);
   const noNav = ix.screens.filter(s => !s.incomingNavigation && !s.incomingAsNestedParent);
   say(`Screens with no incoming navigation found: ${noNav.length}`);
   items(noNav.map(s => `${s.name}${s.parent ? ` (in ${s.parent})` : ''}  ${s.file || 'no file'}`), 20);
@@ -783,6 +843,8 @@ function unusedCmd(P, ix) {
 }
 
 // ─── main ────────────────────────────────────────────────────────────────────
+// Commands answered per code folder when the project links several (unless --folder picks one).
+const PER_FOLDER = new Set(['report', 'groups', 'query', 'unused']);
 const COMMANDS = { notes: notesCmd, groups: groupsCmd, group: groupCmd, query: queryCmd, path: pathCmd, report: reportCmd, callers: callersCmd, overview, files: filesCmd, file: fileCmd, impact: impactCmd, screen: screenCmd, collection: collectionCmd, function: functionCmd, find: findCmd, unused: unusedCmd };
 
 async function main() {
@@ -797,7 +859,19 @@ async function main() {
   ALL_SHORTEST = opts.allShortest;
   TYPES = !!opts.types;
   const P = await loadProject(opts);
-  run(P, index(P.map), cmd === 'path' ? rest : rest.join(' '));  // query takes the words, quoted or not
+  const arg = cmd === 'path' ? rest : rest.join(' ');  // query takes the words, quoted or not
+  if (PER_FOLDER.has(cmd) && isMulti(P.map)) {
+    // Computed for each code folder on its own; groups never span folders.
+    for (const name of folderNames(P.map)) {
+      const F = { ...P, map: forFolder(P.map, name), only: name };
+      say(`=== Folder ${name} (${tilde(F.map.project.path)})`);
+      CIDX = null;
+      run(F, index(F.map), arg);
+      say('');
+    }
+    CIDX = null;
+    if (cmd === 'report') crossFolderCmd(P, index(P.map));
+  } else run(P, index(P.map), arg);
   flush();
 }
 

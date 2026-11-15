@@ -14,7 +14,7 @@ import { pathToFileURL } from 'node:url';
 import { parse } from '@babel/parser';
 import { detectGroups, nameGroups, SEED as GROUP_SEED, WEIGHTS as GROUP_WEIGHTS } from './map-groups.js';
 
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 const IMPORT_KINDS = ['import', 're-export', 'require', 'dynamic'];
 const KINDS = {
   nodes: ['file', 'collection', 'subcollection'],
@@ -46,7 +46,7 @@ const SEPARATE_ROOTS = ['functions', 'scripts'];
 
 function usage(msg) {
   if (msg) console.error(msg);
-  console.error('Usage: node src/mapper.js <project folder> <output name>');
+  console.error('Usage: node src/mapper.js <project folder> <output name>\n       node src/mapper.js --folder <name>=<folder> [--folder <name>=<folder> ...] <output name>');
   process.exit(2);
 }
 
@@ -1553,21 +1553,225 @@ const packageName = (spec) => {
 
 const countBy = (arr, f) => arr.reduce((o, x) => { const k = f(x); o[k] = (o[k] || 0) + 1; return o; }, {});
 
+// --- several folders, one map ------------------------------------------------------
+// A Brain project can link several code folders (two repositories sharing one database). Each is mapped on its
+// own by buildMap, so imports, calls, navigation and routes stay inside one folder; then the maps are merged.
+// With more than one folder every file id and path gets the folder's short name in front (app:src/x.js), so the
+// same path in two repositories never collides. The data layer is the join: a collection or subcollection with the
+// same path pattern is one node, read and written from every folder (its counts per folder in byFolder). A cloud
+// function called in one folder and defined in another is a calls-function edge marked crossFolder. Every node
+// and edge records its folder (codeFolder). A single folder is merged with no prefixes, so its map is unchanged.
+const DATA_ID = /^(sub)?collection:/;
+export function mergeMaps(parts) {
+  const multi = parts.length > 1;
+  const nodes = [], edges = [], unresolved = [], missing = [], parseFailures = [], notes = [], skippedFiles = [], keptLarge = [];
+  const screens = [], unknownOps = [], masked = new Set(), rootGroups = [], folders = [];
+  const groupList = [], isolated = [], groupLinks = [];
+  const nav = { calls: 0, targets: 0, matched: 0, matchedInferred: 0, computed: 0, inferredCalls: 0, unmatched: [], byMethod: {}, skippedNonNavigationReceivers: 0 };
+  const fn = { calls: 0, matched: 0, computed: 0, unmatched: [], names: {}, exported: [], definitions: {} };
+  const fnByFolder = {};
+  const data = new Map();
+  const assetTotals = { total: 0, byExtension: {} };
+  const aliasConfigs = [], aliasUsed = {};
+  const counts = {};
+  let groupOffset = 0, duration = 0;
+  for (const { name, map: m } of parts) {
+    const P = (f) => (f == null || !multi ? f : `${name}:${f}`);
+    const PE = (id) => (DATA_ID.test(id) ? id : P(id));
+    for (const n of m.nodes) {
+      if (n.kind === 'file') { nodes.push({ ...n, id: P(n.id), path: P(n.path), relPath: n.path, codeFolder: name, ...(n.group ? { group: n.group + groupOffset } : {}) }); continue; }
+      const mine = { readers: n.readers, writers: n.writers, unknown: n.usedWithUnknownOperation, paths: n.paths, ...(n.pattern ? { pattern: n.pattern } : {}) };
+      const d = data.get(n.id);
+      if (!d) { data.set(n.id, { ...n, paths: [...n.paths], folders: [name], byFolder: { [name]: mine } }); continue; }
+      // A shared subcollection keeps the pattern of the first folder that has it (the order the folders were
+      // linked); links from a folder that names the placeholders differently are marked as merged by position.
+      d.readers += n.readers; d.writers += n.writers; d.usedWithUnknownOperation += n.usedWithUnknownOperation;
+      d.paths = [...new Set([...d.paths, ...n.paths])].sort();
+      if (n.collectionGroup) d.collectionGroup = true;
+      d.folders.push(name); d.byFolder[name] = mine;
+    }
+    for (const e of m.edges) edges.push({ ...e, from: P(e.from), to: PE(e.to), ...(e.passedFrom ? { passedFrom: P(e.passedFrom) } : {}), codeFolder: name });
+    for (const u of m.unresolved) unresolved.push({ ...u, file: P(u.file), ...(u.target ? { target: P(u.target) } : {}), codeFolder: name });
+    for (const x of m.missingRelative) missing.push({ ...x, file: P(x.file), codeFolder: name });
+    for (const x of m.parseFailures) parseFailures.push({ ...x, file: P(x.file), codeFolder: name });
+    for (const x of m.notes) notes.push({ ...x, file: P(x.file), codeFolder: name });
+    for (const x of m.skippedFiles) skippedFiles.push({ ...x, file: P(x.file), codeFolder: name });
+    for (const x of m.keptLargeFiles) keptLarge.push({ ...x, file: P(x.file), importedBy: P(x.importedBy), codeFolder: name });
+    for (const x of m.data.usesWithUnknownOperation) unknownOps.push({ ...x, file: P(x.file), codeFolder: name });
+    for (const x of m.data.documentIdPathsMasked) masked.add(x);
+    for (const g of m.rootGroups) rootGroups.push({ ...g, entry: P(g.entry), codeFolder: name });
+    const { screens: sc, ...ns } = m.navigation;
+    for (const x of sc) screens.push({ ...x, file: P(x.file), navigatorFile: P(x.navigatorFile), codeFolder: name });
+    for (const [k, v] of Object.entries(ns)) {
+      if (typeof v === 'number') nav[k] = (nav[k] || 0) + v;
+      else if (k === 'unmatched') nav.unmatched.push(...v.map((u) => ({ ...u, file: P(u.file), codeFolder: name })));
+      else if (k === 'byMethod') for (const [mk, mv] of Object.entries(v)) nav.byMethod[mk] = (nav.byMethod[mk] || 0) + mv;
+    }
+    const f = m.functions;
+    const own = { calls: f.calls, matched: f.matched, computed: f.computed, unmatched: f.unmatched.map((u) => ({ ...u, file: P(u.file) })), names: {}, exported: f.exported,
+      definitions: Object.fromEntries(Object.entries(f.definitions || {}).map(([k, v]) => [k, P(v)])) };
+    for (const [k, v] of Object.entries(f.names)) own.names[k] = { definedIn: P(v.definedIn), callers: v.callers.map(P) };
+    fnByFolder[name] = own;
+    fn.calls += f.calls; fn.matched += f.matched; fn.computed += f.computed;
+    fn.unmatched.push(...own.unmatched.map((u) => ({ ...u, codeFolder: name })));
+    for (const [k, v] of Object.entries(own.names)) {
+      const t = (fn.names[k] ??= { definedIn: null, callers: [] });
+      t.definedIn ??= v.definedIn; t.callers.push(...v.callers);
+    }
+    for (const x of f.exported) if (!fn.exported.includes(x)) fn.exported.push(x);
+    for (const [k, v] of Object.entries(own.definitions)) fn.definitions[k] ??= v;
+    for (const g of m.groups.list) groupList.push({ ...g, id: g.id + groupOffset, files: g.files.map(P), central: g.central.map(P), codeFolder: name });
+    isolated.push(...m.groups.isolated.map(P));
+    groupLinks.push(...m.groups.links.map((l) => ({ ...l, a: l.a + groupOffset, b: l.b + groupOffset })));
+    groupOffset += m.groups.list.length;
+    assetTotals.total += m.assetTotals.total;
+    for (const [k, v] of Object.entries(m.assetTotals.byExtension)) assetTotals.byExtension[k] = (assetTotals.byExtension[k] || 0) + v;
+    aliasConfigs.push(...m.pathAliases.configs.map((c) => ({ ...c, config: P(c.config), codeFolder: name })));
+    for (const [k, v] of Object.entries(m.pathAliases.used)) aliasUsed[P(k)] = v;
+    for (const [k, v] of Object.entries(m.counts)) {
+      if (typeof v === 'number') counts[k] = (counts[k] || 0) + v;
+      else if (v && typeof v === 'object') { counts[k] ??= {}; for (const [kk, vv] of Object.entries(v)) counts[k][kk] = (counts[k][kk] || 0) + vv; }
+    }
+    duration += m.durationMs;
+    folders.push({ name, path: m.project.path, gitCommit: m.project.gitCommit, fileListSource: m.project.fileListSource, generatedAt: m.generatedAt, durationMs: m.durationMs, counts: m.counts });
+  }
+
+  if (multi) {
+    // A cloud function called in one folder and defined in another (the app's functions/, the website's calls).
+    for (const { name, map: m } of parts) {
+      for (const u of m.functions.unmatched) {
+        const defs = parts.filter((o) => o.name !== name && o.map.functions.definitions?.[u.name]);
+        if (!defs.length) continue;
+        for (const o of defs) {
+          edges.push({ from: `${name}:${u.file}`, to: `${o.name}:${o.map.functions.definitions[u.name]}`, kind: 'calls-function', line: u.line, function: u.name,
+            codeFolder: name, toFolder: o.name, crossFolder: true, why: `cloud function defined in another linked folder (${o.name})`, tag: 'inferred' });
+        }
+        fn.matched++;
+        fn.unmatched = fn.unmatched.filter((x) => !(x.codeFolder === name && x.name === u.name && x.line === u.line && x.file === `${name}:${u.file}`));
+        fn.names[u.name].definedIn ??= `${defs[0].name}:${defs[0].map.functions.definitions[u.name]}`;
+      }
+    }
+    // A shared subcollection whose placeholders were named differently in another folder.
+    for (const e of edges) {
+      const d = e.to.startsWith('subcollection:') ? data.get(e.to) : null;
+      if (!d || e.why) continue;
+      const n = d.key.split('/').length;
+      if ((e.paths || []).some((p) => p.split('/').slice(0, n).join('/') !== d.pattern)) { e.why = 'placeholders merged by position'; e.tag = 'inferred'; }
+    }
+    for (const d of data.values()) if (d.folders.length > 1) d.shared = true;
+  }
+  const dataNodes = [...data.values()];
+  nodes.push(...dataNodes.filter((n) => n.kind === 'collection').sort((a, b) => a.name.localeCompare(b.name)),
+    ...dataNodes.filter((n) => n.kind === 'subcollection').sort((a, b) => a.key.localeCompare(b.key)));
+
+  Object.assign(counts, {
+    nodes: nodes.length, nodesByKind: countBy(nodes, (n) => n.kind), edges: edges.length, edgesByKind: countBy(edges, (e) => e.kind),
+    unresolved: unresolved.length, unresolvedByKind: countBy(unresolved, (u) => u.kind), edgesByConfidence: countBy(edges, (e) => e.tag),
+    collections: dataNodes.filter((n) => n.kind === 'collection').length, subcollections: dataNodes.filter((n) => n.kind === 'subcollection').length,
+    documentIdPathsMasked: masked.size,
+    ...(multi ? { folders: parts.length, crossFolderEdges: edges.filter((e) => e.crossFolder).length, sharedData: dataNodes.filter((n) => n.shared).length } : {}),
+  });
+  const first = parts[0].map;
+  return {
+    schemaVersion: SCHEMA_VERSION,
+    kinds: KINDS,
+    generatedAt: multi ? new Date().toISOString() : first.generatedAt,
+    durationMs: duration,
+    project: multi ? { folders: parts.map((p) => p.name) } : first.project,
+    folders,
+    rootGroups,
+    counts,
+    nodes, edges, unresolved, missingRelative: missing, assetTotals, parseFailures,
+    navigation: { screens, ...nav },
+    functions: { ...fn, ...(multi ? { byFolder: fnByFolder } : {}) },
+    data: { usesWithUnknownOperation: unknownOps, documentIdPathsMasked: [...masked].sort() },
+    groups: { algorithm: first.groups.algorithm, seed: first.groups.seed, weights: first.groups.weights, list: groupList, isolated, links: groupLinks },
+    notes,
+    skippedFiles, keptLargeFiles: keptLarge,
+    pathAliases: { configs: aliasConfigs, used: aliasUsed },
+  };
+}
+
 // --- main ---------------------------------------------------------------------
 
-function main() {
-  const [projectArg, outName] = process.argv.slice(2);
-  if (!projectArg || !outName) usage();
-  if (!/^[A-Za-z0-9._-]+$/.test(outName) || outName === '.' || outName === '..') usage('Output name may only use letters, digits, dot, dash and underscore.');
-  const root = path.resolve(projectArg.replace(/^~(?=$|\/)/, os.homedir()));
-  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) usage(`Not a folder: ${root}`);
+// Short names of linked code folders: lower-case letters, digits, dash and underscore. The names of the data
+// node prefixes are not allowed, so a node id never reads as a collection.
+export const FOLDER_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,23}$/;
+export const RESERVED_FOLDER_NAMES = new Set(['collection', 'subcollection']);
+export const defaultFolderName = (dir) => (path.basename(dir).toLowerCase().replace(/[^a-z0-9_-]+/g, '-').replace(/^[-_]+|[-_]+$/g, '').slice(0, 24) || 'code');
 
+// node src/mapper.js <project folder> <output name>
+// node src/mapper.js --folder <name>=<folder> [--folder <name>=<folder> ...] <output name>
+function parseCli(argv) {
+  const folders = [], pos = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--folder' || a.startsWith('--folder=')) {
+      const v = a === '--folder' ? argv[++i] : a.slice(9);
+      const eq = v?.indexOf('=') ?? -1;
+      if (eq < 1) usage('--folder takes <name>=<folder>.');
+      folders.push({ name: v.slice(0, eq), dir: v.slice(eq + 1) });
+    } else pos.push(a);
+  }
+  let outName;
+  if (folders.length) { if (pos.length !== 1) usage(); outName = pos[0]; }
+  else { if (pos.length !== 2) usage(); folders.push({ name: null, dir: pos[0] }); outName = pos[1]; }
+  return { folders, outName };
+}
+
+function main() {
+  const { folders: specs, outName } = parseCli(process.argv.slice(2));
+  if (!outName) usage();
+  if (!/^[A-Za-z0-9._-]+$/.test(outName) || outName === '.' || outName === '..') usage('Output name may only use letters, digits, dot, dash and underscore.');
   const outDir = path.join(os.homedir(), '.brain', 'maps', outName);
   const brainDir = path.join(os.homedir(), 'Brain');
   const inside = (p, dir) => p === dir || p.startsWith(dir + path.sep);
-  if (inside(outDir, root)) usage('Refusing to write inside the project folder.');
-  if (inside(outDir, brainDir)) usage('Refusing to write inside ~/Brain.');
+  const folders = specs.map((f) => {
+    const root = path.resolve(f.dir.replace(/^~(?=$|\/)/, os.homedir()));
+    if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) usage(`Not a folder: ${root}`);
+    if (inside(outDir, root)) usage('Refusing to write inside the project folder.');
+    if (inside(outDir, brainDir)) usage('Refusing to write inside ~/Brain.');
+    const name = f.name ?? defaultFolderName(root);
+    if (!FOLDER_NAME_RE.test(name) || RESERVED_FOLDER_NAMES.has(name)) usage(`Folder name "${name}": use up to 24 lower-case letters, digits, dash or underscore (not collection or subcollection).`);
+    return { name, root };
+  });
+  const dup = folders.find((f, i) => folders.findIndex((g) => g.name === f.name) !== i);
+  if (dup) usage(`Two folders are named "${dup.name}".`);
 
+  const t0 = process.hrtime.bigint();
+  const parts = [];
+  for (const f of folders) {
+    let built;
+    try { built = buildMap(f.root); }
+    catch (e) {
+      if (e.code === NO_JS_EXIT) { console.error(folders.length > 1 ? `${f.name} (${f.root}): ${NO_JS_MESSAGE}` : NO_JS_MESSAGE); process.exit(NO_JS_EXIT); }
+      throw e;
+    }
+    parts.push({ ...f, ...built });
+  }
+  const map = mergeMaps(parts.map((p) => ({ name: p.name, map: p.map })));
+  map.durationMs = Math.round(Number(process.hrtime.bigint() - t0) / 1e6);
+
+  fs.mkdirSync(outDir, { recursive: true });
+  const outFile = path.join(outDir, 'map.json');
+  fs.writeFileSync(outFile, JSON.stringify(map, null, 2) + '\n');
+  console.log(`Map written: ${outFile}  (schema ${SCHEMA_VERSION})`);
+  for (const p of parts) {
+    if (parts.length > 1) console.log(`\n=== Folder ${p.name}: ${p.root}`);
+    p.report();
+  }
+  if (parts.length > 1) {
+    const shared = map.nodes.filter((n) => (n.kind === 'collection' || n.kind === 'subcollection') && n.shared);
+    const cross = map.edges.filter((e) => e.crossFolder);
+    console.log(`\n=== Merged: ${map.nodes.length} nodes, ${map.edges.length} edges; ${shared.length} collections and subcollections shared by several folders; ${cross.length} cross-folder cloud function calls`);
+    for (const n of shared) console.log(`  ${n.kind === 'subcollection' ? n.pattern : n.name}: ${Object.entries(n.byFolder).map(([k, v]) => `${k} ${v.readers}r/${v.writers}w`).join(', ')}`);
+    for (const e of cross) console.log(`  ${e.from}:${e.line} → ${e.function} (${e.to})`);
+  }
+}
+
+// Maps one folder: { map (schema without folder fields), report() } . Throws { code: NO_JS_EXIT } when the
+// folder has no JavaScript or TypeScript.
+function buildMap(root) {
   const t0 = process.hrtime.bigint();
   const { source: listSource, files: allFiles } = listFiles(root);
   // Sources: JS and TS, without type declarations (.d.ts, used only to resolve imports) and without vendored
@@ -1601,7 +1805,7 @@ function main() {
     codeOf.delete(f);
     return false;
   });
-  if (!jsFiles.length) { console.error(NO_JS_MESSAGE); process.exit(NO_JS_EXIT); }
+  if (!jsFiles.length) throw Object.assign(new Error(NO_JS_MESSAGE), { code: NO_JS_EXIT });
 
   // Root groups: the project itself, plus separate roots such as functions/ and scripts/.
   const rootGroups = [{ name: 'app', dir: '' }];
@@ -1807,6 +2011,7 @@ function main() {
     }
   }
   fnStats.exported = [...functionDefs.keys()];
+  fnStats.definitions = Object.fromEntries(functionDefs); // name -> file, so another linked folder's calls can be matched
 
   // --- function calls between project files: calls edges (one per call site)
   const resolveExport = (file, name, depth = 0) => {
@@ -2059,13 +2264,11 @@ function main() {
     pathAliases: { configs: resolve.aliases(), used: resolve.aliasesUsed() },
   };
 
-  fs.mkdirSync(outDir, { recursive: true });
-  const outFile = path.join(outDir, 'map.json');
-  fs.writeFileSync(outFile, JSON.stringify(map, null, 2) + '\n');
+  return { map, report };
 
-  // --- report
+  // --- report (printed by main after the merged map is written)
+  function report() {
   const kv = (o) => Object.entries(o).map(([k, v]) => `${k} ${v}`).join(', ');
-  console.log(`Map written: ${outFile}  (schema ${SCHEMA_VERSION})`);
   console.log(`Run time: ${Math.round(elapsedMs)} ms  (file list from ${listSource})`);
   console.log(`Commit: ${commit ?? 'none'}`);
   console.log(`Nodes: ${nodes.length} (${kv(map.counts.nodesByKind)})`);
@@ -2116,6 +2319,7 @@ function main() {
   const al = resolve.aliases(); if (al.length) console.log(`Path aliases: ${al.map((a) => `${a.config} ${[...a.paths, ...(a.baseUrl ? [`baseUrl=${a.baseUrl}`] : [])].join(', ')}`).join(' | ')}; used: ${JSON.stringify(resolve.aliasesUsed())}`);
   console.log(`Parse failures: ${parseFailures.length}`);
   for (const f of parseFailures) console.log(`  ${f.file}:${f.line ?? '?'} ${f.reason}`);
+  }
 }
 
 // Run only when executed directly, so the server can import the constants above.
