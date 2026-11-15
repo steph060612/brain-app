@@ -17,7 +17,7 @@ export const END = '<!-- brainmap:end -->';
 export const block = created => `${start(created)}
 ## Code map: use brainmap first
 - At the start of any task that involves tracing or changing code, call the brainmap \`overview\` tool (mcp__brainmap__overview) once.
-- Before searching the repository for who calls, uses or depends on a function, file, screen or collection, call the matching brainmap tool first: \`callers\`, \`impact\`, \`screen\`, \`collection\` or \`file\` (also \`find\` and \`unused\`).
+- Before searching the repository for who calls, uses or depends on a function, file, screen or collection, call the matching brainmap tool first: \`callers\`, \`impact\`, \`screen\`, \`collection\` or \`file\`; \`path\` shows how two of them connect, \`report\` the most-connected files and next questions (also \`find\` and \`unused\`).
 - Without the tools, run the same queries in a shell: \`brainmap overview\`, \`brainmap callers <function>\` and so on (\`brainmap help\` lists them).
 - The map covers JavaScript only (.js, .jsx, .mjs, .cjs). It is read-only and refreshes itself when the code changes.
 ${END}`;

@@ -80,7 +80,13 @@ The mapper also runs on its own: `node src/mapper.js <project folder> <output na
 
 `brainmap` answers structure questions from the saved map, in compact plain text (each list shows its first
 items with "(+N more, use --all)"): `overview`, `files <folder>`, `file <path>`, `impact <path>`, `screen <name>`,
-`collection <name>`, `function <name>`, `callers <name|file:name>`, `find <text>`, `unused`. `collection` also lists the
+`collection <name>`, `function <name>`, `callers <name|file:name>`, `find <text>`, `unused`, `path <A> <B>` and `report`.
+`path` finds the shortest chain of links (imports, calls including via value, navigation, cloud functions, reads,
+writes) between two files, functions, screens or collections, hop by hop with file and line; it says when only the
+reverse direction exists, tries navigation alone first between two screens, and `--all-shortest` lists up to 5.
+`report` lists the most-connected files, most-called functions, busiest data, bridge files (articulation points of
+the import graph), rare links between folders and five ready-to-run follow-up commands; the diagram shows the same
+report in its findings. `collection` also lists the
 functions that read or write it and who calls them ("Through functions"; `--depth 2` adds the callers of those
 callers). Run it inside a linked folder, or pass `--project <name>`. Before answering it runs the same "code changed
 since last map" check as the panel and re-maps when needed. It prints paths, names and numbers only, never file
@@ -88,7 +94,7 @@ contents. `install.sh` links it next to `brainpack` (`~/.brain/brainmap.sh`, sym
 `/usr/local/bin`).
 
 **Tools for Claude Code (MCP).** `src/brainmap-mcp.js` is a local stdio tool server with the same queries as tools
-(`overview`, `file`, `impact`, `callers`, `collection`, `screen`, `find`, `unused`, each with an `all` option). Each tool
+(`overview`, `file`, `impact`, `callers`, `collection`, `screen`, `find`, `unused`, `path`, `report`, each with an `all` option). Each tool
 runs `brainmap` in the assistant's working folder, so the text, limits and automatic refresh are the same; in a folder
 that is not linked it answers in one line. Read-only. `install.sh` registers it at user scope (every project, no
 project files touched):

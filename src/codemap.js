@@ -7,6 +7,7 @@
 // files. "Files" shows every file. Internally the Files view is the Folders view with every folder expanded.
 import { forceSimulation, forceManyBody, forceLink, forceX, forceY, forceCollide } from 'd3-force';
 import { setBrainPaused } from './brain.js';
+import { computeReport } from './map-report.js';
 
 const SCHEMA_VERSION = 6;
 const BG = '#05070F';
@@ -1195,6 +1196,21 @@ function notImported() {
   });
 }
 
+// The same report as brainmap report: most-connected files, most-called functions, busiest data, bridges, rare links.
+function reportBody() {
+  const r = computeReport(map);
+  const item = (id, text, title = text) => `<button class="cm-item" data-id="${esc(id)}" title="${esc(title)}">${esc(text)}</button>`;
+  const kinds = o => Object.entries(o.byKind).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${n} ${k}`).join(', ');
+  const block = (title, rows) => `<div class="cm-sub">${esc(title)}</div>${rows.length ? rows.join('') : '<div class="cm-note">None</div>'}`;
+  return block('Most depended-on files', r.dependedOn.map(x => item(x.file, `${x.total} · ${x.file}`, `${x.file}: ${kinds(x)}`)))
+    + block('Most dependent files', r.dependent.map(x => item(x.file, `${x.total} · ${x.file}`, `${x.file}: ${kinds(x)}`)))
+    + block('Most-called functions (files)', r.functions.map(x => item(x.file, `${x.files} · ${x.fn}`, `${x.fn} in ${x.file}: ${x.calls} calls`)))
+    + block('Busiest data (reader + writer files)', r.data.map(x => item(x.id, `${x.total} · ${x.name}`, `${x.readers} read, ${x.writers} write`)))
+    + block('Bridges (import graph)', r.bridges.map(x => item(x.file, `${x.file} · cuts off ${x.cutOff}`, `parts: ${x.parts.join(', ')}`)))
+    + block('Rare links between folders', r.surprising.map(x => item(x.from, `${x.from} → ${x.to}`, `${x.kind}${x.what ? ` ${x.what}` : ''}, line ${x.line ?? '?'}; ${x.folders.join(' ↔ ')}: ${x.pairLinks} links`)))
+    + block('Suggested questions', r.questions.map(q => `<div class="cm-note" style="padding-top:2px;padding-bottom:2px" title="${esc(q.why)}">${esc(q.cmd)}</div>`));
+}
+
 function renderFindings() {
   const sec = (title, count, body) =>
     `<details class="cm-sec" name="cm-findings"><summary>${title}<span class="cm-count">${count}</span></summary><div class="cm-sec-body cm-scroll">${body}</div></details>`;
@@ -1239,6 +1255,7 @@ function renderFindings() {
       ${standalone.length ? sec('Standalone scripts', standalone.length, standaloneBody) : ''}
       ${sec('No incoming navigation found', noNav.length, noNavBody)}
       ${sec('Unresolved', unresolved.length, unresolvedBody + unknownBody)}
+      ${sec('Report', 'top 10', reportBody())}
       <div class="cm-note" style="padding:6px 12px 10px">"Not imported" and "no incoming navigation found" mean the map found no link. A file can still be used in ways the map does not see.</div>
     </div>`;
   const collapse = findingsEl.querySelector('.cm-collapse');

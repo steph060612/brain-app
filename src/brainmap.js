@@ -4,6 +4,7 @@
 // as the Brain app's "Map is current"). Prints paths, names and numbers only, never file contents.
 // No network, no model calls.
 import { stat } from 'fs/promises';
+import { findPath, computeReport } from './map-report.js';
 import {
   loadLinks, readMap, mapStatus, runMapper, gitAvailable, realOrSelf, inside, tilde,
 } from './codemap-status.js';
@@ -20,6 +21,8 @@ Usage: brainmap <command> [argument] [--all] [--depth 2] [--project <name>] [--n
   impact <path>         files that depend on it through imports, up to 3 steps away, grouped by depth
   screen <name>         a navigation screen: its file, where it navigates to and where it is reached from
   callers <name>        files and lines that call an exported function (or file:name)
+  path <A> <B>          shortest path between two files, functions, screens or collections (--all-shortest: up to 5)
+  report                most-connected files, most-called functions, busiest data, bridges, rare links, next questions
   collection <name>     files that read and write a collection or subcollection (name or path, e.g. users/{uid}/workoutLogs)
   function <name>       a cloud function: where it is defined and who calls it
   find <text>           matches in file paths, exported names, screens and collections
@@ -30,7 +33,7 @@ Each list shows its first items with "(+N more, use --all)"; --all shows everyth
 
 // ─── output ──────────────────────────────────────────────────────────────────
 const lines = [];
-let ALL = false, DEPTH = 1;
+let ALL = false, DEPTH = 1, ALL_SHORTEST = false;
 const say = (s = '') => { for (const l of String(s).split('\n')) lines.push(l); };
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 // A comma-separated list wrapped to WIDTH, continuation lines indented.
@@ -59,13 +62,14 @@ function die(msg, code = 1) { process.stdout.write([...lines, msg].join('\n') + 
 
 // ─── arguments ───────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const o = { all: false, refresh: true, project: null, depth: 1, pos: [] };
+  const o = { all: false, refresh: true, project: null, depth: 1, allShortest: false, pos: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--all' || a === '-a') o.all = true;
     else if (a === '--no-refresh') o.refresh = false;
     else if (a === '--project' || a === '-p') o.project = argv[++i] ?? '';
     else if (a.startsWith('--project=')) o.project = a.slice(10);
+    else if (a === '--all-shortest') o.allShortest = true;
     else if (a === '--depth') o.depth = Number(argv[++i]);
     else if (a.startsWith('--depth=')) o.depth = Number(a.slice(8));
     else if (a === '--help' || a === '-h') o.pos.unshift('help');
@@ -331,6 +335,50 @@ function screenCmd(P, ix, q) {
   if (!to.size) say('  none found');
 }
 
+// ─── path and report ─────────────────────────────────────────────────────────
+function pathCmd(P, ix, args) {
+  const [a, b] = Array.isArray(args) ? args : [];
+  if (!a || !b) die('Give two things, for example: brainmap path screens/TrackerScreen.js workoutLogs  (quote names with spaces)');
+  const r = findPath(P.map, a, b, { allShortest: ALL_SHORTEST });
+  if (r.status === 'notfound') die(`Nothing in the map matches "${r.query}" (a file, exported function, screen, collection or subcollection).`);
+  if (r.status === 'ambiguous') die(`"${r.query}" matches ${r.matches.length} things; use a fuller name or file:function:\n${r.matches.map(m => `  ${m}`).join('\n')}`);
+  if (r.status === 'same') return say(`${r.a} and ${r.b} are the same node.`);
+  if (r.status === 'none') return say(`No path between ${r.a} and ${r.b}, in either direction (imports, calls, navigation, cloud functions, reads, writes).`);
+  const by = r.only ? ` by ${r.only} only` : '';
+  say(r.direction === 'forward'
+    ? `${r.a} → ${r.b}: ${plural(r.length, 'hop')}${by} (${r.a} uses ${r.b})`
+    : `No path from ${r.a} to ${r.b}; the other direction exists: ${r.b} → ${r.a}, ${plural(r.length, 'hop')}${by} (${r.b} uses ${r.a})`);
+  if (r.paths.length > 1) say(`${r.paths.length} shortest paths${r.paths.length === 5 ? ' (first 5)' : ''}:`);
+  r.paths.forEach((path, i) => {
+    if (r.paths.length > 1) say(`Path ${i + 1}:`);
+    path.forEach((h, j) => {
+      const e = h.edges[0];
+      say(`  ${j + 1}. ${h.from} —${e.kind}${e.what ? ` ${e.what}` : ''}→ ${h.to}  (${e.at})`);
+      if (h.edges.length > 1) say(`     also: ${h.edges.slice(1, ALL ? undefined : 3).map(x => `${x.kind}${x.what ? ` ${x.what}` : ''} (${x.at})`).join('; ')}${!ALL && h.edges.length > 3 ? `; +${h.edges.length - 3} more` : ''}`);
+    });
+  });
+}
+
+function reportCmd(P) {
+  const r = computeReport(P.map);
+  const kinds = o => Object.entries(o.byKind).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${n} ${k}`).join(', ');
+  say(`Report for ${P.slug} (map from ${when(P.map.generatedAt)}); links = imports, calls, navigation, cloud functions, reads, writes.`);
+  say('Most depended-on files (incoming links):');
+  items(r.dependedOn.map(x => `${String(x.total).padStart(4)}  ${x.file}  (${kinds(x)})`));
+  say('Most dependent files (outgoing links):');
+  items(r.dependent.map(x => `${String(x.total).padStart(4)}  ${x.file}  (${kinds(x)})`));
+  say('Most-called functions (calling files):');
+  items(r.functions.map(x => `${String(x.files).padStart(4)}  ${x.fn}  ${x.file}  (${plural(x.calls, 'call')})`));
+  say('Busiest data (reader + writer files):');
+  items(r.data.map(x => `${String(x.total).padStart(4)}  ${x.name}  (${x.readers} read, ${x.writers} write${x.kind === 'subcollection' ? ', subcollection' : ''})`));
+  say('Bridges (removing the file splits the import graph):');
+  items(r.bridges.length ? r.bridges.map(x => `${x.file}  cuts off ${plural(x.cutOff, 'file')} (parts: ${x.parts.slice(0, 5).join(', ')}${x.parts.length > 5 ? ', …' : ''})`) : ['none']);
+  say('Rare links (between folders joined by fewer than 3 links):');
+  items(r.surprising.length ? r.surprising.map(x => `${x.from} —${x.kind}${x.what ? ` ${x.what}` : ''}→ ${x.to}  (${x.from}:${x.line ?? '?'}; ${x.folders.join(' ↔ ')}: ${plural(x.pairLinks, 'link')})`) : ['none']);
+  say('Suggested next questions:');
+  items(r.questions.map(q => `${q.cmd}   # ${q.why}`));
+}
+
 // ─── function calls ──────────────────────────────────────────────────────────
 // Call edges into a function: the exported name or the local name it has in its own file.
 const callsTo = (ix, file, fn) => (ix.inn.get(file) || []).filter(e => e.kind === 'calls' && (e.function === fn || e.local === fn || e.export === fn));
@@ -535,7 +583,7 @@ function unusedCmd(P, ix) {
 }
 
 // ─── main ────────────────────────────────────────────────────────────────────
-const COMMANDS = { callers: callersCmd, overview, files: filesCmd, file: fileCmd, impact: impactCmd, screen: screenCmd, collection: collectionCmd, function: functionCmd, find: findCmd, unused: unusedCmd };
+const COMMANDS = { path: pathCmd, report: reportCmd, callers: callersCmd, overview, files: filesCmd, file: fileCmd, impact: impactCmd, screen: screenCmd, collection: collectionCmd, function: functionCmd, find: findCmd, unused: unusedCmd };
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
@@ -546,8 +594,9 @@ async function main() {
   ALL = opts.all;
   if (![1, 2].includes(opts.depth)) die('--depth takes 1 or 2.');
   DEPTH = opts.depth;
+  ALL_SHORTEST = opts.allShortest;
   const P = await loadProject(opts);
-  run(P, index(P.map), rest.join(' '));
+  run(P, index(P.map), cmd === 'path' ? rest : rest.join(' '));
   flush();
 }
 
