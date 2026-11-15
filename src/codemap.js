@@ -1,4 +1,4 @@
-// Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (schemaVersion 7; subcollection nodes and function call edges are not drawn).
+// Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (schemaVersion 8; subcollection nodes and function call edges are not drawn).
 // Replaces the brain visual on the left while open. Canvas 2D with pre-rendered glow sprites, so it
 // stays smooth at around 1,000 nodes; d3-force is bundled by Vite, so nothing is fetched from outside.
 //
@@ -9,7 +9,7 @@ import { forceSimulation, forceManyBody, forceLink, forceX, forceY, forceCollide
 import { setBrainPaused } from './brain.js';
 import { computeReport, callerTree, callIndex } from './map-report.js';
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 const BG = '#05070F';
 let TOP = 96;             // below the toolbar; follows its height when it wraps
 const SIDE_W = 300;       // findings column and selection card
@@ -32,6 +32,8 @@ const LAYER_BY_ID = Object.fromEntries(LAYERS.map(l => [l.id, l]));
 // Ten hues spread around the wheel, ordered so neighbors in size rank are far apart; all readable on BG.
 const FOLDER_PALETTE = ['#4F8DFF', '#FF9F43', '#3DDC84', '#D36BFF', '#3FD5E8', '#FF5C5C', '#E8E04A', '#8C7CFF', '#A5E86B', '#FF6FB5'];
 const OTHER_COLOR = '#7D8597';
+// Group colors (Files view, Color by: Group): the folder hues plus two more; isolated files grey.
+const GROUP_PALETTE = [...FOLDER_PALETTE, '#F6C177', '#9AD1FF'];
 const COLLECTION_COLOR = '#4DFFC3';
 const SUBCOLLECTION_COLOR = '#A8FFE6';
 
@@ -45,7 +47,7 @@ let map = null, project = null, onClose = null;
 let nodes = [], byId = new Map(), edges = [], drawEdges = [], degree = new Map();
 let folders = new Map();             // folder key → { key, label, color, colored, files: [node], lines, bubble }
 let rankedFolders = [];
-let mode = 'folders', expanded = new Set();
+let mode = 'folders', expanded = new Set(), colorBy = 'folder';
 let sim = null, view = { x: 0, y: 0, k: 1 }, dpr = 1, width = 0, height = 0;
 let layerOn = {};
 let hovered = null, selected = null, neighbors = new Set(), searchHits = new Set(), searchMatches = [], searchQuery = '';
@@ -221,7 +223,7 @@ const folderLabel = k => (k === 'folder:(root)' ? 'root files' : `${k.slice(k.in
 function prepare() {
   layerOn = Object.fromEntries(LAYERS.map(l => [l.id, l.on]));
   hovered = selected = null; neighbors = new Set(); searchHits = new Set(); searchMatches = []; searchQuery = '';
-  mode = 'folders'; expanded = new Set();
+  mode = 'folders'; expanded = new Set(); colorBy = 'folder';
 
   // Folders: scripts/ and functions/ (their own root groups) count as folders. The 10 largest get a hue.
   folders = new Map();
@@ -251,7 +253,7 @@ function prepare() {
     }
     if (n.kind !== 'file') continue;
     const F = folders.get(folderKeyOf(n));
-    const node = { id: n.id, kind: 'file', raw: n, folder: F.key, key: F.colored ? F.key : 'folder:(other)', color: F.color,
+    const node = { id: n.id, kind: 'file', raw: n, folder: F.key, key: F.colored ? F.key : 'folder:(other)', color: F.color, fkey: F.colored ? F.key : 'folder:(other)', fcolor: F.color,
       r: Math.max(2.2, Math.min(9, 1.6 + Math.sqrt(n.lines || 1) / 5.5)), label: base(n.path), x: 0, y: 0 };
     F.files.push(node);
     fileNodes.push(node);
@@ -384,8 +386,30 @@ function layout({ warm = false, refit = false } = {}) {
   dirty = true;
 }
 
+// Files view: color (and place) files by folder or by group (subsystems found by the mapper).
+const groupById = () => new Map((map.groups?.list || []).map(g => [g.id, g]));
+function setColorBy(c) {
+  if (c === colorBy && c !== 'refresh') return;
+  colorBy = c === 'refresh' ? colorBy : c;
+  const files = nodes.filter(n => n.kind === 'file');
+  for (const n of files) {
+    const gid = n.raw.group;
+    if (colorBy === 'group') { n.key = gid ? `group:${gid}` : 'group:0'; n.color = gid ? GROUP_PALETTE[(gid - 1) % GROUP_PALETTE.length] : OTHER_COLOR; }
+    else { n.key = n.fkey; n.color = n.fcolor; }
+  }
+  const data = nodes.filter(n => n.kind === 'collection' || n.kind === 'subcollection');
+  spiralAnchors(files.concat(data.filter(n => n.kind === 'collection')), 70 + Math.sqrt(files.length + data.length) * 4, (n, a) => { n.fax = a.x; n.fay = a.y; });
+  const topOf = n => (n.kind === 'subcollection' && n.parent ? topOf(n.parent) : n);
+  for (const sub of data.filter(n => n.kind === 'subcollection' && n.parent)) { const t = topOf(sub); sub.fax = t.fax; sub.fay = t.fay; }
+  for (const n of files) { n.x = n.fax + (Math.random() - 0.5) * 60; n.y = n.fay + (Math.random() - 0.5) * 60; }
+  applyAnchors();
+  layout({ warm: true, refit: true });
+  renderToolbar(); renderLegend();
+}
+
 function setMode(m) {
   if (m === mode) return;
+  if (m === 'folders' && colorBy === 'group') { colorBy = 'folder'; for (const n of nodes) if (n.kind === 'file') { n.key = n.fkey; n.color = n.fcolor; } }
   mode = m;
   expanded = new Set();
   select(null);
@@ -714,6 +738,21 @@ function drawLabels() {
       return;
     }
   };
+  // Group mode: each group's name at the middle of its files, before any node label.
+  if (mode === 'files' && colorBy === 'group') {
+    const G = groupById(), sums = new Map();
+    for (const n of nodes) if (n.kind === 'file' && n.raw.group && nodeVisible(n)) { const o = sums.get(n.raw.group) || sums.set(n.raw.group, { x: 0, y: 0, c: 0 }).get(n.raw.group); o.x += n.x; o.y += n.y; o.c++; }
+    for (const [gid, o] of [...sums].sort((a, b) => b[1].c - a[1].c)) {
+      const g = G.get(gid); if (!g || o.c < 2) continue;
+      const text = `${g.label}`, font = '600 13px system-ui,-apple-system,sans-serif';
+      ctx.font = font;
+      const w = ctx.measureText(text).width, cx = (o.x / o.c) * k + view.x, cy = (o.y / o.c) * k + view.y;
+      const box = { x0: cx - w / 2 - 4, y0: cy - 10, x1: cx + w / 2 + 4, y1: cy + 10 };
+      if (box.x1 < 0 || box.x0 > width || box.y1 < 0 || box.y0 > height || overlaps(box)) continue;
+      placed.push(box);
+      queue.push({ n: { kind: 'group', color: GROUP_PALETTE[(gid - 1) % GROUP_PALETTE.length] }, text, font, x: cx - w / 2, y: cy, big: true, group: true });
+    }
+  }
   // Hovered always shows, so it reserves its space first.
   if (hovered) place(hovered, true);
   const seen = new Set([hovered]);
@@ -724,7 +763,7 @@ function drawLabels() {
     ctx.lineWidth = 3.5;
     ctx.strokeStyle = 'rgba(3,5,12,0.92)';
     ctx.strokeText(q.text, q.x, q.y);
-    ctx.fillStyle = q.big ? '#ffffff' : q.n.kind === 'collection' || q.n.kind === 'subcollection' ? '#bfffe9' : 'rgba(215,222,242,0.92)';
+    ctx.fillStyle = q.group ? q.n.color : q.big ? '#ffffff' : q.n.kind === 'collection' || q.n.kind === 'subcollection' ? '#bfffe9' : 'rgba(215,222,242,0.92)';
     ctx.fillText(q.text, q.x, q.y);
   }
 }
@@ -1115,6 +1154,8 @@ function renderToolbar() {
     <div class="cm-seg" role="group" aria-label="View">
       <button data-mode="folders" aria-pressed="${mode === 'folders'}">Folders</button><button data-mode="files" aria-pressed="${mode === 'files'}">Files</button>
     </div>
+    ${mode === 'files' && map.groups?.list?.length ? `<span style="font-size:11px;color:#5a6890">Color by</span><div class="cm-seg cm-colorby" role="group" aria-label="Color by">
+      <button data-color="folder" aria-pressed="${colorBy === 'folder'}">Folder</button><button data-color="group" aria-pressed="${colorBy === 'group'}">Group</button></div>` : ''}
     ${LAYERS.map(L => `<button class="cm-chip" data-layer="${L.id}" aria-pressed="${!!layerOn[L.id]}">
       <span class="cm-dot" style="background:${L.color};box-shadow:0 0 6px ${L.color}"></span>${L.label}
       <span style="color:#5a6890">${layerCount(L.id)}</span></button>`).join('')}
@@ -1129,7 +1170,8 @@ function renderToolbar() {
     if (searchQuery) runSearch(searchQuery);
     renderToolbar();
   });
-  for (const b of toolbarEl.querySelectorAll('.cm-seg button')) b.addEventListener('click', () => setMode(b.dataset.mode));
+  for (const b of toolbarEl.querySelectorAll('.cm-seg button[data-mode]')) b.addEventListener('click', () => setMode(b.dataset.mode));
+  for (const b of toolbarEl.querySelectorAll('.cm-colorby button')) b.addEventListener('click', () => setColorBy(b.dataset.color));
   for (const b of toolbarEl.querySelectorAll('.cm-chip')) {
     b.addEventListener('click', () => {
       layerOn[b.dataset.layer] = !layerOn[b.dataset.layer];
@@ -1179,13 +1221,17 @@ function renderLegend() {
   const row = (color, name, count, title = name) =>
     `<div style="display:flex;align-items:center;gap:7px;margin:3px 0" title="${esc(title)}"><span class="cm-swatch" style="background:${color}"></span>
       <span style="flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${esc(name)}</span><span style="color:#5a6890">${count}</span></div>`;
-  const rows = colored.map(F => row(F.color, F.label, F.files.length)).join('') +
-    (others.length ? row(OTHER_COLOR, 'other folders', others.reduce((s, F) => s + F.files.length, 0), others.map(F => F.label).join(', ')) : '');
+  const groups = mode === 'files' && colorBy === 'group';
+  const rows = groups
+    ? (map.groups.list.map(g => row(GROUP_PALETTE[(g.id - 1) % GROUP_PALETTE.length], `${g.id}. ${g.label}`, g.size)).join('')
+      + (map.groups.isolated.length ? row(OTHER_COLOR, 'isolated', map.groups.isolated.length) : ''))
+    : colored.map(F => row(F.color, F.label, F.files.length)).join('') +
+      (others.length ? row(OTHER_COLOR, 'other folders', others.reduce((s, F) => s + F.files.length, 0), others.map(F => F.label).join(', ')) : '');
   const showCols = layerOn.reads || layerOn.writes;
   legendEl.innerHTML = `
     <button class="cm-legend-toggle" aria-expanded="${!!legendOpen}" style="display:flex;width:100%;align-items:center;gap:6px;background:none;border:none;cursor:pointer;
       padding:8px 11px;color:#8090b0;font-size:10.5px;letter-spacing:0.05em;text-transform:uppercase">
-      <span style="font-size:10px;width:10px">${legendOpen ? '▾' : '▸'}</span>Legend<span style="margin-left:auto;text-transform:none;letter-spacing:0">${mode === 'folders' ? 'folders' : 'files'} by folder</span></button>
+      <span style="font-size:10px;width:10px">${legendOpen ? '▾' : '▸'}</span>Legend<span style="margin-left:auto;text-transform:none;letter-spacing:0">${mode === 'folders' ? 'folders by folder' : colorBy === 'group' ? 'files by group' : 'files by folder'}</span></button>
     ${legendOpen ? `<div style="padding:0 11px 9px">
       <div class="cm-scroll" style="max-height:240px;overflow-y:auto">${rows}</div>
       <div style="display:flex;align-items:center;gap:7px;margin-top:6px;${showCols ? '' : 'opacity:0.45'}">

@@ -1,4 +1,4 @@
-// Path between two things, and a project report, computed from a map (schemaVersion 7). Pure functions with no
+// Path between two things, and a project report, computed from a map (schemaVersion 8). Pure functions with no
 // Node or browser dependencies: used by the brainmap command (and its tools) and by the diagram. Deterministic.
 
 const IMPORT_KINDS = new Set(['import', 'require', 're-export', 'dynamic']);
@@ -391,6 +391,7 @@ export function queryMap(map, question, { maxMatches = 5 } = {}) {
   }
   for (const s of map.navigation?.screens || []) if (s.file)
     cands.push({ key: `screen:${s.name}:${s.file}`, kind: 'screen', label: `screen ${s.name} (${s.file})`, node: s.file, screen: s.name, full: s.name, name: splitWords(s.name), path: s.file.split('/').flatMap(splitWords), folder: s.file.split('/')[0] });
+  for (const g of map.groups?.list || []) cands.push({ key: `group:${g.id}`, kind: 'group', label: `group ${g.id}. ${g.label} (${g.size} files)`, node: `group:${g.id}`, full: g.label, name: g.terms.slice(0, 3), path: g.terms.slice(3), group: g });
   for (const n of map.nodes) {
     if (n.kind === 'collection') cands.push({ key: n.id, kind: 'collection', label: `collection ${n.name}`, node: n.id, full: n.name, name: splitWords(n.name), path: [] });
     if (n.kind === 'subcollection') cands.push({ key: n.id, kind: 'subcollection', label: `subcollection ${n.pattern}`, node: n.id, full: n.name, name: splitWords(n.name), path: n.key.split('/').filter(p => p !== '{}').slice(0, -1).flatMap(splitWords) });
@@ -494,18 +495,18 @@ export function queryMap(map, question, { maxMatches = 5 } = {}) {
   const dup = new Set(matches.filter(c => c.kind === 'function').map(c => c.fn).filter((f, i, a) => a.indexOf(f) !== i));
   const fnRef = c => (dup.has(c.fn) ? `${c.node}:${c.fn}` : c.fn);
   const depth = kinds.has('screen') ? ' --depth 2' : '';
-  const cmdFor = c => (c.kind === 'screen' ? `brainmap screen ${c.screen}` : c.kind === 'function' ? `brainmap callers ${fnRef(c)}`
+  const cmdFor = c => (c.kind === 'group' ? `brainmap group ${c.group.id}` : c.kind === 'screen' ? `brainmap screen ${c.screen}` : c.kind === 'function' ? `brainmap callers ${fnRef(c)}`
     : c.kind === 'collection' || c.kind === 'subcollection' ? `brainmap collection ${c.kind === 'subcollection' ? c.node.slice(14) : c.full}${depth}` : `brainmap file ${c.node}`);
   for (const c of matches) { const cmd = cmdFor(c); if (!next.includes(cmd)) next.push(cmd); if (next.length >= 2) break; }
   // A path between the first two matches that are different files or collections.
-  const ref = c => (c.kind === 'function' ? `${c.node}:${c.fn}` : c.kind === 'screen' ? c.screen : c.kind === 'file' ? c.node : c.kind === 'subcollection' ? c.node.slice(14) : c.full);
+  const ref = c => (c.kind === 'group' ? c.group.central[0] : c.kind === 'function' ? `${c.node}:${c.fn}` : c.kind === 'screen' ? c.screen : c.kind === 'file' ? c.node : c.kind === 'subcollection' ? c.node.slice(14) : c.full);
   const other = matches.find(c => c.node !== matches[0].node);
   if (other) next.push(`brainmap path ${ref(matches[0])} ${ref(other)}`);
   else if (fileById.has(matches[0].node)) next.push(`brainmap impact ${matches[0].node}`);
 
   return {
     terms, dropped,
-    matches: matches.map(c => ({ label: c.label, kind: c.kind, score: c.score, hit: c.hit })),
+    matches: matches.map(c => ({ label: c.label, kind: c.kind, score: c.score, hit: c.hit, ...(c.kind === 'group' ? { central: c.group.central } : {}) })),
     groups: order.filter(k => groups.has(k)).map(k => ({ kind: k, edges: groups.get(k).sort((a, b) => (b.between - a.between) || a.at.localeCompare(b.at, undefined, { numeric: true })) })),
     paths, next: next.slice(0, 3),
   };

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // brainmap: read-only answers about a mapped code project, for coding assistants. Reads
-// ~/.brain/maps/<slug>/map.json (schemaVersion 7); refreshes it first when the code changed (the same check
+// ~/.brain/maps/<slug>/map.json (schemaVersion 8); refreshes it first when the code changed (the same check
 // as the Brain app's "Map is current"). Prints paths, names and numbers only, never file contents.
 // No network, no model calls.
 import { stat } from 'fs/promises';
@@ -23,6 +23,8 @@ Usage: brainmap <command> [argument] [--all] [--depth 2] [--project <name>] [--n
   callers <name>        files and lines that call an exported function (or file:name)
   path <A> <B>          shortest path between two files, functions, screens or collections (--all-shortest: up to 5)
   query "<question>"    plain-words question: matching files, functions, screens, collections and the links around them
+  groups                subsystems: groups of related files with a name, size, central files and links between groups
+  group <label|number>  one group: its files by folder, collections, and the groups it depends on
   report                most-connected files, most-called functions, busiest data, bridges, rare links, next questions
   collection <name>     files that read and write a collection or subcollection (name or path, e.g. users/{uid}/workoutLogs)
   function <name>       a cloud function: where it is defined and who calls it
@@ -395,7 +397,7 @@ function queryCmd(P, ix, q) {
     return say(`Nothing in the map matches those words well enough.${r.best ? ` Try: brainmap find ${r.best}` : ''}`);
   }
   say('Matches:');
-  items(r.matches.map((m, i) => `${i + 1}. ${m.label}  [${m.hit.join(', ')}]`), 5);
+  items(r.matches.map((m, i) => `${i + 1}. ${m.label}  [${m.hit.join(', ')}]${m.kind === 'group' ? `  central: ${m.central.join(', ')}` : ''}`), 5);
   const total = r.groups.reduce((n, g) => n + g.edges.length, 0);
   say(`Links around them (${total}):`);
   for (const g of r.groups) {
@@ -408,6 +410,53 @@ function queryCmd(P, ix, q) {
   }
   say('Next:');
   items(r.next);
+}
+
+const groupName = g => `${g.id}. ${g.label}`;
+function groupsCmd(P) {
+  const G = P.map.groups;
+  if (!G?.list?.length) die('This map has no groups.');
+  say(`${plural(G.list.length, 'group')} of related files (${G.algorithm.split(' (')[0]}, seed ${G.seed})${G.isolated.length ? `, plus ${plural(G.isolated.length, 'isolated file')}` : ''}:`);
+  items(G.list.map(g => `${groupName(g)}  (${plural(g.size, 'file')})  central: ${g.central.join(', ')}`), 30);
+  const byId = new Map(G.list.map(g => [g.id, g]));
+  say('Strongest links between groups:');
+  items(G.links.map(l => `${byId.get(l.a).label}  ↔  ${byId.get(l.b).label}  (weight ${l.weight})`), 8);
+  if (G.isolated.length) { say('Isolated (linked to nothing):'); wrapList('  ', G.isolated, 12); }
+  say('Next: brainmap group <number or label>');
+}
+
+function groupCmd(P, ix, q) {
+  const G = P.map.groups;
+  if (!G?.list?.length) die('This map has no groups.');
+  if (!q) die('Give a group number or label, for example: brainmap group 1  (brainmap groups lists them)');
+  const low = q.trim().toLowerCase();
+  if (low === 'isolated' || low === '0') { say(`Isolated files (${G.isolated.length}): linked to nothing on any layer`); return items(G.isolated, 30); }
+  let hits = /^\d+$/.test(low) ? G.list.filter(g => g.id === Number(low)) : G.list.filter(g => g.label.toLowerCase() === low);
+  if (!hits.length) hits = G.list.filter(g => g.label.toLowerCase().includes(low) || g.terms.some(t => t === low || low.split(/\s+/).includes(t)));
+  if (!hits.length) die(`No group matches "${q}". Groups: ${G.list.map(groupName).join('; ')}`);
+  if (hits.length > 1) die(`"${q}" matches ${hits.length} groups: ${hits.map(groupName).join('; ')}`);
+  const g = hits[0], members = new Set(g.files);
+  say(`Group ${groupName(g)}: ${plural(g.size, 'file')}; words: ${g.terms.join(', ')}`);
+  say(`Central files: ${g.central.join(', ')}`);
+  say(`Files by folder:`);
+  groupedByFolder(ix, g.files.map(f => ({ file: f, text: f })), 40);
+  wrapList(`Collections (${g.collections.length}): `, g.collections, 12);
+  // Which groups its files use (imports, calls, navigation), and which use it.
+  const fileGroup = new Map(P.map.nodes.filter(n => n.kind === 'file').map(n => [n.id, n.group]));
+  const out = new Map(), inn = new Map();
+  for (const e of P.map.edges) {
+    if (!['import', 'require', 're-export', 'dynamic', 'calls', 'navigate', 'calls-function'].includes(e.kind) || e.sameFile) continue;
+    const a = fileGroup.get(e.from), b = fileGroup.get(e.to);
+    if (a === undefined || b === undefined || a === b) continue;
+    if (members.has(e.from)) out.set(b, (out.get(b) || 0) + 1);
+    if (members.has(e.to)) inn.set(a, (inn.get(a) || 0) + 1);
+  }
+  const byId = new Map(G.list.map(x => [x.id, x]));
+  const row = ([id, n]) => `${byId.get(id) ? groupName(byId.get(id)) : 'isolated'}  (${plural(n, 'link')})`;
+  say('Depends on (links from this group into others):');
+  items([...out].sort((a, b) => b[1] - a[1]).map(row));
+  say('Used by (links from other groups into this one):');
+  items([...inn].sort((a, b) => b[1] - a[1]).map(row));
 }
 
 function reportCmd(P) {
@@ -426,6 +475,10 @@ function reportCmd(P) {
   items(r.bridges.length ? r.bridges.map(x => `${x.file}  cuts off ${plural(x.cutOff, 'file')} (parts: ${x.parts.slice(0, 5).join(', ')}${x.parts.length > 5 ? ', …' : ''})`) : ['none']);
   say('Rare links (between folders joined by fewer than 3 links):');
   items(r.surprising.length ? r.surprising.map(x => `${x.from} —${x.kind}${x.what ? ` ${x.what}` : ''}→ ${x.to}  (${x.from}:${x.line ?? '?'}; ${x.folders.join(' ↔ ')}: ${plural(x.pairLinks, 'link')})`) : ['none']);
+  if (P.map.groups?.list?.length) {
+    say(`Groups (related files; brainmap groups):`);
+    items(P.map.groups.list.map(g => `${groupName(g)}  (${g.size})  central: ${g.central[0]}`), 12);
+  }
   say('Suggested next questions:');
   items(r.questions.map(q => `${q.cmd}   # ${q.why}`));
 }
@@ -670,7 +723,7 @@ function unusedCmd(P, ix) {
 }
 
 // ─── main ────────────────────────────────────────────────────────────────────
-const COMMANDS = { query: queryCmd, path: pathCmd, report: reportCmd, callers: callersCmd, overview, files: filesCmd, file: fileCmd, impact: impactCmd, screen: screenCmd, collection: collectionCmd, function: functionCmd, find: findCmd, unused: unusedCmd };
+const COMMANDS = { groups: groupsCmd, group: groupCmd, query: queryCmd, path: pathCmd, report: reportCmd, callers: callersCmd, overview, files: filesCmd, file: fileCmd, impact: impactCmd, screen: screenCmd, collection: collectionCmd, function: functionCmd, find: findCmd, unused: unusedCmd };
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));

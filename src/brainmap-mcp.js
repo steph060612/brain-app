@@ -27,6 +27,8 @@ const TOOLS = [
   { name: 'find', description: 'Search file paths, exported names, screens and collections in the map.', props: str('text', 'Text to look for.'), required: ['text'], args: a => [a.text] },
   { name: 'path', description: 'Shortest chain of links between two things (file, exported function, screen, collection or subcollection), hop by hop with file and line.', props: { ...str('a', 'Start: file, function (or file:function), screen or collection.'), ...str('b', 'End: same kinds.'), allShortest: { type: 'boolean', description: 'List up to 5 equally short paths.' } }, required: ['a', 'b'], args: a => [a.a, a.b, ...(a.allShortest ? ['--all-shortest'] : [])] },
   { name: 'query', description: 'Question in plain words: the files, functions, screens and collections that match, and the links around them, with file and line.', props: str('question', 'The question, e.g. "what saves completed workout sessions".'), required: ['question'], args: a => [a.question] },
+  { name: 'groups', description: 'Subsystems: groups of related files with a name, size, central files and the strongest links between groups.', props: {}, args: () => [] },
+  { name: 'group', description: 'One group (number or label): its files by folder, collections, and which groups it depends on or is used by.', props: str('name', 'Group number or label (see groups).'), required: ['name'], args: a => [a.name] },
   { name: 'report', description: 'Project report: most-connected files, most-called functions, busiest data, bridge files, rare links between folders, suggested next queries.', props: {}, args: () => [] },
   { name: 'unused', description: 'Files not imported from the entry file, and screens with no incoming navigation found.', props: {}, args: () => [] },
 ];

@@ -12,8 +12,9 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { parse } from '@babel/parser';
+import { detectGroups, nameGroups, SEED as GROUP_SEED, WEIGHTS as GROUP_WEIGHTS } from './map-groups.js';
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 const IMPORT_KINDS = ['import', 're-export', 'require', 'dynamic'];
 const KINDS = {
   nodes: ['file', 'collection', 'subcollection'],
@@ -1540,6 +1541,34 @@ function main() {
     n.reachableFromAppEntry = fromAppEntry.has(n.path);
   }
 
+  // --- subsystems: groups of related files (community detection on the file graph; see map-groups.js)
+  const det = detectGroups(fileNodes, edges);
+  const rawGroups = det.groups.sort((a, b) => b.length - a.length || a[0].localeCompare(b[0]));
+  const names = nameGroups(rawGroups, fileNodes, edges, screens);
+  const groupOfFile = new Map();
+  rawGroups.forEach((g, i) => g.forEach(f => groupOfFile.set(f, i + 1)));
+  for (const f of det.isolated) groupOfFile.set(f, 0);
+  const internal = f => { let s = 0; for (const [o, w] of det.adj.get(f)) if (groupOfFile.get(o) === groupOfFile.get(f)) s += w; return s; };
+  const groupList = rawGroups.map((g, i) => {
+    const cols = new Map();
+    for (const e of edges) if ((e.kind === 'reads' || e.kind === 'writes') && e.to.startsWith('collection:') && groupOfFile.get(e.from) === i + 1) cols.set(e.to.slice(11), (cols.get(e.to.slice(11)) || 0) + 1);
+    return { id: i + 1, label: names[i].label, terms: names[i].terms, size: g.length,
+      central: [...g].sort((a, b) => internal(b) - internal(a) || a.localeCompare(b)).slice(0, 3),
+      collections: [...cols].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([c]) => c), files: g };
+  });
+  const between = new Map();
+  for (const [a, m] of det.adj) for (const [b, w] of m) {
+    const ga = groupOfFile.get(a), gb = groupOfFile.get(b);
+    if (a < b && ga !== gb && ga && gb) { const k = ga < gb ? `${ga}-${gb}` : `${gb}-${ga}`; between.set(k, (between.get(k) || 0) + w); }
+  }
+  for (const n of fileNodes) n.group = groupOfFile.get(n.id) ?? 0;
+  const groupsOut = {
+    algorithm: 'Louvain with Leiden-style refinement (groups split into connected parts), modularity, resolution 1',
+    seed: GROUP_SEED, weights: GROUP_WEIGHTS, list: groupList, isolated: det.isolated,
+    links: [...between].map(([k, w]) => { const [a, b] = k.split('-').map(Number); return { a, b, weight: Math.round(w * 100) / 100 }; })
+      .sort((x, y) => y.weight - x.weight || x.a - y.a || x.b - y.b).slice(0, 40),
+  };
+
   const commit = git(root, ['rev-parse', 'HEAD'])?.trim() || null;
   const elapsedMs = Number(process.hrtime.bigint() - t0) / 1e6;
 
@@ -1564,6 +1593,7 @@ function main() {
     functions: fnStats,
     // Paths in which a literal document ID was replaced by {id} (masked form only; the raw ID is never stored).
     data: { usesWithUnknownOperation: dataOpUnknown, documentIdPathsMasked: [...maskedPaths].sort() },
+    groups: groupsOut,
   };
 
   fs.mkdirSync(outDir, { recursive: true });
@@ -1614,6 +1644,8 @@ function main() {
     console.log(`Data uses with unknown read/write: ${dataOpUnknown.length}; unresolved data paths: ${map.counts.unresolvedByKind.data ?? 0}; paths with a literal document ID masked as {id}: ${maskedPaths.size}`);
   }
   console.log(`Function calls between files: ${callStats.resolved} resolved (${callStats.viaValue || 0} via a value passed on), ${callStats.unresolved} unresolved (kind call); inside the same file: ${localCallCount}`);
+  console.log(`Groups: ${groupList.length} (+${det.isolated.length} isolated files)`);
+  for (const g of groupList) console.log(`  ${g.id}. ${g.label}  (${g.size})  ${g.central.join(', ')}`);
   console.log(`Parse failures: ${parseFailures.length}`);
   for (const f of parseFailures) console.log(`  ${f.file}:${f.line ?? '?'} ${f.reason}`);
 }
