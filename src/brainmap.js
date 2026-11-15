@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // brainmap: read-only answers about a mapped code project, for coding assistants. Reads
-// ~/.brain/maps/<slug>/map.json (schemaVersion 12); refreshes it first when the code changed in any linked
+// ~/.brain/maps/<slug>/map.json (format version: map-schema.js); refreshes it first when the code changed in any linked
 // folder (the same check as the Brain app's "Map is current"). A project can link several code folders mapped
 // into one map: paths then start with the folder's short name (ptdash:src/x.js), --folder limits the output to
 // one folder, and report, groups, query and unused run per folder. Prints paths, names and numbers only, never

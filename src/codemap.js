@@ -1,4 +1,4 @@
-// Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (schemaVersion 12; subcollection nodes and function call edges are not drawn).
+// Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (format version from map-schema.js; subcollection nodes and function call edges are not drawn).
 // Replaces the brain visual on the left while open. Canvas 2D with pre-rendered glow sprites, so it
 // stays smooth at around 1,000 nodes; d3-force is bundled by Vite, so nothing is fetched from outside.
 //
@@ -10,7 +10,7 @@ import { setBrainPaused } from './brain.js';
 import { computeReport, callerTree, callIndex } from './map-report.js';
 import { isMulti, prefixed, folderNames } from './map-folders.js';
 
-const SCHEMA_VERSION = 11;
+import { SCHEMA_VERSION } from './map-schema.js';
 const BG = '#05070F';
 let TOP = 96;             // below the toolbar; follows its height when it wraps
 const SIDE_W = 300;       // findings column and selection card

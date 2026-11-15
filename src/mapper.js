@@ -14,7 +14,7 @@ import { pathToFileURL } from 'node:url';
 import { parse } from '@babel/parser';
 import { detectGroups, nameGroups, SEED as GROUP_SEED, WEIGHTS as GROUP_WEIGHTS } from './map-groups.js';
 
-const SCHEMA_VERSION = 12;
+import { SCHEMA_VERSION } from './map-schema.js';
 const IMPORT_KINDS = ['import', 're-export', 'require', 'dynamic'];
 const KINDS = {
   nodes: ['file', 'collection', 'subcollection'],

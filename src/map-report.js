@@ -1,4 +1,4 @@
-// Path between two things, and a project report, computed from a map (schemaVersion 12). Pure functions with no
+// Path between two things, and a project report, computed from a map (format version: map-schema.js). Pure functions with no
 // Node or browser dependencies: used by the brainmap command (and its tools) and by the diagram. Deterministic.
 import { isMulti, prefixed, scopeQuery } from './map-folders.js';
 

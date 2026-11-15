@@ -15,7 +15,8 @@ export const DOT   = join(HOME, '.brain');
 export const LINKS = join(DOT, 'code-folders.json');
 export const MAPS  = join(DOT, 'maps');
 export const BRAIN = join(HOME, 'Brain');
-export const SCHEMA_VERSION = 12;
+import { SCHEMA_VERSION } from './map-schema.js';
+export { SCHEMA_VERSION };
 export const MAP_TIMEOUT_MS = 60_000;
 const MAPPER = join(dirname(fileURLToPath(import.meta.url)), 'mapper.js');
 

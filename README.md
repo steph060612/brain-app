@@ -59,7 +59,7 @@ Starts Vite on port 5174 (with hot reload) and the API on port 3001 in parallel.
 A project's panel can link one or more code folders (stored in `~/.brain/code-folders.json` as
 `slug → [{ name, path }]`, never in `~/Brain`; the older `slug → "/path"` format is still read and is upgraded in
 place on the next write) and **Map project**: the server runs `node src/mapper.js --folder <name>=<folder> … <slug>`
-(spawned with an argument list, 60 second limit) and writes `~/.brain/maps/<slug>/map.json` (schemaVersion 12). Literal document IDs in Firestore paths (generated-looking
+(spawned with an argument list, 60 second limit) and writes `~/.brain/maps/<slug>/map.json` (format version in src/map-schema.js). Literal document IDs in Firestore paths (generated-looking
 values, UUIDs, email addresses, long numbers) are replaced by `{id}` before anything is stored, so they never appear in
 the map, the diagram or brainmap; short fixed document names such as `stats/exercisePRs` are kept. Firestore use is read in every folder (app,
 functions/, scripts/): one node per top-level collection (counting everything under it) and one per subcollection

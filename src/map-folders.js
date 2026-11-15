@@ -1,4 +1,4 @@
-// Several code folders in one map (schemaVersion 12). Pure helpers with no Node or browser dependencies, used by
+// Several code folders in one map (format version: map-schema.js). Pure helpers with no Node or browser dependencies, used by
 // brainmap, the tool server, the status check and the diagram. In a map of more than one folder, file ids and
 // paths start with the folder's short name (app:src/x.js); `relPath` is the path inside the folder and
 // `codeFolder` the folder every node and edge came from. A single-folder map has no prefixes.
