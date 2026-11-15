@@ -13,7 +13,7 @@ import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { parse } from '@babel/parser';
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 const IMPORT_KINDS = ['import', 're-export', 'require', 'dynamic'];
 const KINDS = {
   nodes: ['file', 'collection', 'subcollection'],
@@ -805,6 +805,28 @@ function collectParamCalls(program, A) {
   return out;
 }
 
+// Calls to functions defined in the same file (function declarations and const = arrow / function expression,
+// exported or not, at any depth): { function, line, caller }. Recursion (a function calling itself) is left out.
+function collectLocalCalls(program, A) {
+  const out = [];
+  const local = []; // [name, idNode]
+  walkAst(program, (n) => {
+    if (n.type === 'FunctionDeclaration' && n.id) local.push([n.id.name, n.id]);
+    else if (n.type === 'VariableDeclarator' && n.id.type === 'Identifier' && isFnNode(n.init)) local.push([n.id.name, n.id]);
+  });
+  for (const [name, id] of local) {
+    const b = A.lookup(name, id);
+    if (!b || A.assignmentsOf(b).length) continue; // reassigned: not certain which function runs
+    for (const u of A.usesOf(b)) {
+      if (!isCall(A.parent(u)) || A.key(u) !== 'callee') continue;
+      const caller = enclosingFunction(u, A);
+      if (caller === name) continue;
+      out.push({ function: name, line: u.loc.start.line, caller });
+    }
+  }
+  return out.sort((a, b) => a.line - b.line);
+}
+
 // Calls to functions imported from other project files: { file, name, line, caller, via }, and the uses the
 // mapper cannot follow (a computed member, an imported function passed as a value, a module object passed on).
 function collectCalls(ast, A, rel, resolve) {
@@ -1211,6 +1233,7 @@ function main() {
   const nodes = [], edges = [], unresolved = [], missing = [], parseFailures = [];
   const rawScreens = [], navCallsByFile = new Map(), callablesByFile = new Map(), dataByFile = new Map();
   const exportTables = new Map(), callsByFile = new Map(), paramCallsByFile = new Map();
+  let localCallCount = 0;
   let navSkippedNonNav = 0, functionDefs = new Map();
   const assetTotals = { total: 0, byExtension: {} };
 
@@ -1269,6 +1292,10 @@ function main() {
     if (fc.calls.length || fc.values.length) callsByFile.set(rel, fc);
     const pc = collectParamCalls(ast.program, A);
     if (pc.size) paramCallsByFile.set(rel, pc);
+    for (const c of collectLocalCalls(ast.program, A)) {
+      edges.push({ from: rel, to: rel, kind: 'calls', line: c.line, function: c.function, ...(c.caller ? { caller: c.caller } : {}), sameFile: true });
+      localCallCount++;
+    }
     const data = collectData(A);
     if (data.uses.length || data.unresolvedLines.length || data.partial.length) dataByFile.set(rel, data);
 
@@ -1529,7 +1556,7 @@ function main() {
       unresolved: unresolved.length, unresolvedByKind: countBy(unresolved, (u) => u.kind),
       missingRelative: missing.length, assets: assetTotals.total, parseFailures: parseFailures.length,
       screens: screens.length, navigationCalls: navStats.calls, functionCalls: fnStats.calls,
-      functionCallSites: callStats.calls, functionCallsResolved: callStats.resolved, functionCallsViaValue: callStats.viaValue || 0, functionCallsUnresolved: callStats.unresolved,
+      functionCallsSameFile: localCallCount, functionCallSites: callStats.calls, functionCallsResolved: callStats.resolved, functionCallsViaValue: callStats.viaValue || 0, functionCallsUnresolved: callStats.unresolved,
       collections: collections.size, subcollections: subs.size, documentIdPathsMasked: maskedPaths.size, dataUsesWithUnknownOperation: dataOpUnknown.length,
     },
     nodes, edges, unresolved, missingRelative: missing, assetTotals, parseFailures,
@@ -1586,7 +1613,7 @@ function main() {
     for (const n of nodes.filter((x) => x.kind === 'subcollection')) console.log(`  ${n.pattern}: ${n.readers} / ${n.writers} / ${n.usedWithUnknownOperation}`);
     console.log(`Data uses with unknown read/write: ${dataOpUnknown.length}; unresolved data paths: ${map.counts.unresolvedByKind.data ?? 0}; paths with a literal document ID masked as {id}: ${maskedPaths.size}`);
   }
-  console.log(`Function calls between files: ${callStats.resolved} resolved (${callStats.viaValue || 0} via a value passed on), ${callStats.unresolved} unresolved (kind call)`);
+  console.log(`Function calls between files: ${callStats.resolved} resolved (${callStats.viaValue || 0} via a value passed on), ${callStats.unresolved} unresolved (kind call); inside the same file: ${localCallCount}`);
   console.log(`Parse failures: ${parseFailures.length}`);
   for (const f of parseFailures) console.log(`  ${f.file}:${f.line ?? '?'} ${f.reason}`);
 }

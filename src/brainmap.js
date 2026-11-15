@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // brainmap: read-only answers about a mapped code project, for coding assistants. Reads
-// ~/.brain/maps/<slug>/map.json (schemaVersion 6); refreshes it first when the code changed (the same check
+// ~/.brain/maps/<slug>/map.json (schemaVersion 7); refreshes it first when the code changed (the same check
 // as the Brain app's "Map is current"). Prints paths, names and numbers only, never file contents.
 // No network, no model calls.
 import { stat } from 'fs/promises';
-import { findPath, computeReport, queryMap } from './map-report.js';
+import { findPath, computeReport, queryMap, callerTree, callIndex } from './map-report.js';
 import {
   loadLinks, readMap, mapStatus, runMapper, gitAvailable, realOrSelf, inside, tilde,
 } from './codemap-status.js';
@@ -18,7 +18,7 @@ Usage: brainmap <command> [argument] [--all] [--depth 2] [--project <name>] [--n
   overview              project summary: entry files, folders, most imported files, screens, collections, functions
   files <folder>        files in a folder, with line counts and exported names
   file <path>           exports, imports, importers, navigation, collections and functions of one file
-  impact <path>         files that depend on it through imports, up to 3 steps away, grouped by depth
+  impact <path>         files that depend on it through imports, up to 3 steps away (impact file:function: through calls)
   screen <name>         a navigation screen: its file, where it navigates to and where it is reached from
   callers <name>        files and lines that call an exported function (or file:name)
   path <A> <B>          shortest path between two files, functions, screens or collections (--all-shortest: up to 5)
@@ -271,7 +271,34 @@ function fileCmd(P, ix, q) {
   if (served.length) wrapList('Defines called cloud functions: ', served.map(([n, v]) => `${n} ←${v.callers.length}`));
 }
 
+// impact <file:function>: everything that reaches the function through calls, up to 3 levels across files
+// (calls inside a file are followed without using up a level), grouped by depth.
+function impactFunction(P, ix, file, fn) {
+  const nodes = tree(P, file, fn, 3);
+  const byDepth = new Map(); // depth -> Map(key -> { e, lines })
+  const walk = (ns, d) => { for (const n of ns) {
+    const depth = n.e.sameFile ? d : d + 1;
+    const k = `${n.e.from}\0${n.e.caller}\0${n.e.sameFile ? 1 : 0}`;
+    const m = byDepth.get(depth) || byDepth.set(depth, new Map()).get(depth);
+    const g = m.get(k) || m.set(k, { e: n.e, lines: new Set() }).get(k); g.lines.add(n.e.line);
+    walk(n.children, depth);
+  } };
+  walk(nodes, 0);
+  const files = new Set([...byDepth.values()].flatMap(m => [...m.values()].map(g => g.e.from)));
+  files.delete(file);
+  say(`${fn} (${file}): reached through calls from ${plural(files.size, 'other file')} (${[...byDepth.keys()].sort().map(d => `depth ${d}: ${byDepth.get(d).size}`).join(', ') || 'none'}); calls inside a file do not add depth`);
+  for (const d of [...byDepth.keys()].sort()) {
+    say(d === 0 ? 'Inside its own file:' : d === 1 ? 'Depth 1 (call it directly, or through same-file helpers):' : `Depth ${d}:`);
+    items([...byDepth.get(d).values()].sort((a, b) => a.e.from.localeCompare(b.e.from)).map(g => rowText(g)));
+  }
+}
+
 function impactCmd(P, ix, q) {
+  const colon = q.lastIndexOf(':');
+  if (colon > 0 && !/^\d+$/.test(q.slice(colon + 1))) {
+    const f0 = resolveFile(ix, q.slice(0, colon));
+    return impactFunction(P, ix, f0.path, q.slice(colon + 1));
+  }
   const f = resolveFile(ix, q);
   const seen = new Map([[f.path, { depth: 0 }]]);
   let frontier = [f.path];
@@ -354,7 +381,7 @@ function pathCmd(P, ix, args) {
     if (r.paths.length > 1) say(`Path ${i + 1}:`);
     path.forEach((h, j) => {
       const e = h.edges[0];
-      say(`  ${j + 1}. ${h.from} —${e.kind}${e.what ? ` ${e.what}` : ''}→ ${h.to}  (${e.at})`);
+      say(`  ${j + 1}. ${h.from} —${e.kind}${e.what ? ` ${e.what}` : ''}→ ${h.to}  (${e.at})${h.loose ? '  [files connect here, but no call reaches the next step]' : ''}`);
       if (h.edges.length > 1) say(`     also: ${h.edges.slice(1, ALL ? undefined : 3).map(x => `${x.kind}${x.what ? ` ${x.what}` : ''} (${x.at})`).join('; ')}${!ALL && h.edges.length > 3 ? `; +${h.edges.length - 3} more` : ''}`);
     });
   });
@@ -392,7 +419,7 @@ function reportCmd(P) {
   say('Most dependent files (outgoing links):');
   items(r.dependent.map(x => `${String(x.total).padStart(4)}  ${x.file}  (${kinds(x)})`));
   say('Most-called functions (calling files):');
-  items(r.functions.map(x => `${String(x.files).padStart(4)}  ${x.fn}  ${x.file}  (${plural(x.calls, 'call')})`));
+  items(r.functions.map(x => `${String(x.files).padStart(4)}  ${x.fn}  ${x.file}  (${plural(x.calls, 'call')}${x.same ? `, +${x.same} in its own file` : ''})`));
   say('Busiest data (reader + writer files):');
   items(r.data.map(x => `${String(x.total).padStart(4)}  ${x.name}  (${x.readers} read, ${x.writers} write${x.kind === 'subcollection' ? ', subcollection' : ''})`));
   say('Bridges (removing the file splits the import graph):');
@@ -406,48 +433,80 @@ function reportCmd(P) {
 // ─── function calls ──────────────────────────────────────────────────────────
 // Call edges into a function: the exported name or the local name it has in its own file.
 const callsTo = (ix, file, fn) => (ix.inn.get(file) || []).filter(e => e.kind === 'calls' && (e.function === fn || e.local === fn || e.export === fn));
-// One row per calling file; calls through a function handed over as a value get their own row with where it came from.
-const callRows = list => [...groupBy(list, e => (e.via === 'value' ? `${e.from}\0${e.passedFrom}:${e.passedLine}` : e.from))].map(([, es]) => {
-  const e0 = es[0];
-  const callers = [...new Set(es.map(e => e.caller).filter(Boolean))];
-  return { file: e0.from, text: `${e0.from}${linesOf(es)}${callers.length ? ` in ${callers.slice(0, 3).join(', ')}${callers.length > 3 ? ', …' : ''}` : ''}${e0.via === 'value' ? `, via value from ${e0.passedFrom}:${e0.passedLine}` : ''}` };
-});
+let CIDX = null;
+const tree = (P, file, fn, depth) => callerTree(P.map, file, fn, depth, (CIDX ??= callIndex(P.map)));
 
-// "Through functions": the named functions that read or write a collection, and the files that call them. With
-// --depth 2, also the callers of functions (in other files) that call those functions.
-function throughFunctions(ix, dataEdges) {
+// Sibling callers merged per calling file and function (and per value hand-over), with their lines.
+function mergeNodes(nodes) {
+  const by = new Map();
+  for (const n of nodes) {
+    const e = n.e, k = `${e.from}\0${e.caller}\0${e.sameFile ? 1 : 0}\0${e.via === 'value' ? `${e.passedFrom}:${e.passedLine}` : ''}`;
+    const g = by.get(k) || by.set(k, { e, lines: new Set(), children: [] }).get(k);
+    g.lines.add(e.line);
+    if (!g.children.length) g.children = n.children;
+  }
+  return [...by.values()].sort((x, y) => (x.e.sameFile ? 1 : 0) - (y.e.sameFile ? 1 : 0) || x.e.from.localeCompare(y.e.from) || String(x.e.caller).localeCompare(String(y.e.caller)));
+}
+const rowText = g => {
+  const ls = [...g.lines].sort((x, y) => x - y);
+  return `${g.e.from} (line${ls.length > 1 ? 's' : ''} ${ls.slice(0, 6).join(', ')}${ls.length > 6 ? ', …' : ''})${g.e.caller ? ` in ${g.e.caller}` : ' at top level'}`
+    + `${g.e.sameFile ? ', same file' : ''}${g.e.via === 'value' ? `, via value from ${g.e.passedFrom}:${g.e.passedLine}` : ''}`;
+};
+// Callers of callers, indented with "←".
+function sayTree(nodes, pad, limit = 4) {
+  const gs = mergeNodes(nodes), shown = ALL ? gs : gs.slice(0, limit);
+  for (const g of shown) { say(`${pad}← ${rowText(g)}`); sayTree(g.children, `${pad}  `); }
+  if (shown.length < gs.length) say(`${pad}  (+${gs.length - shown.length} more, use --all)`);
+}
+// Top level of a caller tree: other files by folder, then calls inside the function's own file.
+function sayCallers(ix, nodes, limit) {
+  const gs = mergeNodes(nodes), other = gs.filter(g => !g.e.sameFile), same = gs.filter(g => g.e.sameFile);
+  const byFolder = groupBy(other, g => folderLabel(ix.byPath.get(g.e.from)));
+  const rank = k => (k === 'functions/' || k === 'scripts/' ? 1 : 0);
+  let shown = 0;
+  for (const k of [...byFolder.keys()].sort((x, y) => rank(x) - rank(y) || x.localeCompare(y))) {
+    if (!ALL && shown >= limit) break;
+    say(`  ${k} (${byFolder.get(k).length})`);
+    for (const g of byFolder.get(k)) { if (!ALL && shown >= limit) break; say(`    ${rowText(g)}`); sayTree(g.children, '      '); shown++; }
+  }
+  if (shown < other.length) say(`  (+${other.length - shown} more, use --all)`);
+  if (same.length) {
+    say('  inside its own file:');
+    for (const g of ALL ? same : same.slice(0, limit)) { say(`    ${rowText(g)}`); sayTree(g.children, '      '); }
+    if (!ALL && same.length > limit) say(`    (+${same.length - limit} more, use --all)`);
+  }
+}
+// "← 3 files", "← 2 files, and 4 places in its own file", "← called only inside its own file (4 places)".
+function callerSummary(nodes) {
+  const other = new Set(nodes.filter(n => !n.e.sameFile).map(n => n.e.from)), same = nodes.filter(n => n.e.sameFile).length;
+  if (other.size) return `${plural(other.size, 'file')}${same ? `, and ${plural(same, 'place')} in its own file` : ''}`;
+  return same ? `called only inside its own file (${plural(same, 'place')})` : 'no calls found';
+}
+
+// "Through functions": the named functions that read or write a collection, and who calls them. Calls inside
+// a file are followed for free; --depth 2 adds one more level of callers in other files.
+function throughFunctions(P, ix, dataEdges) {
   const fns = new Map(); // file\0function -> { file, fn, ops }
   for (const e of dataEdges) for (const st of e.sites || []) {
     if (!st.function) continue;
     const k = `${e.from}\0${st.function}`;
     (fns.get(k) || fns.set(k, { file: e.from, fn: st.function, ops: new Set() }).get(k)).ops.add(e.kind === 'reads' ? 'reads' : 'writes');
   }
-  const list = [...fns.values()].sort((a, b) => a.file.localeCompare(b.file) || a.fn.localeCompare(b.fn));
-  const direct = list.map(f => ({ ...f, calls: callsTo(ix, f.file, f.fn) }));
-  const callerFiles = new Set(direct.flatMap(f => f.calls.map(e => e.from)));
-  say(`Through functions: ${plural(list.length, 'function')} read or write it, called from ${plural(callerFiles.size, 'other file')}${DEPTH === 1 ? ' (--depth 2 adds their callers)' : ''}`);
-  // Many functions: fewer of them, and fewer caller lines each, unless --all.
-  const many = direct.length > 6;
-  const shownFns = ALL ? direct : direct.slice(0, many ? 8 : 12);
+  const list = [...fns.values()].sort((a, b) => a.file.localeCompare(b.file) || a.fn.localeCompare(b.fn)).map(f => ({ ...f, nodes: tree(P, f.file, f.fn, DEPTH) }));
+  // Every other file anywhere in the caller trees (calls inside a file are followed to the files beyond).
+  const callerFiles = new Set();
+  const walk = (ns, own) => { for (const n of ns) { if (n.e.from !== own) callerFiles.add(n.e.from); walk(n.children, own); } };
+  for (const f of list) walk(f.nodes, f.file);
+  say(`Through functions: ${plural(list.length, 'function')} read or write it, reached from ${plural(callerFiles.size, 'other file')}${DEPTH === 1 ? ' (--depth 2 adds their callers)' : ''}`);
+  const many = list.length > 6;
+  const shownFns = ALL ? list : list.slice(0, many ? 8 : 12);
   for (const f of shownFns) {
-    say(`  ${f.fn} (${f.file}, ${[...f.ops].join(' and ')}) ← ${f.calls.length ? plural(new Set(f.calls.map(e => e.from)).size, 'file') : 'no calls from other files'}`);
-    if (f.calls.length) indent(() => groupedByFolder(ix, callRows(f.calls), many ? 3 : 6));
+    say(`  ${f.fn} (${f.file}, ${[...f.ops].join(' and ')}) ← ${callerSummary(f.nodes)}`);
+    if (f.nodes.length) indent(() => sayCallers(ix, f.nodes, many ? 3 : 6));
     const passed = ix.unresolvedCalls.filter(u => u.target === f.file && u.name === f.fn);
     if (passed.length) say(`    also passed on as a value, not followed: ${passed.map(u => `${u.file}:${u.line}`).join(', ')}`);
-    if (DEPTH < 2) continue;
-    // Functions in other files that call f, and who calls them.
-    const wrappers = [...groupBy(f.calls.filter(e => e.caller), e => `${e.from}\0${e.caller}`).values()]
-      .map(es => ({ file: es[0].from, fn: es[0].caller, calls: callsTo(ix, es[0].from, es[0].caller) }))
-      .filter(w => !fns.has(`${w.file}\0${w.fn}`)); // already listed above as reading or writing it
-    for (const w of wrappers) {
-      if (!w.calls.length) continue;
-      say(`    via ${w.fn} (${w.file}) ← ${plural(new Set(w.calls.map(e => e.from)).size, 'file')}`);
-      indent(() => indent(() => groupedByFolder(ix, callRows(w.calls), 4)));
-    }
-    const silent = wrappers.filter(w => !w.calls.length).length;
-    if (silent) say(`    (${plural(silent, 'calling function')} with no calls from other files)`);
   }
-  if (shownFns.length < direct.length) say(`  (+${direct.length - shownFns.length} more functions, use --all)`);
+  if (shownFns.length < list.length) say(`  (+${list.length - shownFns.length} more functions, use --all)`);
 }
 
 // Runs fn with its output indented by two more spaces.
@@ -458,7 +517,7 @@ function indent(fn) {
 }
 
 function callersCmd(P, ix, q) {
-  if (!q) die('Give an exported function name, or file:name, for example: brainmap callers logWorkout');
+  if (!q) die('Give a function name, or file:name (any function defined in that file), for example: brainmap callers logWorkout');
   let file = null, name = q;
   const colon = q.lastIndexOf(':');
   if (colon > 0) { file = resolveFile(ix, q.slice(0, colon)).path; name = q.slice(colon + 1); }
@@ -468,14 +527,18 @@ function callersCmd(P, ix, q) {
   if (!byTarget.size) {
     const defined = ix.files.filter(f => (f.exports || []).includes(name) && (!file || f.path === file)).map(f => f.path);
     say(defined.length
-      ? `${name} (exported by ${defined.join(', ')}): no calls from other files found.`
-      : `No exported function "${name}"${file ? ` in ${file}` : ''} is called from another file.${file ? '' : ' Try brainmap find.'}`);
+      ? `${name} (exported by ${defined.join(', ')}): no calls found, in other files or its own.`
+      : `No function "${name}"${file ? ` in ${file}` : ''} is called anywhere in the map.${file ? '' : ' Try brainmap find, or file:name for a function that is not exported.'}`);
   }
   if (byTarget.size > 1) say(`"${name}" matches ${byTarget.size} functions: ${[...byTarget.keys()].map(t => `${t}:${name}`).join(', ')}`);
   for (const [target, es] of byTarget) {
     if (byTarget.size > 1) say('');
-    say(`${name} (${target}): ${plural(es.length, 'call')} from ${plural(new Set(es.map(e => e.from)).size, 'file')}, by folder:`);
-    groupedByFolder(ix, callRows(es), byTarget.size > 1 ? 10 : 25);
+    const nodes = tree(P, target, name, DEPTH);
+    const other = es.filter(e => !e.sameFile), same = es.length - other.length;
+    say(other.length
+      ? `${name} (${target}): ${plural(other.length, 'call')} from ${plural(new Set(other.map(e => e.from)).size, 'file')}${same ? `, ${plural(same, 'call')} inside its own file` : ''}${DEPTH > 1 ? `, callers to depth ${DEPTH}` : ''}, by folder:`
+      : `${name} (${target}): called only inside its own file (${plural(same, 'place')})${DEPTH > 1 ? `, callers to depth ${DEPTH}` : ''}:`);
+    sayCallers(ix, nodes, byTarget.size > 1 ? 10 : 25);
   }
   if (passed.length) {
     say(`Also passed on as a value, so its calls cannot be followed (${passed.length}):`);
@@ -551,7 +614,7 @@ function collectionCmd(P, ix, q) {
       say(`Read or write unknown (${unknown.length}), by folder:`);
       groupedByFolder(ix, unknown.map(u => ({ file: u.file, text: `${u.file}:${u.line}${u.function ? ` (in ${u.function})` : ''}  ${u.path || ''}` })), 10);
     }
-    throughFunctions(ix, es);
+    throughFunctions(P, ix, es);
   });
   const partial = (P.map.unresolved || []).filter(u => u.kind === 'data' && u.path).length;
   say(`Firestore use is mapped in every folder (app, functions/, scripts/).${partial ? ` ${plural(partial, 'path')} with a subcollection name the map could not work out ${partial === 1 ? 'is' : 'are'} counted as unresolved.` : ''}`);

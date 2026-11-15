@@ -1,4 +1,4 @@
-// Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (schemaVersion 6; subcollection nodes and function call edges are not drawn).
+// Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (schemaVersion 7; subcollection nodes and function call edges are not drawn).
 // Replaces the brain visual on the left while open. Canvas 2D with pre-rendered glow sprites, so it
 // stays smooth at around 1,000 nodes; d3-force is bundled by Vite, so nothing is fetched from outside.
 //
@@ -7,9 +7,9 @@
 // files. "Files" shows every file. Internally the Files view is the Folders view with every folder expanded.
 import { forceSimulation, forceManyBody, forceLink, forceX, forceY, forceCollide } from 'd3-force';
 import { setBrainPaused } from './brain.js';
-import { computeReport } from './map-report.js';
+import { computeReport, callerTree, callIndex } from './map-report.js';
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 const BG = '#05070F';
 let TOP = 96;             // below the toolbar; follows its height when it wraps
 const SIDE_W = 300;       // findings column and selection card
@@ -49,7 +49,7 @@ let mode = 'folders', expanded = new Set();
 let sim = null, view = { x: 0, y: 0, k: 1 }, dpr = 1, width = 0, height = 0;
 let layerOn = {};
 let hovered = null, selected = null, neighbors = new Set(), searchHits = new Set(), searchMatches = [], searchQuery = '';
-let lastLabels = [], tethers = [];
+let lastLabels = [], tethers = [], CIDX = null;
 let dirty = true, raf = 0, panelOpen = true, legendOpen = null;
 const sprites = new Map();
 
@@ -65,7 +65,7 @@ export async function openCodeMap(proj, { onBack } = {}) {
     throw new Error(`This map uses schema version ${data.schemaVersion ?? 'unknown'}; this app reads only version ${SCHEMA_VERSION}. Re-map the project to replace it.`);
   }
   build();
-  project = proj; onClose = onBack || null; map = data;
+  project = proj; onClose = onBack || null; map = data; CIDX = null;
   prepare();
   root.style.display = 'block';
   setBrainPaused(true);
@@ -877,7 +877,7 @@ function linkSummary(n) {
   const per = {};
   for (const e of edges) {
     if (e.from !== n.id && e.to !== n.id) continue;
-    if (byId.get(e.to)?.kind === 'subcollection') continue; // already counted in its top-level collection
+    if (byId.get(e.to)?.kind === 'subcollection' || e.sameFile) continue; // counted in the collection / listed separately
     const p = per[e.layer] ||= { outLinks: 0, out: new Set(), inLinks: 0, in: new Set() };
     if (e.from === n.id) { p.outLinks++; p.out.add(e.to); }
     if (e.to === n.id) { p.inLinks++; p.in.add(e.from); }
@@ -935,7 +935,7 @@ function folderLinks(key) {
   let inside = 0, totalIn = 0, totalOut = 0;
   const row = g => rows.get(g) || (rows.set(g, { g, in: 0, out: 0 }), rows.get(g));
   for (const e of edges) {
-    if (!layerOn[e.layer] || byId.get(e.to)?.kind === 'subcollection') continue; // subcollections count in their parent
+    if (!layerOn[e.layer] || byId.get(e.to)?.kind === 'subcollection' || e.sameFile) continue; // subcollections count in their parent
     const a = groupOf(e.from), b = groupOf(e.to);
     if (a === key && b === key) inside++;
     else if (a === key) { row(b).out++; totalOut++; }
@@ -1021,11 +1021,11 @@ const callsInto = (file, fn) => edges.filter(e => e.kind === 'calls' && e.to ===
 // Caller rows as brainmap shows them: file (lines) in function, via value from file:line.
 function callerRows(list, limit) {
   const by = new Map();
-  for (const e of list) { const k = e.via === 'value' ? `${e.from}\0${e.passedFrom}:${e.passedLine}` : e.from; (by.get(k) || by.set(k, []).get(k)).push(e); }
+  for (const e of list) { const k = e.via === 'value' ? `${e.from}\0${e.passedFrom}:${e.passedLine}` : e.sameFile ? `${e.from}\0same\0${e.caller}` : e.from; (by.get(k) || by.set(k, []).get(k)).push(e); }
   const rows = [...by.values()].sort((a, b) => a[0].from.localeCompare(b[0].from)).map(es => {
     const e0 = es[0], ls = [...new Set(es.map(e => e.line))].sort((a, b) => a - b);
     const callers = [...new Set(es.map(e => e.caller).filter(Boolean))];
-    return wrapItem(e0.from, `${esc(e0.from)} <span style="color:#5a6890">(line${ls.length > 1 ? 's' : ''} ${ls.join(', ')})${callers.length ? ` in ${esc(callers.join(', '))}` : ''}${e0.via === 'value' ? ` · via value from ${esc(e0.passedFrom)}:${e0.passedLine}` : ''}</span>`);
+    return wrapItem(e0.from, `${esc(e0.from)} <span style="color:#5a6890">(line${ls.length > 1 ? 's' : ''} ${ls.join(', ')})${callers.length ? ` in ${esc(callers.join(', '))}` : ''}${e0.sameFile ? ' · same file' : ''}${e0.via === 'value' ? ` · via value from ${esc(e0.passedFrom)}:${e0.passedLine}` : ''}</span>`);
   });
   return moreList(rows, limit);
 }
@@ -1033,22 +1033,33 @@ function callerRows(list, limit) {
 // A file: its exported functions with how many files call each, and the functions it calls in other files.
 function functionsHtml(n) {
   if (n.kind !== 'file') return '';
-  const inc = edges.filter(e => e.kind === 'calls' && e.to === n.id);
+  const inc = edges.filter(e => e.kind === 'calls' && e.to === n.id && !e.sameFile);
+  const local = edges.filter(e => e.kind === 'calls' && e.from === n.id && e.sameFile);
+  const localBy = new Map();
+  for (const e of local) localBy.set(e.function, (localBy.get(e.function) || 0) + 1);
   const byFn = new Map();
   for (const e of inc) (byFn.get(e.function) || byFn.set(e.function, new Set()).get(e.function)).add(e.from);
   const exported = (n.raw.exports || []).filter(x => x !== 'default' && !x.startsWith('* from'));
   const rows = [...new Set([...byFn.keys(), ...exported])].map(fn => ({ fn, files: byFn.get(fn)?.size || 0 }))
     .sort((a, b) => b.files - a.files || a.fn.localeCompare(b.fn));
-  const called = rows.filter(r => r.files), silent = rows.length - called.length;
+  const called = rows.filter(r => r.files);
+  const onlyLocal = rows.filter(r => !r.files && localBy.get(r.fn));
+  const silent = rows.length - called.length - onlyLocal.length;
   const out = new Map();
-  for (const e of edges) if (e.kind === 'calls' && e.from === n.id) { const k = `${e.to}\0${e.function}`; (out.get(k) || out.set(k, { to: e.to, fn: e.function, n: 0, value: 0 }).get(k)).n++; if (e.via === 'value') out.get(k).value++; }
+  for (const e of edges) if (e.kind === 'calls' && e.from === n.id && !e.sameFile) { const k = `${e.to}\0${e.function}`; (out.get(k) || out.set(k, { to: e.to, fn: e.function, n: 0, value: 0 }).get(k)).n++; if (e.via === 'value') out.get(k).value++; }
   const outRows = [...out.values()].sort((a, b) => b.n - a.n || a.fn.localeCompare(b.fn));
-  if (!rows.length && !outRows.length) return '';
+  // Calls inside this file: caller → callee, grouped.
+  const pairs = new Map();
+  for (const e of local) { const k = `${e.caller ?? 'top level'}\0${e.function}`; pairs.set(k, (pairs.get(k) || 0) + 1); }
+  const localRows = [...pairs].sort((a, b) => a[0].localeCompare(b[0])).map(([k, c]) => { const [from, to] = k.split('\0'); return `<div style="padding-left:4px;word-break:break-word">${esc(from)} <span style="color:#5a6890">→</span> ${esc(to)}${c > 1 ? ` <span style="color:#5a6890">×${c}</span>` : ''}</div>`; });
+  if (!rows.length && !outRows.length && !localRows.length) return '';
   return `${rows.length ? `<div class="cm-h">Exported functions, files calling each</div>
       ${moreList(called.map(r => `<div style="display:flex;gap:6px"><span style="flex:1;word-break:break-word">${esc(r.fn)}</span><span style="color:#c8d0e8">${r.files}</span></div>`), 12, 'more called')}
-      ${silent ? `<div style="color:#5a6890">${plural(silent, 'other export')} not called from other files</div>` : ''}` : ''}
+      ${onlyLocal.length ? `<div style="color:#5a6890">Called only inside this file: ${onlyLocal.map(r => `${esc(r.fn)} (${localBy.get(r.fn)})`).join(', ')}</div>` : ''}
+      ${silent ? `<div style="color:#5a6890">${plural(silent, 'other export')} not called anywhere in the map</div>` : ''}` : ''}
     ${outRows.length ? `<div class="cm-h">Calls functions in other files</div>
-      ${moreList(outRows.map(r => wrapItem(r.to, `${esc(r.fn)} <span style="color:#5a6890">(${esc(r.to)})${r.n > 1 ? ` ×${r.n}` : ''}${r.value ? ' · via value' : ''}</span>`)), 12)}` : ''}`;
+      ${moreList(outRows.map(r => wrapItem(r.to, `${esc(r.fn)} <span style="color:#5a6890">(${esc(r.to)})${r.n > 1 ? ` ×${r.n}` : ''}${r.value ? ' · via value' : ''}</span>`)), 12)}` : ''}
+    ${localRows.length ? `<div class="cm-h">Calls inside this file (${local.length})</div>${moreList(localRows, 12)}` : ''}`;
 }
 
 // A collection or subcollection: the functions that read or write it and who calls them (depth 1), as brainmap collection.
@@ -1066,8 +1077,17 @@ function throughFunctionsHtml(n) {
   if (!list.length) return '';
   return `<div class="cm-h">Through functions (${list.length})</div>
     ${moreList(list.map(f => {
-      const calls = callsInto(f.file, f.fn);
-      return `<div style="margin-top:4px"><span style="color:#fff">${esc(f.fn)}</span> <span style="color:#5a6890">(${esc(f.file)}, ${[...f.ops].join(' and ')}) ← ${calls.length ? plural(new Set(calls.map(e => e.from)).size, 'file') : 'no calls from other files'}</span></div>
+      // Depth 1 as brainmap collection: calls inside the file are followed to the first callers elsewhere.
+      const calls = [];
+      const top = callerTree(map, f.file, f.fn, 1, CIDX ??= callIndex(map));
+      const walk = ns => { for (const x of ns) { calls.push(x.e); walk(x.children); } };
+      walk(top);
+      // Direct callers decide the wording; files reached through same-file helpers are counted separately.
+      const direct = new Set(top.filter(n => !n.e.sameFile).map(n => n.e.from)), same = top.filter(n => n.e.sameFile).length;
+      const reached = new Set(calls.filter(e => e.from !== f.file).map(e => e.from));
+      const summary = direct.size ? `${plural(direct.size, 'file')}${same ? ` (and ${plural(same, 'place')} in its own file)` : ''}`
+        : same ? `called only inside its own file (${plural(same, 'place')})${reached.size ? `, reached from ${plural(reached.size, 'file')}` : ''}` : 'no calls found';
+      return `<div style="margin-top:4px"><span style="color:#fff">${esc(f.fn)}</span> <span style="color:#5a6890">(${esc(f.file)}, ${[...f.ops].join(' and ')}) ← ${summary}</span></div>
         ${calls.length ? `<div style="padding-left:10px">${callerRows(calls, 4)}</div>` : ''}`;
     }), 10, 'more functions')}`;
 }
@@ -1083,7 +1103,8 @@ function renderToolbar() {
   const colCount = map.counts?.nodesByKind?.collection ?? 0;
   const when = map.generatedAt ? new Date(map.generatedAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '';
   // Subcollection edges are inside their top-level collection's, so they are not counted again here.
-  const layerCount = id => edges.filter(e => e.layer === id && byId.get(e.to)?.kind !== 'subcollection').length;
+  // Calls inside a file are not drawn and not counted here (they are listed in the file's card).
+  const layerCount = id => edges.filter(e => e.layer === id && byId.get(e.to)?.kind !== 'subcollection' && !e.sameFile).length;
   toolbarEl.innerHTML = `
     <button class="cm-btn cm-back">← Back to brain</button>
     <div style="font-size:13px;color:#fff;font-weight:600">${esc(project.name)}</div>

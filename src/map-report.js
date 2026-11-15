@@ -1,4 +1,4 @@
-// Path between two things, and a project report, computed from a map (schemaVersion 6). Pure functions with no
+// Path between two things, and a project report, computed from a map (schemaVersion 7). Pure functions with no
 // Node or browser dependencies: used by the brainmap command (and its tools) and by the diagram. Deterministic.
 
 const IMPORT_KINDS = new Set(['import', 'require', 're-export', 'dynamic']);
@@ -9,6 +9,57 @@ const PATH_KINDS = new Set([...IMPORT_KINDS, 'calls', 'navigate', 'calls-functio
 export const folderOf = f => (f.rootGroup !== 'app' ? f.rootGroup : f.topFolder === '(root)' ? '(root)' : f.topFolder);
 const firstLine = e => e.line ?? e.lines?.[0] ?? null;
 const nodeLabel = n => (n.kind === 'file' ? n.path : n.kind === 'subcollection' ? n.pattern : n.name);
+
+// ─── callers (across files and inside a file) ────────────────────────────────
+// target file + function → every call edge reaching it (other files, values passed on, and the same file).
+export function callIndex(map) {
+  const idx = new Map();
+  const add = (k, e) => (idx.get(k) || idx.set(k, []).get(k)).push(e);
+  for (const e of map.edges) {
+    if (e.kind !== 'calls') continue;
+    for (const name of new Set([e.function, e.local, e.export].filter(Boolean))) add(`${e.to}\0${name}`, e);
+  }
+  return idx;
+}
+
+// Callers of a function as a tree. A call from another file uses up one level of depth; a call inside the same
+// file does not (it is plumbing between helpers), up to 6 such hops in a row. Cycles are cut.
+export function callerTree(map, file, fn, depth = 1, idx = callIndex(map)) {
+  const visit = (f, name, d, sameHops, seen) => (idx.get(`${f}\0${name}`) || []).map(e => {
+    const node = { e, children: [] };
+    const key = `${e.from}\0${e.caller}`;
+    if (e.caller && !seen.has(key)) {
+      const next = new Set([...seen, key]);
+      if (e.sameFile && sameHops < 6) node.children = visit(e.from, e.caller, d, sameHops + 1, next);
+      else if (!e.sameFile && d < depth) node.children = visit(e.from, e.caller, d + 1, 0, next);
+    }
+    return node;
+  });
+  return visit(file, fn, 1, 0, new Set([`${file}\0${fn}`]));
+}
+
+// Same-file call graph of one file: caller → Set(callee).
+function localCalls(map) {
+  const g = new Map();
+  for (const e of map.edges) if (e.sameFile && e.caller) {
+    const m = g.get(e.from) || g.set(e.from, new Map()).get(e.from);
+    (m.get(e.caller) || m.set(e.caller, new Set()).get(e.caller)).add(e.function);
+  }
+  return g;
+}
+// Shortest chain of same-file calls from function a to function b in a file: [a, …, b], or null.
+function localChain(g, file, a, b) {
+  const m = g.get(file);
+  if (!m || a === b) return a === b ? [a] : null;
+  const prev = new Map([[a, null]]), q = [a];
+  for (let i = 0; i < q.length; i++) for (const n of m.get(q[i]) || []) {
+    if (prev.has(n)) continue;
+    prev.set(n, q[i]);
+    if (n === b) { const chain = [b]; for (let x = q[i]; x !== null; x = prev.get(x)) chain.unshift(x); return chain; }
+    q.push(n);
+  }
+  return null;
+}
 
 // ─── endpoints ───────────────────────────────────────────────────────────────
 // Every node a query can mean: a file (path, suffix or name), an exported function (name or file:name),
@@ -98,31 +149,46 @@ const RANK = k => ['calls', 'navigate', 'calls-function', 'writes', 'reads'].ind
 
 // For each hop, put first the edge that leads into the next hop: a call to the function that makes the next call
 // or does the read/write. Then the most telling kinds (calls, navigation, data) before imports.
-function chooseEdges(hops) {
-  // Functions in a file that act in the hop leaving it: callers of its calls, functions doing its reads/writes.
-  const actors = es => new Set(es.flatMap(e => (e.kind === 'calls' ? [e.caller] : e.kind === 'reads' || e.kind === 'writes' ? (e.sites || []).map(x => x.function) : [])).filter(Boolean));
+function chooseEdges(hops, local = null) {
+  // Functions in a file that act in the hop leaving it: callers of its calls, functions doing its reads/writes,
+  // and (with the same-file call graph) every function there that reaches one of those through local calls.
+  // Returns Map(function -> 2 if it acts directly, 1 if it reaches an actor through same-file calls).
+  const actors = (es, file) => {
+    const score = new Map(es.flatMap(e => (e.kind === 'calls' ? [e.caller] : e.kind === 'reads' || e.kind === 'writes' ? (e.sites || []).map(x => x.function) : [])).filter(Boolean).map(f => [f, 2]));
+    const m = local?.get(file);
+    if (m) for (let grew = true; grew;) { grew = false; for (const [caller, callees] of m) if (!score.has(caller) && [...callees].some(c => score.has(c))) { score.set(caller, 1); grew = true; } }
+    return score;
+  };
   const byRank = (a, b) => RANK(a.kind) - RANK(b.kind) || (firstLine(a) ?? 0) - (firstLine(b) ?? 0);
+  const fit = new Map(); // edge -> how well it leads into the next hop (kept as a tie-breaker below)
   // Backward: a call into the next file goes first when it calls one of the functions acting there.
   for (let i = hops.length - 1; i >= 0; i--) {
-    const want = hops[i + 1] ? actors(hops[i + 1].edges) : null;
-    const fits = e => !!want && e.kind === 'calls' && (want.has(e.function) || want.has(e.local));
-    hops[i].edges = [...hops[i].edges].sort((a, b) => (fits(b) - fits(a)) || byRank(a, b));
+    const want = hops[i + 1] ? actors(hops[i + 1].edges, hops[i + 1].edges[0]?.from) : null;
+    for (const e of hops[i].edges) fit.set(e, want && e.kind === 'calls' ? Math.max(want.get(e.function) || 0, want.get(e.local) || 0) : 0);
+    hops[i].edges = [...hops[i].edges].sort((a, b) => (fit.get(b) - fit.get(a)) || byRank(a, b));
+    // A call whose function does not lead into the next step: the files connect, the functions do not.
+    const next = hops[i + 1]?.edges[0];
+    if (next && hops[i].edges[0].kind === 'calls' && !fit.get(hops[i].edges[0]) && ['calls', 'reads', 'writes'].includes(next.kind)) hops[i].loose = true;
   }
   // Forward: the next hop then shows the edge made by the function that was called.
   for (let i = 1; i < hops.length; i++) {
     const prev = hops[i - 1].edges[0];
     if (prev.kind !== 'calls') continue;
     const fn = prev.function;
-    const by = e => (e.kind === 'calls' ? e.caller === fn : (e.sites || []).some(x => x.function === fn));
-    hops[i].edges = [...hops[i].edges].sort((a, b) => (by(b) - by(a)) || byRank(a, b));
+    const reach = local ? (x => x === fn || !!localChain(local, hops[i].edges[0]?.from, fn, x)) : (x => x === fn);
+    const by = e => (e.kind === 'calls' ? reach(e.caller) : (e.sites || []).some(x => reach(x.function)));
+    hops[i].edges = [...hops[i].edges].sort((a, b) => (by(b) - by(a)) || (fit.get(b) - fit.get(a)) || byRank(a, b));
+    // How the called function gets to the one acting next, inside that file: "via a → b, same file".
+    const e = hops[i].edges[0], actor = e.kind === 'calls' ? e.caller : (e.sites || []).map(x => x.function).find(reach);
+    if (local && actor && actor !== fn) { const chain = localChain(local, e.from, fn, actor); if (chain) hops[i].via = chain.join(' → '); }
   }
   return hops;
 }
 
 // One edge as text; `fn` is the function the previous hop called, so a read/write shows the line in it.
-function edgeText(e, fn) {
+function edgeText(e, fn, via = null) {
   let line = firstLine(e), what = '';
-  if (e.kind === 'calls') what = `${e.function}()${e.via === 'value' ? ` via value from ${e.passedFrom}:${e.passedLine}` : ''}`;
+  if (e.kind === 'calls') what = `${e.function}()${e.via === 'value' ? ` via value from ${e.passedFrom}:${e.passedLine}` : ''}${e.sameFile ? ` in ${e.caller ?? 'top level'}, same file` : ''}`;
   else if (e.kind === 'navigate') what = `screen ${e.screen}`;
   else if (e.kind === 'calls-function') what = e.function;
   else if (e.kind === 'reads' || e.kind === 'writes') {
@@ -130,6 +196,7 @@ function edgeText(e, fn) {
     if (site) line = site.line;
     what = site ? `in ${fn}` : e.sites?.[0]?.function ? `in ${e.sites[0].function}` : '';
   }
+  if (via) what = `${what}${what ? ' ' : ''}(${via}, same file)`;
   return { kind: KIND_LABEL[e.kind] || e.kind, what, at: line ? `${e.from}:${line}` : e.from };
 }
 
@@ -144,6 +211,7 @@ export function findPath(map, aQuery, bQuery, { allShortest = false } = {}) {
   const limit = allShortest ? 5 : 1;
   const base = { a: `${nodeLabel(a.node)}${a.how !== 'file' && a.node.kind === 'file' ? ` (${a.how})` : ''}`, b: `${nodeLabel(b.node)}${b.how !== 'file' && b.node.kind === 'file' ? ` (${b.how})` : ''}` };
   if (a.node.id === b.node.id) return { status: 'same', ...base };
+  const local = localCalls(map);
   // Two screens: a path by navigation alone answers "how do you get there"; otherwise any kind of link.
   const screens = a.how.startsWith('screen') && b.how.startsWith('screen');
   const tries = [...(screens ? [[new Set(['navigate']), 'navigation']] : []), [PATH_KINDS, null]];
@@ -155,11 +223,11 @@ export function findPath(map, aQuery, bQuery, { allShortest = false } = {}) {
       return {
         status: 'found', direction: dir, only, ...base, length: paths[0].length - 1,
         paths: paths.map(p => {
-          const hops = chooseEdges(p.slice(1).map((id, i) => ({ from: nodeLabel(byId.get(p[i])), to: nodeLabel(byId.get(id)), edges: adj.get(p[i]).get(id) })));
+          const hops = chooseEdges(p.slice(1).map((id, i) => ({ from: nodeLabel(byId.get(p[i])), to: nodeLabel(byId.get(id)), edges: adj.get(p[i]).get(id) })), local);
           return hops.map((h, i) => {
             const prev = hops[i - 1]?.edges[0];
-            const fn = prev?.kind === 'calls' ? prev.function : null;
-            return { from: h.from, to: h.to, edges: h.edges.map((e, j) => edgeText(e, j === 0 ? fn : null)) };
+            const fn = prev?.kind === 'calls' ? (h.via ? h.via.split(' → ').pop() : prev.function) : null;
+            return { from: h.from, to: h.to, loose: !!h.loose, edges: h.edges.map((e, j) => edgeText(e, j === 0 ? fn : null, j === 0 ? h.via : null)) };
           });
         }),
       };
@@ -233,8 +301,12 @@ export function computeReport(map, top = 10) {
   const rankBy = m => [...m].sort((a, b) => b[1].total - a[1].total || a[0].localeCompare(b[0])).slice(0, top).map(([file, v]) => ({ file, ...v }));
 
   const fnCallers = new Map();
-  for (const e of map.edges) if (e.kind === 'calls') { const k = `${e.to}:${e.function}`; (fnCallers.get(k) || fnCallers.set(k, { file: e.to, fn: e.function, from: new Set(), calls: 0 }).get(k)); fnCallers.get(k).from.add(e.from); fnCallers.get(k).calls++; }
-  const functions = [...fnCallers.values()].map(x => ({ file: x.file, fn: x.fn, files: x.from.size, calls: x.calls }))
+  for (const e of map.edges) if (e.kind === 'calls') {
+    const k = `${e.to}:${e.function}`;
+    const o = fnCallers.get(k) || fnCallers.set(k, { file: e.to, fn: e.function, from: new Set(), calls: 0, same: 0 }).get(k);
+    if (e.sameFile) o.same++; else { o.from.add(e.from); o.calls++; }
+  }
+  const functions = [...fnCallers.values()].filter(x => x.from.size).map(x => ({ file: x.file, fn: x.fn, files: x.from.size, calls: x.calls, same: x.same }))
     .sort((a, b) => b.files - a.files || b.calls - a.calls || a.fn.localeCompare(b.fn)).slice(0, top);
 
   const data = map.nodes.filter(n => n.kind === 'collection' || n.kind === 'subcollection')
@@ -362,6 +434,7 @@ export function queryMap(map, question, { maxMatches = 5 } = {}) {
     return { terms, dropped, matches: [], best };
   }
 
+  const cidx = callIndex(map);
   // Subgraph: links touching each match (for a function: its calls and the reads/writes it makes; for a screen:
   // its navigation in and out and what its file calls), plus paths of up to 3 hops between two matches.
   const links = new Map();
@@ -372,7 +445,7 @@ export function queryMap(map, question, { maxMatches = 5 } = {}) {
       if (!PATH_KINDS.has(e.kind) || String(e.to).startsWith('subcollection:') && c.kind === 'collection') continue;
       if (c.kind === 'function') {
         if ((e.kind === 'calls' || e.kind === 'calls-function') && e.to === c.node && (e.function === c.fn || e.local === c.fn)) add(e, c);
-        else if (e.from === c.node && e.kind === 'calls' && e.caller === c.fn) add(e, c);
+        else if (e.from === c.node && e.kind === 'calls' && e.caller === c.fn && !e.sameFile) add(e, c); // not its local helpers
         else if (e.from === c.node && (e.kind === 'reads' || e.kind === 'writes') && (e.sites || []).some(x => x.function === c.fn)) {
           // The subcollection link says more than the same use counted on the top-level collection.
           const sub = map.edges.some(o => o.from === e.from && o.kind === e.kind && String(o.to).startsWith('subcollection:') && (o.sites || []).some(x => x.function === c.fn));
@@ -380,17 +453,19 @@ export function queryMap(map, question, { maxMatches = 5 } = {}) {
         }
       } else if (c.kind === 'screen') {
         if (e.kind === 'navigate' && (e.screen === c.screen || e.from === c.node)) add(e, c);
-        else if (e.from === c.node && e.kind !== 'navigate' && !IMPORT_KINDS.has(e.kind)) add(e, c);
-      } else if (e.from === c.node || e.to === c.node) add(e, c);
+        else if (e.from === c.node && e.kind !== 'navigate' && !IMPORT_KINDS.has(e.kind) && !e.sameFile) add(e, c);
+      } else if ((e.from === c.node || e.to === c.node) && !e.sameFile) add(e, c); // a file's internal calls are not listed
     }
-    // Data: also who calls the functions doing the reads and writes (depth 1, as brainmap collection).
+    // Data: also who calls the functions doing the reads and writes (depth 1, as brainmap collection: calls
+    // inside the same file are followed to the first caller in another file).
     if (c.kind === 'collection' || c.kind === 'subcollection') {
       const actors = new Set();
       for (const e of map.edges) if (e.to === c.node && (e.kind === 'reads' || e.kind === 'writes')) for (const x of e.sites || []) if (x.function) actors.add(`${e.from}\0${x.function}`);
-      for (const e of map.edges) if (e.kind === 'calls' && (actors.has(`${e.to}\0${e.function}`) || actors.has(`${e.to}\0${e.local}`))) add(e, c);
+      const walk = nodes => { for (const n of nodes) { add(n.e, c); walk(n.children); } };
+      for (const a of actors) { const [f, fn] = a.split('\0'); walk(callerTree(map, f, fn, 1, cidx)); }
     }
   }
-  const adj = adjacency(map), navAdj = adjacency(map, false, new Set(['navigate'])), byId = new Map(map.nodes.map(n => [n.id, n]));
+  const adj = adjacency(map), navAdj = adjacency(map, false, new Set(['navigate'])), byId = new Map(map.nodes.map(n => [n.id, n])), local = localCalls(map);
   const paths = [];
   const nodesOf = [...new Set(matches.map(m => m.node))];
   const isScreenNode = id => matches.some(m => m.node === id && m.kind === 'screen');
@@ -404,15 +479,15 @@ export function queryMap(map, question, { maxMatches = 5 } = {}) {
     const adjUsed = useNav ? navAdj : adj;
     const p = useNav ? navP : shortest(adj, [nodesOf[i]], new Set([nodesOf[j]]), 1)[0];
     if (p && p.length - 1 <= 3 && p.length > 2) { // direct links are already listed above
-      const hops = chooseEdges(p.slice(1).map((id, k) => ({ from: nodeLabel(byId.get(p[k])), to: nodeLabel(byId.get(id)), edges: adjUsed.get(p[k]).get(id) })));
-      paths.push(hops.map((h, k) => ({ from: h.from, to: h.to, edge: edgeText(h.edges[0], k && hops[k - 1].edges[0].kind === 'calls' ? hops[k - 1].edges[0].function : null) })));
+      const hops = chooseEdges(p.slice(1).map((id, k) => ({ from: nodeLabel(byId.get(p[k])), to: nodeLabel(byId.get(id)), edges: adjUsed.get(p[k]).get(id) })), local);
+      paths.push(hops.map((h, k) => ({ from: h.from, to: h.to, edge: edgeText(h.edges[0], k && hops[k - 1].edges[0].kind === 'calls' ? (h.via ? h.via.split(' → ').pop() : hops[k - 1].edges[0].function) : null, h.via) })));
     }
   }
   const groups = new Map();
   const groupOf = k => (IMPORT_KINDS.has(k) ? 'imports' : { navigate: 'navigation', 'calls-function': 'cloud functions' }[k] || k);
   // Links between two matched things first: they are usually the answer.
   const matchedNodes = new Set(nodesOf);
-  for (const { e, why } of links.values()) (groups.get(groupOf(e.kind)) || groups.set(groupOf(e.kind), []).get(groupOf(e.kind))).push({ ...edgeText(e, why.kind === 'function' && e.from === why.node ? why.fn : null), between: matchedNodes.has(e.from) && matchedNodes.has(e.to), from: nodeLabel(byId.get(e.from) || { kind: 'file', path: e.from }), to: nodeLabel(byId.get(e.to) || { kind: 'file', path: e.to }) });
+  for (const { e, why } of links.values()) (groups.get(groupOf(e.kind)) || groups.set(groupOf(e.kind), []).get(groupOf(e.kind))).push({ ...edgeText(e, why.kind === 'function' && e.from === why.node ? why.fn : null), between: !e.sameFile && matchedNodes.has(e.from) && matchedNodes.has(e.to), from: nodeLabel(byId.get(e.from) || { kind: 'file', path: e.from }), to: nodeLabel(byId.get(e.to) || { kind: 'file', path: e.to }) });
   const order = ['navigation', 'calls', 'cloud functions', 'writes', 'reads', 'imports'];
 
   const next = [];
