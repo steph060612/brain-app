@@ -4,7 +4,7 @@
 // as the Brain app's "Map is current"). Prints paths, names and numbers only, never file contents.
 // No network, no model calls.
 import { stat } from 'fs/promises';
-import { findPath, computeReport } from './map-report.js';
+import { findPath, computeReport, queryMap } from './map-report.js';
 import {
   loadLinks, readMap, mapStatus, runMapper, gitAvailable, realOrSelf, inside, tilde,
 } from './codemap-status.js';
@@ -22,6 +22,7 @@ Usage: brainmap <command> [argument] [--all] [--depth 2] [--project <name>] [--n
   screen <name>         a navigation screen: its file, where it navigates to and where it is reached from
   callers <name>        files and lines that call an exported function (or file:name)
   path <A> <B>          shortest path between two files, functions, screens or collections (--all-shortest: up to 5)
+  query "<question>"    plain-words question: matching files, functions, screens, collections and the links around them
   report                most-connected files, most-called functions, busiest data, bridges, rare links, next questions
   collection <name>     files that read and write a collection or subcollection (name or path, e.g. users/{uid}/workoutLogs)
   function <name>       a cloud function: where it is defined and who calls it
@@ -359,6 +360,29 @@ function pathCmd(P, ix, args) {
   });
 }
 
+function queryCmd(P, ix, q) {
+  if (!q) die('Ask in words, for example: brainmap query "what saves completed workout sessions"');
+  const r = queryMap(P.map, q);
+  say(`Terms: ${r.terms.join(', ') || 'none'}${r.dropped.length ? `   (ignored: ${r.dropped.join(', ')})` : ''}`);
+  if (!r.matches.length) {
+    return say(`Nothing in the map matches those words well enough.${r.best ? ` Try: brainmap find ${r.best}` : ''}`);
+  }
+  say('Matches:');
+  items(r.matches.map((m, i) => `${i + 1}. ${m.label}  [${m.hit.join(', ')}]`), 5);
+  const total = r.groups.reduce((n, g) => n + g.edges.length, 0);
+  say(`Links around them (${total}):`);
+  for (const g of r.groups) {
+    say(`  ${g.kind} (${g.edges.length}):`);
+    indent(() => items(g.edges.map(e => `${e.between ? '★ ' : ''}${e.from} —${e.kind}${e.what ? ` ${e.what}` : ''}→ ${e.to}  (${e.at})`), 8));
+  }
+  if (r.paths.length) {
+    say('Connecting paths (up to 3 hops):');
+    items(r.paths.map(p => [p[0].from, ...p.map(h => `—${h.edge.kind}${h.edge.what ? ` ${h.edge.what}` : ''} (${h.edge.at})→ ${h.to}`)].join(' ')), 4);
+  }
+  say('Next:');
+  items(r.next);
+}
+
 function reportCmd(P) {
   const r = computeReport(P.map);
   const kinds = o => Object.entries(o.byKind).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${n} ${k}`).join(', ');
@@ -583,7 +607,7 @@ function unusedCmd(P, ix) {
 }
 
 // ─── main ────────────────────────────────────────────────────────────────────
-const COMMANDS = { path: pathCmd, report: reportCmd, callers: callersCmd, overview, files: filesCmd, file: fileCmd, impact: impactCmd, screen: screenCmd, collection: collectionCmd, function: functionCmd, find: findCmd, unused: unusedCmd };
+const COMMANDS = { query: queryCmd, path: pathCmd, report: reportCmd, callers: callersCmd, overview, files: filesCmd, file: fileCmd, impact: impactCmd, screen: screenCmd, collection: collectionCmd, function: functionCmd, find: findCmd, unused: unusedCmd };
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
@@ -596,7 +620,7 @@ async function main() {
   DEPTH = opts.depth;
   ALL_SHORTEST = opts.allShortest;
   const P = await loadProject(opts);
-  run(P, index(P.map), cmd === 'path' ? rest : rest.join(' '));
+  run(P, index(P.map), cmd === 'path' ? rest : rest.join(' '));  // query takes the words, quoted or not
   flush();
 }
 

@@ -80,7 +80,12 @@ The mapper also runs on its own: `node src/mapper.js <project folder> <output na
 
 `brainmap` answers structure questions from the saved map, in compact plain text (each list shows its first
 items with "(+N more, use --all)"): `overview`, `files <folder>`, `file <path>`, `impact <path>`, `screen <name>`,
-`collection <name>`, `function <name>`, `callers <name|file:name>`, `find <text>`, `unused`, `path <A> <B>` and `report`.
+`collection <name>`, `function <name>`, `callers <name|file:name>`, `find <text>`, `unused`, `path <A> <B>`, `report` and `query "<question>"`.
+`query` answers a question in plain words without AI: it drops common words, splits camelCase, snake_case and paths
+on both sides with simple plural matching, scores files, exported functions, screens and collections by the words
+in their names, keeps up to 5 clear matches and prints the links around them (grouped by kind, links between two
+matches first, paths of up to 3 hops between matches) and three follow-up commands; with no clear match it suggests
+`brainmap find`.
 `path` finds the shortest chain of links (imports, calls including via value, navigation, cloud functions, reads,
 writes) between two files, functions, screens or collections, hop by hop with file and line; it says when only the
 reverse direction exists, tries navigation alone first between two screens, and `--all-shortest` lists up to 5.
@@ -94,7 +99,7 @@ contents. `install.sh` links it next to `brainpack` (`~/.brain/brainmap.sh`, sym
 `/usr/local/bin`).
 
 **Tools for Claude Code (MCP).** `src/brainmap-mcp.js` is a local stdio tool server with the same queries as tools
-(`overview`, `file`, `impact`, `callers`, `collection`, `screen`, `find`, `unused`, `path`, `report`, each with an `all` option). Each tool
+(`overview`, `file`, `impact`, `callers`, `collection`, `screen`, `find`, `unused`, `path`, `report`, `query`, each with an `all` option). Each tool
 runs `brainmap` in the assistant's working folder, so the text, limits and automatic refresh are the same; in a folder
 that is not linked it answers in one line. Read-only. `install.sh` registers it at user scope (every project, no
 project files touched):

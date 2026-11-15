@@ -16,10 +16,9 @@ export const start = created => `<!-- brainmap:start created-file=${created ? 'y
 export const END = '<!-- brainmap:end -->';
 export const block = created => `${start(created)}
 ## Code map: use brainmap first
-- At the start of any task that involves tracing or changing code, call the brainmap \`overview\` tool (mcp__brainmap__overview) once.
-- Before searching the repository for who calls, uses or depends on a function, file, screen or collection, call the matching brainmap tool first: \`callers\`, \`impact\`, \`screen\`, \`collection\` or \`file\`; \`path\` shows how two of them connect, \`report\` the most-connected files and next questions (also \`find\` and \`unused\`).
-- Without the tools, run the same queries in a shell: \`brainmap overview\`, \`brainmap callers <function>\` and so on (\`brainmap help\` lists them).
-- The map covers JavaScript only (.js, .jsx, .mjs, .cjs). It is read-only and refreshes itself when the code changes.
+- For questions about how this code fits together (who calls, uses or depends on what, where something happens), use the brainmap tools (mcp__brainmap__*) or the \`brainmap\` command before searching the repository.
+- Start with \`report\` or \`overview\`; for a question in words, use \`query\`.
+- The tool list or \`brainmap help\` shows the rest. The map covers JavaScript only, is read-only and refreshes itself.
 ${END}`;
 
 const BLOCK_RE = /\n*<!-- brainmap:start[^\n]*-->[\s\S]*?<!-- brainmap:end -->[ \t]*\n?/g;
