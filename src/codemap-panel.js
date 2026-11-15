@@ -73,6 +73,14 @@ function folderStatus(name) {
   return [f.diffUnavailable && !f.changedFiles ? 'Code changed since last map' : `Code changed since last map (${f.changedFiles} file${f.changedFiles === 1 ? '' : 's'})`, '#e0a040'];
 }
 
+// The entry files the last map found in a folder, or a plain "no entry file found".
+function entryLine(name) {
+  const m = info?.map?.folders?.find(x => x.name === name);
+  if (!m?.entries) return '';
+  const text = m.entries.length ? `Entry files: ${m.entries.slice(0, 3).join(', ')}${m.entries.length > 3 ? ` +${m.entries.length - 3} more` : ''}` : 'No entry file found: every file counts as a standalone script';
+  return `<div style="font-size:10.5px; color:${m.entries.length ? '#5a6890' : '#e0a040'}; margin:1px 0 0 52px" title="${esc(m.entries.join('\n'))}">${esc(text)}</div>`;
+}
+
 function render(message = '', color = '#8090b0') {
   if (!current || !info) return;
   if (!info.folders.length) return renderUnlinked(message, color);
@@ -88,7 +96,7 @@ function render(message = '', color = '#8090b0') {
         <span title="${esc(f.path)}" style="color:#5a6890">${esc(f.display)}</span>
         ${s ? `<span class="cm-fstatus" title="${esc(title)}" style="font-size:11px; color:${s[1]}">${esc(s[0])}</span>` : ''}
         <button class="cm-unlink" data-name="${esc(f.name)}" style="${LINK} font-size:11px; color:#8090b0; margin-left:auto">Remove</button>
-      </div>`;
+      </div>${entryLine(f.name)}`;
   }).join('');
   const removed = status?.removed?.length ? `<div style="font-size:11px; color:#e0a040; margin-top:3px">The map still includes ${esc(status.removed.join(', '))}, no longer linked; re-map to drop ${status.removed.length === 1 ? 'it' : 'them'}.</div>` : '';
   el.innerHTML = `
@@ -320,32 +328,43 @@ function renderAgents() {
 }
 
 // ─── Strict: send the first code search to the map (hook in .claude/settings.local.json) ─────────────
+// The hook goes into every linked folder; a folder where git tracks the file (or it is not ignored, or not valid
+// JSON) is skipped with its reason. Each folder is restored on its own by Remove.
 function renderStrict(box) {
   if (!strict) return;
   const row = document.createElement('div');
   row.style.cssText = 'margin-top:6px;';
+  const folders = strict.folders || [];
+  const several = folders.length > 1;
+  const label = F => (several ? `${F.name}/` : '') + F.file;
+  const usable = folders.filter(F => !F.refused), on = folders.filter(F => F.enabled), off = usable.filter(F => !F.enabled);
+  const refusedRows = folders.filter(F => F.refused && !F.enabled).map(F => `<div style="${MUTED} margin-top:3px">${several ? `${esc(F.name)}: ` : ''}not available: ${esc(F.refused)}</div>`).join('');
   if (strict.error) row.innerHTML = `<div style="${MUTED}">Strict mode: ${esc(strict.error)}</div>`;
   else if (strictConfirm) {
     const enable = strictConfirm === 'enable';
+    const targets = enable ? off : on;
     row.innerHTML = `<div style="border:1px solid rgba(100,120,200,0.22); border-radius:6px; padding:8px 10px; font-size:11.5px; color:#c8d0e8;">
       ${enable
-        ? `<div>This adds a Claude Code hook to <b>${esc(strict.path)}</b>${strict.exists ? '' : ' (new file)'} (git: ${esc(strict.git)}). In each session it blocks the first Grep, Glob or Read of source code once, with a message to use the brainmap tools first, then allows everything. CLAUDE.md, AGENTS.md and configuration files are never blocked. The settings already in the file stay as they are (the file is saved as standard JSON), Remove puts the file back exactly as it was, and nothing is committed.</div>
-           <pre style="margin:6px 0 0; padding:7px 8px; background:#0b0e1c; border:1px solid rgba(100,120,200,0.15); border-radius:4px; font-size:10.5px; line-height:1.45; color:#a8b4d4; white-space:pre-wrap; word-break:break-word; max-height:200px; overflow:auto">${esc(strict.added)}</pre>`
-        : `<div>This takes the brainmap hook out of <b>${esc(strict.path)}</b>. If the file was not edited since, it is restored exactly as it was before (or removed, if the app created it). Nothing is committed.</div>`}
+        ? `<div>This adds a Claude Code hook to ${targets.map(F => `<b>${esc(F.path)}</b>${F.exists ? '' : ' (new file)'} (git: ${esc(F.git)})`).join(', ')}. In each session it blocks the first Grep, Glob or Read of source code once, with a message to use the brainmap tools first, then allows everything. CLAUDE.md, AGENTS.md and configuration files are never blocked. The settings already in each file stay as they are (the file is saved as standard JSON), Remove puts each file back exactly as it was, and nothing is committed.</div>
+           ${folders.filter(F => F.refused).map(F => `<div style="margin-top:6px; color:#e0a040">Skipped: ${esc(several ? `${F.name}, ` : '')}${esc(F.refused)}</div>`).join('')}
+           <pre style="margin:6px 0 0; padding:7px 8px; background:#0b0e1c; border:1px solid rgba(100,120,200,0.15); border-radius:4px; font-size:10.5px; line-height:1.45; color:#a8b4d4; white-space:pre-wrap; word-break:break-word; max-height:200px; overflow:auto">${esc(targets[0]?.added || '')}</pre>`
+        : `<div>This takes the brainmap hook out of ${targets.map(F => `<b>${esc(F.path)}</b>`).join(', ')}. A file not edited since is restored exactly as it was before (or removed, if the app created it); an edited one loses only the hook. Nothing is committed.</div>`}
       <div style="display:flex; gap:6px; margin-top:8px">
-        <button class="cm-strict-ok" style="${BTN}">${enable ? 'Add the hook' : 'Remove the hook'}</button>
+        <button class="cm-strict-ok" style="${BTN}">${enable ? `Add the hook${several ? ` to ${targets.map(F => F.name).join(' and ')}` : ''}` : `Remove the hook${several ? ` from ${targets.map(F => F.name).join(' and ')}` : ''}`}</button>
         <button class="cm-strict-cancel" style="${BTN2}">Cancel</button></div></div>`;
     row.querySelector('.cm-strict-ok').addEventListener('click', () => (enable ? enableStrictMode() : removeStrictMode()));
     row.querySelector('.cm-strict-cancel').addEventListener('click', () => { strictConfirm = null; renderAgents(); });
-  } else if (strict.enabled) {
+  } else if (on.length) {
     row.innerHTML = `<div style="${MUTED} display:flex; gap:8px; align-items:baseline; flex-wrap:wrap">
-      <span style="color:#6FE3D0">Strict: first code search goes to the map</span><span>in ${esc((info?.folders?.length || 0) > 1 ? `${info.folders[0].name}/` : '')}${esc(strict.file)}</span>
-      <button class="cm-strict-remove" style="${LINK} font-size:11px; color:#8090b0">Remove</button></div>`;
+      <span style="color:${off.length ? '#e0a040' : '#6FE3D0'}">Strict: first code search goes to the map${off.length ? ` (not in ${esc(off.map(F => F.name).join(', '))})` : ''}</span><span>in ${esc(on.map(label).join(', '))}</span>
+      ${off.length ? '<button class="cm-strict-enable" style="' + LINK + ' font-size:11px">Add</button>' : ''}
+      <button class="cm-strict-remove" style="${LINK} font-size:11px; color:#8090b0">Remove</button></div>${refusedRows}`;
     row.querySelector('.cm-strict-remove').addEventListener('click', () => askStrict('remove'));
-  } else if (strict.refused) {
-    row.innerHTML = `<div style="${MUTED}">Strict mode not available: ${esc(strict.refused)}</div>`;
+    row.querySelector('.cm-strict-enable')?.addEventListener('click', () => askStrict('enable'));
+  } else if (!usable.length) {
+    row.innerHTML = refusedRows || `<div style="${MUTED}">Strict mode not available.</div>`;
   } else {
-    row.innerHTML = `<button class="cm-strict-enable" style="${BTN2}" title="Claude Code only: blocks the first code search of each session once, pointing to the map tools${(info?.folders?.length || 0) > 1 ? ` (in the first linked folder, ${esc(info.folders[0].name)})` : ''}">Strict: send the first code search to the map</button>`;
+    row.innerHTML = `<button class="cm-strict-enable" style="${BTN2}" title="Claude Code only: blocks the first code search of each session once, pointing to the map tools${several ? ' (in every linked folder)' : ''}">Strict: send the first code search to the map</button>${refusedRows}`;
     row.querySelector('.cm-strict-enable').addEventListener('click', () => askStrict('enable'));
   }
   box.appendChild(row);
@@ -353,16 +372,20 @@ function renderStrict(box) {
 
 async function askStrict(kind) {
   await loadAgents();
-  if (strict?.error || (kind === 'enable' && strict?.refused)) return renderAgents();
+  if (strict?.error) return renderAgents();
+  if (kind === 'enable' && !(strict.folders || []).some(F => !F.refused && !F.enabled)) return renderAgents();
   strictConfirm = kind;
   renderAgents();
 }
 
+const strictWhere = name => ((strict?.folders?.length || 0) > 1 ? `${name}: ` : '');
 async function enableStrictMode() {
   try {
     const r = await api('POST', '/strict', { expect: strict.expect });
     strictConfirm = null; await loadAgents();
-    setMsg(r.already ? 'Strict mode was already on.' : `Strict mode on (${r.created ? 'created' : 'updated'} ${strict.file}).`, '#6FE3D0');
+    const done = r.folders.map(f => `${strictWhere(f.name)}${f.already ? 'already on' : f.created ? 'file created' : 'file updated'}`);
+    const skipped = r.skipped.map(f => `${f.name} skipped (${f.reason})`);
+    setMsg(`Strict mode on${done.length ? ` (${done.join('; ')})` : ''}.${skipped.length ? ` ${skipped.join('; ')}.` : ''}`, skipped.length ? '#e0a040' : '#6FE3D0');
   } catch (e) { strictConfirm = null; await loadAgents(); setMsg(e.message, '#c0503a'); }
 }
 
@@ -370,7 +393,7 @@ async function removeStrictMode() {
   try {
     const r = await api('DELETE', '/strict', { expect: strict.expect });
     strictConfirm = null; await loadAgents();
-    setMsg(r.already ? 'Strict mode was already off.' : r.restored ? (r.deleted ? 'Strict mode off; the file the app created was removed.' : 'Strict mode off; the file is back exactly as it was.') : 'Strict mode off; only the hook was taken out (the file had been edited since).', '#6FE3D0');
+    setMsg(r.folders.length ? `Strict mode off: ${r.folders.map(f => `${strictWhere(f.name)}${f.already ? 'was already off' : f.restored ? (f.deleted ? 'the file the app created was removed' : 'the file is back exactly as it was') : 'only the hook was taken out (the file had been edited since)'}`).join('; ')}.` : 'Strict mode was already off.', '#6FE3D0');
   } catch (e) { strictConfirm = null; await loadAgents(); setMsg(e.message, '#c0503a'); }
 }
 

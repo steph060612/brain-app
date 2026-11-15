@@ -1278,9 +1278,10 @@ function notImported() {
   const reach = start => { const seen = new Set(), st = [start]; while (st.length) { const f = st.pop(); if (!f || seen.has(f) || !out.has(f)) continue; seen.add(f); st.push(...out.get(f)); } return seen; };
   return (map.rootGroups || []).map(g => {
     const members = files.filter(f => f.rootGroup === g.name && (!g.codeFolder || !f.codeFolder || f.codeFolder === g.codeFolder));
-    if (g.entry) {
-      const seen = reach(g.entry);
-      return { group: g, entry: g.entry, files: members.filter(f => !seen.has(f.path)) };
+    const entries = g.entries || (g.entry ? [g.entry] : []);
+    if (entries.length) {
+      const seen = new Set(); for (const e of entries) for (const f of reach(e)) seen.add(f);
+      return { group: g, entry: entries.join(', '), files: members.filter(f => !seen.has(f.path)) };
     }
     return { group: g, entry: null, files: members };
   });

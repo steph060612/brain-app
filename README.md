@@ -98,6 +98,17 @@ list (`MODULES.map(({ path }) => <NavLink to={path} />)`) and a path that lands 
 inferred. Targets the map cannot know, or no route matches, are unresolved (kind `navigate`, the same as for screens) with a reason, such as
 `computed target: href` or `no route matches /x`. Back navigation (`navigate(-1)`) and links to other sites are ignored.
 
+**Entry files.** Each root (app, functions/, scripts/) of each code folder can have several entry files, looked for
+in every folder of the root that has a package.json (and the root's own folder): the package's `main` and
+`module`, files its scripts run (`node x.js`, `esbuild src/index.js`), scripts its HTML pages load (`index.html`'s
+`<script src="/src/main.jsx">` in a Vite app, a static site's `js/main.js`, and files imported by inline
+`<script type="module">` blocks), `src/main.*` and `src/index.*`, Expo and React Native `App.*` and `index.*`,
+Next.js `app/**/page.*`, `app/layout.*` and `pages/**`, and the functions entry (`functions/package.json` main or
+`functions/index.js`). scripts/ only gets an entry its package.json names. The map stores `entries` (with the
+reason for each) per root; the mapper's summary, `brainmap overview` and the panel list them per folder and say
+plainly when a folder has none. "Not imported" is a file no entry of its own root reaches; "standalone scripts"
+are the files of a root with no entry file at all (scripts/). `unused` works per folder with that folder's entries.
+
 The mapper also runs on its own: `node src/mapper.js <project folder> <output name>`, or
 `node src/mapper.js --folder app=~/AppRepo --folder web=~/WebRepo <output name>` for several folders.
 
@@ -131,7 +142,9 @@ collections with their readers and writers on each side, collections only one fo
 cloud function calls. The automatic refresh checks every linked folder and re-maps the project when any changed
 (or a folder was added or removed). **Enable for assistants** writes its block into every linked folder; each
 folder's files keep their own `created-file` marker, so **Remove** deletes only files the app created in that
-folder. Strict mode applies to the first linked folder. In the diagram's Files view, "Color by: Folder | Group |
+folder. **Strict mode** likewise adds its hook to every linked folder's `.claude/settings.local.json`, each previewed
+and restored on its own by Remove; a folder where git tracks that file (or does not ignore it, or it is not valid
+JSON) is skipped, and the panel says which folders were skipped and why. In the diagram's Files view, "Color by: Folder | Group |
 Code folder" adds the code folder as a grouping; folder bubbles carry the code folder's name. A single-folder
 project looks exactly as before.
 

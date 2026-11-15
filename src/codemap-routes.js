@@ -63,7 +63,13 @@ const mapSummary = map => ({
   durationMs: map.durationMs,
   gitCommit: map.project?.gitCommit ?? null,
   folder: map.project?.path ?? null,
-  folders: (map.folders || []).map(f => ({ name: f.name, folder: tilde(f.path), gitCommit: f.gitCommit, files: f.counts?.nodesByKind?.file ?? null })),
+  // Per folder: the entry files found (every root: app, functions/, scripts/), so the panel can say when there are none.
+  folders: (map.folders || []).map(f => {
+    const roots = (map.rootGroups || []).filter(g => (g.codeFolder ?? f.name) === f.name);
+    const strip = p => (p && (map.folders.length > 1) ? p.slice(f.name.length + 1) : p);
+    return { name: f.name, folder: tilde(f.path), gitCommit: f.gitCommit, files: f.counts?.nodesByKind?.file ?? null,
+      entries: roots.flatMap(g => (g.entries || []).map(strip)), rootsWithoutEntry: roots.filter(g => !(g.entries || []).length).map(g => `${g.dir || g.name}/`) };
+  }),
   counts: { nodes: map.counts?.nodes, edges: map.counts?.edges, nodesByKind: map.counts?.nodesByKind, edgesByKind: map.counts?.edgesByKind },
 });
 
@@ -263,16 +269,34 @@ export function registerCodeMapRoutes(app, { gitAvailable }) {
     });
   }
 
-  // Strict mode works on the first linked folder (see brainmap-strict.js).
-  const agentsFolder = async req => (await validFolders(slugOf(req)))[0].path;
-  // Strict mode: the brainmap PreToolUse hook in the project's .claude/settings.local.json (see brainmap-strict.js).
+  // Strict mode: the hook goes into every linked folder's .claude/settings.local.json, each previewed, written and
+  // removed on its own (body.folder limits it to one). A folder where the file is tracked by git (or not valid
+  // JSON, or not ignored) is skipped with its reason; the others still get the hook.
+  const strictAll = async folders => {
+    const out = [];
+    for (const f of folders) out.push({ name: f.name, display: tilde(f.path), ...(await strictPreview(f.path)) });
+    return { folders: out, enabled: out.some(f => f.enabled), allEnabled: out.every(f => f.enabled || f.refused),
+      expect: Object.fromEntries(out.map(f => [f.name, f.expect])) };
+  };
   app.get('/api/code/:slug/strict', async (req, res) => {
-    try { res.json(await strictPreview(await agentsFolder(req))); } catch (e) { send(res, e); }
+    try { res.json(await strictAll(await validFolders(slugOf(req)))); } catch (e) { send(res, e); }
   });
-  app.post('/api/code/:slug/strict', async (req, res) => {
-    try { res.json(await enableStrict(await agentsFolder(req), req.body?.expect)); } catch (e) { send(res, e); }
-  });
-  app.delete('/api/code/:slug/strict', async (req, res) => {
-    try { res.json(await removeStrict(await agentsFolder(req), req.body?.expect)); } catch (e) { send(res, e); }
-  });
+  for (const [method, act] of [['post', enableStrict], ['delete', removeStrict]]) {
+    app[method]('/api/code/:slug/strict', async (req, res) => {
+      try {
+        const folders = pick(await validFolders(slugOf(req)), req.body?.folder);
+        const now = await strictAll(folders);
+        const changed = now.folders.filter(f => f.expect !== req.body?.expect?.[f.name]).map(f => f.name);
+        if (changed.length) throw fail(409, `${changed.join(' and ')}: .claude/settings.local.json changed since the preview. Review it again.`);
+        const done = [], skipped = [];
+        for (const f of folders) {
+          const p = now.folders.find(x => x.name === f.name);
+          if (method === 'post' && p.refused) { skipped.push({ name: f.name, reason: p.refused }); continue; }
+          if (method === 'delete' && !p.enabled) continue;
+          done.push({ name: f.name, ...(await act(f.path, req.body.expect[f.name])) });
+        }
+        res.json({ ok: true, folders: done, skipped });
+      } catch (e) { send(res, e); }
+    });
+  }
 }

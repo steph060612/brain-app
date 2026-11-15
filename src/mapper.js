@@ -1462,6 +1462,72 @@ function collectData(A) {
   return { uses, unresolvedLines, partial, masked };
 }
 
+// --- entry files -------------------------------------------------------------------
+// The files a root group (app, functions/, scripts/) starts from; a group may have several. Looked for in every
+// folder of the group that has a package.json (and in the group's own folder): the package's main and module, files
+// its scripts run (node x.js, esbuild src/index.js), the scripts its HTML pages load (index.html's
+// <script src="/src/main.jsx"> in a Vite app, a static site's js/main.js, files imported by inline module scripts), the Vite and CRA conventions
+// (src/main.* and src/index.*), Expo and React Native (App.*, index.*), and Next.js pages (app/**/page.*, app/layout.*,
+// pages/**). scripts/ is a set of tools run by hand: only its package.json can name an entry. Returns
+// [{ file, why }] in that order of confidence.
+function detectEntries(root, g, jsSet, allFiles, groupOf) {
+  const found = new Map();
+  const add = (rel, why) => {
+    rel = toPosix(path.posix.normalize(rel)).replace(/^\.\//, '');
+    if (jsSet.has(rel) && groupOf(rel) === g.name && !found.has(rel)) found.set(rel, why);
+  };
+  const tryBase = (base, why) => {
+    for (const suf of ['', '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '/index.js', '/index.jsx', '/index.ts', '/index.tsx']) {
+      if (jsSet.has(toPosix(path.posix.normalize(base + suf)).replace(/^\.\//, ''))) return add(base + suf, why);
+    }
+  };
+  const readJson = (f) => { try { return JSON.parse(fs.readFileSync(path.join(root, f), 'utf8')); } catch { return null; } };
+  const dirs = new Set([g.dir]);
+  for (const f of allFiles) if (path.posix.basename(f) === 'package.json') { const d = path.posix.dirname(f) === '.' ? '' : path.posix.dirname(f); if (groupOf(d ? `${d}/x.js` : 'x.js') === g.name) dirs.add(d); }
+  const ordered = [...dirs].sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b));
+  const pre = (d) => (d ? `${d}/` : '');
+  const conventions = g.name !== 'scripts';
+  for (const d of ordered) {
+    const pj = readJson(`${pre(d)}package.json`);
+    if (pj) {
+      for (const k of ['main', 'module']) if (typeof pj[k] === 'string') tryBase(pre(d) + pj[k].replace(/^\.\//, ''), `package.json ${k}`);
+      for (const [name, cmd] of Object.entries(pj.scripts || {})) {
+        if (typeof cmd !== 'string') continue;
+        for (const tok of cmd.split(/[\s=&|;]+/)) if (/^[\w./@-]+\.(m?[jt]sx?|cjs)$/.test(tok) && !tok.startsWith('..')) tryBase(pre(d) + tok.replace(/^\.\//, ''), `package.json script "${name}"`);
+      }
+    }
+    if (!conventions) continue;
+    // HTML pages in this folder and the scripts they load (local paths only).
+    const pages = allFiles.filter((f) => path.posix.dirname(f) === (d || '.') && /\.html?$/i.test(f))
+      .sort((a, b) => (/(^|\/)index\.html?$/i.test(b) - /(^|\/)index\.html?$/i.test(a)) || a.localeCompare(b));
+    for (const f of pages) {
+      let html = ''; try { html = fs.readFileSync(path.join(root, f), 'utf8'); } catch { continue; }
+      for (const m of html.matchAll(/<script\b[^>]*\bsrc\s*=\s*["']([^"'?#]+)/gi)) {
+        const src = m[1];
+        if (/^[a-z]+:|^\/\//i.test(src)) continue;
+        add(src.startsWith('/') ? pre(d) + src.slice(1) : pre(d) + src, `script in ${f}`);
+      }
+      // Inline <script type="module"> blocks that import local files: import { auth } from './assets/js/x.js'.
+      for (const m of html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/gi)) {
+        for (const im of m[1].matchAll(/(?:\bfrom\s*|\bimport\s*\(?\s*)["']([^"'?#]+\.(?:m?[jt]sx?|cjs))["']/g)) {
+          const src = im[1];
+          if (/^[a-z]+:|^\/\//i.test(src)) continue;
+          add(src.startsWith('/') ? pre(d) + src.slice(1) : path.posix.join(pre(d) || '.', src), `imported by a module script in ${f}`);
+        }
+      }
+    }
+    for (const b of ['src/main', 'src/index']) tryBase(pre(d) + b, 'Vite / web app convention');
+    for (const b of ['App', 'index']) for (const ext of ['.js', '.jsx', '.ts', '.tsx']) add(pre(d) + b + ext, b === 'App' ? 'Expo / React Native App' : 'index file');
+    if (pj && (pj.dependencies?.next || pj.devDependencies?.next)) {
+      for (const f of jsSet) {
+        const rest = f.startsWith(pre(d)) ? f.slice(pre(d).length).replace(/^src\//, '') : null;
+        if (rest && (/^app\/(.*\/)?(page|layout)\.(m?[jt]sx?)$/.test(rest) || (/^pages\/.+\.(m?[jt]sx?)$/.test(rest) && !rest.startsWith('pages/api/')))) add(f, 'Next.js page');
+      }
+    }
+  }
+  return [...found].map(([file, why]) => ({ file, why }));
+}
+
 // --- resolution ---------------------------------------------------------------
 
 // tsconfig.json / jsconfig.json, with comments and trailing commas allowed (as TypeScript reads them).
@@ -1599,7 +1665,7 @@ export function mergeMaps(parts) {
     for (const x of m.keptLargeFiles) keptLarge.push({ ...x, file: P(x.file), importedBy: P(x.importedBy), codeFolder: name });
     for (const x of m.data.usesWithUnknownOperation) unknownOps.push({ ...x, file: P(x.file), codeFolder: name });
     for (const x of m.data.documentIdPathsMasked) masked.add(x);
-    for (const g of m.rootGroups) rootGroups.push({ ...g, entry: P(g.entry), codeFolder: name });
+    for (const g of m.rootGroups) rootGroups.push({ ...g, entry: P(g.entry), entries: g.entries.map(P), entryReasons: Object.fromEntries(Object.entries(g.entryReasons).map(([k, v]) => [P(k), v])), codeFolder: name });
     const { screens: sc, ...ns } = m.navigation;
     for (const x of sc) screens.push({ ...x, file: P(x.file), navigatorFile: P(x.navigatorFile), codeFolder: name });
     for (const [k, v] of Object.entries(ns)) {
@@ -1813,16 +1879,13 @@ function buildMap(root) {
     if (fs.existsSync(path.join(root, d)) && fs.statSync(path.join(root, d)).isDirectory()) rootGroups.push({ name: d, dir: d });
   }
   const groupOf = (rel) => rootGroups.find((g) => g.dir && (rel === g.dir || rel.startsWith(g.dir + '/')))?.name ?? 'app';
+  const jsSet = new Set(jsFiles);
   for (const g of rootGroups) {
-    const pkgPath = path.join(root, g.dir, 'package.json');
-    g.hasPackageJson = fs.existsSync(pkgPath);
-    let main = null;
-    if (g.hasPackageJson) { try { main = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).main ?? null; } catch {} }
-    g.entry = null;
-    for (const cand of [main, 'index.js'].filter(Boolean)) {
-      const rel = toPosix(path.join(g.dir, cand)).replace(/^\.\//, '');
-      if (jsFiles.includes(rel)) { g.entry = rel; break; }
-    }
+    g.hasPackageJson = fs.existsSync(path.join(root, g.dir, 'package.json'));
+    const found = detectEntries(root, g, jsSet, allFiles, groupOf);
+    g.entries = found.map((x) => x.file);
+    g.entryReasons = Object.fromEntries(found.map((x) => [x.file, x.why]));
+    g.entry = g.entries[0] ?? null; // the first one, for readers of a single entry
   }
   const functionsEntry = rootGroups.find((g) => g.name === 'functions')?.entry ?? null;
 
@@ -2163,21 +2226,20 @@ function buildMap(root) {
   const out = new Map(jsFiles.map((f) => [f, []]));
   const importers = new Map(jsFiles.map((f) => [f, new Set()]));
   for (const e of importEdges) { out.get(e.from).push(e.to); importers.get(e.to).add(e.from); }
-  const reach = (start) => {
+  const reach = (starts) => {
     const seen = new Set();
-    if (!start) return seen;
-    const stack = [start];
+    const stack = [].concat(starts || []).filter(Boolean);
     while (stack.length) { const f = stack.pop(); if (seen.has(f)) continue; seen.add(f); stack.push(...out.get(f)); }
     return seen;
   };
-  const appEntry = rootGroups[0].entry;
-  const fromAppEntry = reach(appEntry);
+  const appEntry = rootGroups[0].entries.join(', ') || null;
+  const fromAppEntry = reach(rootGroups[0].entries);
   for (const g of rootGroups) {
     const members = fileNodes.filter((n) => n.rootGroup === g.name).map((n) => n.path);
-    const fromOwn = reach(g.entry);
+    const fromOwn = reach(g.entries);
     g.fileCount = members.length;
     g.notImportedFromAppEntry = members.filter((f) => !fromAppEntry.has(f)).length;
-    g.notImportedFromOwnEntry = g.entry ? members.filter((f) => !fromOwn.has(f)).length : null;
+    g.notImportedFromOwnEntry = g.entries.length ? members.filter((f) => !fromOwn.has(f)).length : null;
     g.importedByNoFile = members.filter((f) => importers.get(f).size === 0).length;
   }
   for (const n of fileNodes) {
@@ -2275,8 +2337,8 @@ function buildMap(root) {
   console.log(`Edges: ${edges.length} (${kv(map.counts.edgesByKind)})`);
   console.log(`Unresolved: ${unresolved.length} (${kv(map.counts.unresolvedByKind)})  Missing relative: ${missing.length}  Assets: ${assetTotals.total} ${JSON.stringify(assetTotals.byExtension)}`);
   for (const g of rootGroups) {
-    console.log(`Root group ${g.name}: ${g.fileCount} files, entry ${g.entry ?? 'none'}, not imported from ${appEntry ?? 'app entry'}: ${g.notImportedFromAppEntry}`
-      + (g.entry && g.name !== 'app' ? `, not imported from own entry: ${g.notImportedFromOwnEntry}` : '')
+    console.log(`Root group ${g.name}: ${g.fileCount} files, ${g.entries.length ? `entry files ${g.entries.map((e) => `${e} (${g.entryReasons[e]})`).join(', ')}` : 'no entry file found'}, not imported from ${appEntry ?? 'app entry'}: ${g.notImportedFromAppEntry}`
+      + (g.entries.length && g.name !== 'app' ? `, not imported from own entry: ${g.notImportedFromOwnEntry}` : '')
       + `, imported by no file: ${g.importedByNoFile}`);
   }
   console.log('Most imported:');

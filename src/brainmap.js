@@ -37,7 +37,7 @@ Usage: brainmap <command> [argument] [--all] [--depth 2] [--types] [--folder <na
   collection <name>     files that read and write a collection or subcollection (name or path, e.g. users/{uid}/workoutLogs)
   function <name>       a cloud function: where it is defined and who calls it
   find <text>           matches in file paths, exported names, screens and collections
-  unused                files not imported from the entry file, screens with no incoming navigation found
+  unused                files not reached from their folder's entry files, screens with no incoming navigation found
 
 The project is the one whose linked folder contains the current folder (any of its folders), or --project <name>.
 Each list shows its first items with "(+N more, use --all)"; --all shows everything. Paths are relative to the project folder.
@@ -240,7 +240,8 @@ function overview(P, ix) {
   if (Object.keys(langs).length) say(`Languages: ${Object.entries(langs).map(([l, n]) => `${n} ${l === 'typescript' ? 'TypeScript' : 'JavaScript'}`).join(', ')}${map.skippedFiles?.length ? `; skipped ${plural(map.skippedFiles.length, 'file')} (${[...new Set(map.skippedFiles.map(x => x.reason.split(' (')[0]))].join(', ')})` : ''}`);
   const groups = map.rootGroups || [];
   const gname = g => (isMulti(map) ? `${g.codeFolder}:` : '') + (g.dir || g.name);
-  wrapList('Entry files: ', groups.map(g => (g.entry ? `${g.entry} (${g.name})` : `${gname(g)}/ has no entry file (${plural(g.fileCount, 'file')})`)));
+  const ents = g => g.entries || (g.entry ? [g.entry] : []);
+  wrapList('Entry files: ', groups.map(g => (ents(g).length ? `${ents(g).join(', ')} (${g.name})` : `${gname(g)}/ has no entry file (${plural(g.fileCount, 'file')})`)));
   const fc = new Map();
   for (const f of ix.files) fc.set(folderOf(f), (fc.get(folderOf(f)) || 0) + 1);
   wrapList('Folders: ', [...fc].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([k, n]) => `${k.endsWith('(root)') ? k.replace('(root)', '(root files)') : `${k}/`} ${n}`), Infinity);
@@ -257,10 +258,10 @@ function overview(P, ix) {
   const called = map.functions?.names || {};
   wrapList(`Cloud functions (${fnNames.length}${Object.keys(called).length ? `, ${Object.keys(called).length} called from code` : ''}): `,
     fnNames.map(n => (called[n]?.callers?.length ? `${n} ←${called[n].callers.length}` : n)), Infinity);
-  const apps = groups.filter(g => g.entry && g.name === 'app');
-  const standalone = groups.filter(g => !g.entry).reduce((s, g) => s + (g.fileCount || 0), 0);
+  const apps = groups.filter(g => ents(g).length && g.name === 'app');
+  const standalone = groups.filter(g => !ents(g).length).reduce((s, g) => s + (g.fileCount || 0), 0);
   const noNav = ix.screens.filter(s => !s.incomingNavigation && !s.incomingAsNestedParent).length;
-  say(`Not imported from ${apps.map(a => a.entry).join(' / ') || 'the entry file'}: ${apps.length ? apps.reduce((s, a) => s + (a.notImportedFromOwnEntry || 0), 0) : '?'} app files${standalone ? ` (+${standalone} standalone scripts)` : ''} · screens with no incoming navigation: ${noNav} · unresolved: ${(map.unresolved || []).length}`);
+  say(`Not imported from ${apps.length ? (apps.length > 1 ? 'the app entry files' : apps[0].entries.length > 2 ? `${apps[0].entries.length} entry files` : apps[0].entries.join(' or ')) : 'the entry file'}: ${apps.length ? apps.reduce((s, a) => s + (a.notImportedFromOwnEntry || 0), 0) : '?'} app files${standalone ? ` (+${standalone} standalone scripts)` : ''} · screens with no incoming navigation: ${noNav} · unresolved: ${(map.unresolved || []).length}`);
   say('More: brainmap file <path> | impact <path> | screen <name> | collection <name> | function <name> | files <folder> | find <text> | unused');
 }
 
@@ -829,13 +830,15 @@ function unusedCmd(P, ix) {
   const imports = new Map();
   for (const e of P.map.edges) if (IMPORT_KINDS.has(e.kind)) (imports.get(e.from) || imports.set(e.from, []).get(e.from)).push(e.to);
   const reach = start => { const seen = new Set(), st = [start]; while (st.length) { const f = st.pop(); if (!f || seen.has(f) || !ix.byPath.has(f)) continue; seen.add(f); st.push(...(imports.get(f) || [])); } return seen; };
-  for (const g of groups.filter(g => g.entry)) {
-    const seen = reach(g.entry);
+  // Each root's own entry files (several when the folder has several, such as a site's pages and a Vite app).
+  const ents = g => g.entries || (g.entry ? [g.entry] : []);
+  for (const g of groups.filter(g => ents(g).length)) {
+    const seen = new Set(); for (const e of ents(g)) for (const f of reach(e)) seen.add(f);
     const list = ix.files.filter(f => f.rootGroup === g.name && !seen.has(f.path)).sort((a, b) => a.path.localeCompare(b.path));
-    say(`Not imported from ${g.entry} (${g.name}): ${list.length}`);
+    say(`Not imported from ${ents(g).length > 3 ? `${ents(g).length} entry files (${ents(g).slice(0, 3).join(', ')}, …)` : ents(g).join(', ')} (${g.name}): ${list.length}`);
     items(list.map(f => `${f.path}${f.importedBy ? `  (imported by ${f.importedBy} unreached file${f.importedBy === 1 ? '' : 's'})` : ''}`), 25);
   }
-  for (const g of groups.filter(g => !g.entry)) say(`${g.codeFolder && P.only ? `${g.codeFolder}:` : ''}${g.dir || g.name}/: ${plural(g.fileCount, 'file')} with no entry file (standalone scripts, run by hand); not listed`);
+  for (const g of groups.filter(g => !ents(g).length)) say(`${g.codeFolder && P.only ? `${g.codeFolder}:` : ''}${g.dir || g.name}/: ${plural(g.fileCount, 'file')} with no entry file (standalone scripts, run by hand); not listed`);
   const noNav = ix.screens.filter(s => !s.incomingNavigation && !s.incomingAsNestedParent);
   say(`Screens with no incoming navigation found: ${noNav.length}`);
   items(noNav.map(s => `${s.name}${s.parent ? ` (in ${s.parent})` : ''}  ${s.file || 'no file'}`), 20);
