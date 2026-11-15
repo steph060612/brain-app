@@ -283,7 +283,11 @@ function analyze(ast) {
         for (const d of node.declarations) {
           // `for (const x of list)`: remember the list, so x's possible values can be read from it.
           const forOf = par?.type === 'ForOfStatement' && key === 'left' ? par.right : null;
-          for (const id of patternIds(d.id)) declare(scope, id, d.id.type === 'Identifier' ? { kind: node.kind, init: d.init, ...(forOf ? { forOf } : {}) } : { kind: 'pattern' });
+          // `const { doc } = require('firebase/firestore')`: remember the module, so the data pass can tell
+          // Firestore's functions from local ones. Other passes still treat it as a plain pattern binding.
+          const req = d.init?.type === 'CallExpression' && d.init.callee.type === 'Identifier' && d.init.callee.name === 'require'
+            && d.init.arguments[0]?.type === 'StringLiteral' ? d.init.arguments[0].value : null;
+          for (const id of patternIds(d.id)) declare(scope, id, d.id.type === 'Identifier' ? { kind: node.kind, init: d.init, ...(forOf ? { forOf } : {}) } : { kind: 'pattern', ...(req ? { requireSpec: req } : {}) });
         }
         break;
       case 'FunctionDeclaration': case 'ClassDeclaration':
@@ -1195,11 +1199,13 @@ const ARG_WRITE = new Set(['set', 'update', 'delete', 'create']);
 const REF_PROPS = new Set(['id', 'path', 'parent', 'type', 'firestore']);
 const DB_NAME =/^(db|firestore|fs|database|firestoreDb|adminDb|\w*Db)$/;
 
-// Identifier callee that is Firestore's: imported (or a global), not a local variable or parameter.
+// Identifier callee that is Firestore's: imported (or a global, or destructured from require of a Firestore
+// module), not a local variable or parameter.
+const FS_MODULE = /(^|\/)firestore(\/|$)|^@firebase\/firestore/;
 function fsFn(n, names, A) {
   if (!isCall(n) || n.callee.type !== 'Identifier' || !names.has(n.callee.name)) return null;
   const b = A.lookup(n.callee.name, n.callee);
-  return !b || b.kind === 'import' ? n.callee.name : null;
+  return !b || b.kind === 'import' || (b.kind === 'pattern' && FS_MODULE.test(b.requireSpec || '')) ? n.callee.name : null;
 }
 
 function isDbLike(node, A) {
@@ -1225,22 +1231,39 @@ const cartesian = (a, b) => { const out = []; for (const x of a) for (const y of
 
 // The possible texts of one path argument: a literal, a template or '+' concatenation (with named
 // placeholders for the parts it cannot know), or the few string values a variable or conditional can hold.
-function segValues(node, A) {
+// A const holding a template or concatenation (const p = `patients/${uid}`; db.doc(p)) gives that template's
+// pattern, marked as resolved from a value.
+function segValues(node, A, depth = 0) {
   node = unwrapTS(node);
-  if (!node) return { values: ['{id}'], inferred: false };
+  if (!node || depth > 8) return { values: ['{id}'], inferred: false };
   const lit = literalValue(node);
   if (lit !== null) return { values: [lit], inferred: false };
   if (node.type === 'TemplateLiteral') {
     let vals = [''], inferred = false;
     node.quasis.forEach((q, i) => {
       vals = vals.map((v) => v + q.value.cooked);
-      if (i < node.expressions.length) { const e = segValues(node.expressions[i], A); inferred ||= e.inferred; vals = cartesian(vals, e.values); }
+      if (i < node.expressions.length) { const e = segValues(node.expressions[i], A, depth + 1); inferred ||= e.inferred; vals = cartesian(vals, e.values); }
     });
     return { values: vals, inferred };
   }
   if (node.type === 'BinaryExpression' && node.operator === '+') {
-    const l = segValues(node.left, A), r = segValues(node.right, A);
+    const l = segValues(node.left, A, depth + 1), r = segValues(node.right, A, depth + 1);
     return { values: cartesian(l.values, r.values), inferred: l.inferred || r.inferred };
+  }
+  if (node.type === 'Identifier') {
+    const b = A.lookup(node.name, node);
+    // for (const path of [`users/${uid}`, `patients/${uid}`]): each element's pattern.
+    if (b?.forOf) {
+      const arr = objectOf(b.forOf, A, depth + 1);
+      if (arr?.type === 'ArrayExpression' && arr.elements.length && arr.elements.length <= MAX_VARIANTS
+        && arr.elements.every((e) => e && (literalValue(e) !== null || unwrapTS(e).type === 'TemplateLiteral'))) {
+        return { values: [...new Set(arr.elements.flatMap((e) => segValues(e, A, depth + 1).values))].slice(0, MAX_VARIANTS), inferred: true };
+      }
+    }
+    const init = b?.kind === 'const' && !b.forOf ? unwrapTS(b.init) : null;
+    if (init && (init.type === 'TemplateLiteral' && init.expressions.length || (init.type === 'BinaryExpression' && init.operator === '+'))) {
+      return { values: segValues(init, A, depth + 1).values, inferred: true };
+    }
   }
   const v = stringValues(node, A);
   if (v?.length && v.length <= MAX_VARIANTS) return { values: v, inferred: true };
@@ -1292,6 +1315,8 @@ function refPath(node, A, depth = 0) {
   }
   if (prop === 'doc' || CHAIN_QUERY.has(prop)) {
     const base = refPath(recv, A, depth + 1);
+    // firebase-admin: db.doc('patients/' + uid), getFirestore().doc(`patients/${uid}`): a full path on the database.
+    if (!base && prop === 'doc' && args.length && isDbLike(recv, A)) return { segs: [segOf(args[0], A)] };
     if (!base || base.unresolved) return base;
     return prop === 'doc' ? { segs: [...base.segs, segOf(args[0], A)] } : base;
   }
@@ -1317,7 +1342,7 @@ function isRefCtor(n, A) {
   if (fsFn(n, FS_REF_FNS, A)) return true;
   const prop = propName(n.callee);
   if (prop === 'collection' || prop === 'collectionGroup') return isDbLike(n.callee.object, A) || !!refPath(n.callee.object, A);
-  if (prop === 'doc') return !!refPath(n.callee.object, A);
+  if (prop === 'doc') return (n.arguments.length > 0 && isDbLike(n.callee.object, A)) || !!refPath(n.callee.object, A);
   return false;
 }
 

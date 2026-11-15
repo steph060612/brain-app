@@ -63,7 +63,12 @@ place on the next write) and **Map project**: the server runs `node src/mapper.j
 values, UUIDs, email addresses, long numbers) are replaced by `{id}` before anything is stored, so they never appear in
 the map, the diagram or brainmap; short fixed document names such as `stats/exercisePRs` are kept. Firestore use is read in every folder (app,
 functions/, scripts/): one node per top-level collection (counting everything under it) and one per subcollection
-path pattern, such as `users/{uid}/workoutLogs`; each read or write records the named function it is in. Calls
+path pattern, such as `users/{uid}/workoutLogs`; each read or write records the named function it is in. Both
+styles are read: modular (`doc(db, 'users', uid)`, `doc(db, \`users/${uid}/workoutLogs/${id}\`)`, also when
+destructured from `require('firebase/firestore')`) and firebase-admin (`db.doc(\`patients/${id}\`)`,
+`getFirestore().collection('a/' + uid + '/b')`, `.doc()` / `.collection()` chained on a reference built earlier,
+and `batch.set` / `t.get` / `t.update` on those references). A path may be a template, a concatenation, a `const`
+holding one, or a `for … of` over a literal list of them (resolved paths are tagged inferred). Calls
 from one file to a function exported by another are `calls` edges (renamed, namespace and default imports, `require`,
 re-exports through index files). An imported function handed to another file's function, as an argument or inside an
 object literal (`backfill(uid, { getWorkoutLogs })`), is followed one hop to where that function calls it, and recorded
