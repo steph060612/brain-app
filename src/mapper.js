@@ -14,7 +14,7 @@ import { pathToFileURL } from 'node:url';
 import { parse } from '@babel/parser';
 import { detectGroups, nameGroups, SEED as GROUP_SEED, WEIGHTS as GROUP_WEIGHTS } from './map-groups.js';
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 const IMPORT_KINDS = ['import', 're-export', 'require', 'dynamic'];
 const KINDS = {
   nodes: ['file', 'collection', 'subcollection'],
@@ -806,6 +806,35 @@ function collectParamCalls(program, A) {
   return out;
 }
 
+// "Why" comments: a line of a comment that starts with NOTE, WHY, HACK, FIXME, TODO, IMPORTANT or WARNING (any case),
+// or any comment citing an ADR or RFC. Attached to the innermost named function around it (null at top level),
+// with the line and the first 200 characters (following // lines that continue it are joined).
+const NOTE_TAG = /^[\s!]*(NOTE|WHY|HACK|FIXME|TODO|IMPORTANT|WARNING)\b(\s*[:\-–—]|\(|[^.:\n()]{1,40}:)?/i;
+// A tag counts when written in capitals (TODO), followed by ":" or a dash, directly by "(" (todo(locale)), or by a
+// colon within a few words ("Why this exists:"); plain words such as a JSX label {/* Warning */}, a section label
+// "Note (in details tray)" or prose "note that…" are not notes.
+const NOTE_RE = { test: (l) => { const m = NOTE_TAG.exec(l); return !!m && (m[1] === m[1].toUpperCase() || !!m[2]); }, exec: (l) => NOTE_TAG.exec(l) };
+const CITE_RE = /\b(ADR|RFC)[\s#-]?\d+/i;
+function collectNotes(ast, A) {
+  const fns = [];
+  for (const n of A.nodes()) if (FUNC_TYPES.has(n.type)) { const name = functionName(n, A); if (name) fns.push({ start: n.start, end: n.end, name }); }
+  const cs = ast.comments || [], out = [];
+  for (let i = 0; i < cs.length; i++) {
+    const c = cs[i];
+    const lines = c.value.split('\n').map((l) => (c.type === 'CommentBlock' ? l.replace(/^\s*\*+\s?/, '') : l));
+    let idx = lines.findIndex((l) => NOTE_RE.test(l)), tag = null;
+    if (idx >= 0) tag = NOTE_RE.exec(lines[idx])[1].toUpperCase();
+    else { const m = CITE_RE.exec(c.value); if (!m) continue; tag = m[1].toUpperCase(); idx = Math.max(0, lines.findIndex((l) => CITE_RE.test(l))); }
+    let text = lines.slice(idx).join(' ');
+    // A // NOTE continued on the next // lines (not starting a new tag) is one note.
+    for (let j = i + 1; c.type === 'CommentLine' && j < cs.length && cs[j].type === 'CommentLine' && cs[j].loc.start.line === cs[j - 1].loc.start.line + 1 && !NOTE_RE.test(cs[j].value); j++) { text += ` ${cs[j].value}`; i = j; }
+    text = text.replace(/\s+/g, ' ').trim();
+    const around = fns.filter((f) => f.start <= c.start && c.end <= f.end).sort((a, b) => (a.end - a.start) - (b.end - b.start))[0];
+    out.push({ line: c.loc.start.line + idx, tag, function: around?.name ?? null, text: text.length > 200 ? `${text.slice(0, 199)}…` : text });
+  }
+  return out;
+}
+
 // Calls to functions defined in the same file (function declarations and const = arrow / function expression,
 // exported or not, at any depth): { function, line, caller }. Recursion (a function calling itself) is left out.
 function collectLocalCalls(program, A) {
@@ -973,7 +1002,7 @@ function refPath(node, A, depth = 0) {
   // A helper defined in this file that returns a reference, such as workoutLogsRef(uid).
   if (!fn && node.callee.type === 'Identifier') {
     const ret = returnedExpr(localFunction(node.callee, A));
-    if (ret) return refPath(ret, A, depth + 1);
+    if (ret) { const r = refPath(ret, A, depth + 1); return r && !r.unresolved ? { ...r, helper: true } : r; }
   }
   const args = node.arguments;
   if (fn === 'query') return refPath(args[0], A, depth + 1);
@@ -1135,7 +1164,8 @@ function collectData(A) {
   for (const n of A.nodes()) {
     if (!isCall(n) || !isRefCtor(n, A)) continue;
     // Where the reference is used: here, or at each call of the helper that returns it.
-    const sites = (helperCallSites(n, A) ?? [n]).map((c) => ({ ops: cleanOps(opsFor(c, A)), line: c.loc.start.line, fn: enclosingFunction(c, A) })).filter((x) => x.ops);
+    const helperSites = helperCallSites(n, A);
+    const sites = (helperSites ?? [n]).map((c) => ({ ops: cleanOps(opsFor(c, A)), line: c.loc.start.line, fn: enclosingFunction(c, A) })).filter((x) => x.ops);
     if (!sites.length) continue;
     const line = n.loc.start.line;
     const r = refPath(n, A);
@@ -1158,7 +1188,9 @@ function collectData(A) {
         if (colParts.some((p, i) => i % 2 === 0 && isHole(p))) partial.push({ line, path: pathText });
         else sub = { key: subKey(colParts), pattern: colParts.join('/') };
       }
-      for (const st of sites) for (const op of st.ops) uses.push({ collection: parts[0], path: pathText, op, line: st.line, fn: st.fn, inferred, group: !!r.group, sub });
+      // How the mapper got there, when it was not written out: a helper-built reference, or a value it resolved.
+      const why = helperSites || r.helper ? 'through a helper-built reference' : inferred ? 'path from a resolved value' : null;
+      for (const st of sites) for (const op of st.ops) uses.push({ collection: parts[0], path: pathText, op, line: st.line, fn: st.fn, inferred, why, group: !!r.group, sub });
     }
     if (!any) unresolvedLines.push(line);
   }
@@ -1235,6 +1267,7 @@ function main() {
   const rawScreens = [], navCallsByFile = new Map(), callablesByFile = new Map(), dataByFile = new Map();
   const exportTables = new Map(), callsByFile = new Map(), paramCallsByFile = new Map();
   let localCallCount = 0;
+  const notes = [];
   let navSkippedNonNav = 0, functionDefs = new Map();
   const assetTotals = { total: 0, byExtension: {} };
 
@@ -1293,6 +1326,7 @@ function main() {
     if (fc.calls.length || fc.values.length) callsByFile.set(rel, fc);
     const pc = collectParamCalls(ast.program, A);
     if (pc.size) paramCallsByFile.set(rel, pc);
+    for (const nt of collectNotes(ast, A)) notes.push({ file: rel, ...nt });
     for (const c of collectLocalCalls(ast.program, A)) {
       edges.push({ from: rel, to: rel, kind: 'calls', line: c.line, function: c.function, ...(c.caller ? { caller: c.caller } : {}), sameFile: true });
       localCallCount++;
@@ -1356,7 +1390,7 @@ function main() {
         for (const via of t.via) for (const v of via.split('|')) viaIncoming.set(v, (viaIncoming.get(v) || 0) + 1);
         for (const h of hits) {
           if (h.file) edges.push({ from, to: h.file, kind: 'navigate', line: t.line, screen: t.name, method: call.method,
-            ...(t.via.length ? { via: t.via } : {}), ...(t.inferred ? { inferred: true } : {}) });
+            ...(t.via.length ? { via: t.via } : {}), ...(t.inferred ? { inferred: true, why: 'screen name inferred' } : {}) });
         }
       }
     }
@@ -1433,7 +1467,7 @@ function main() {
           followed++;
           edges.push({ from: recv.file, to: r.file, kind: 'calls', line: h.line, function: fnName,
             ...(r.name !== fnName ? { export: r.name } : {}), ...(r.local && r.local !== r.name ? { local: r.local } : {}),
-            caller: h.caller, via: 'value', passedFrom: from, passedLine: ps.passLine,
+            caller: h.caller, via: 'value', passedFrom: from, passedLine: ps.passLine, why: 'function passed as a value',
             through: ps.propKey ? `${recv.local}(…${ps.propKey})` : `${recv.local} argument ${ps.argIndex + 1}` });
         }
       }
@@ -1460,6 +1494,8 @@ function main() {
     if (!e.sites.some((x) => x.line === u.line)) e.sites.push({ line: u.line, function: u.fn ?? null });
     if (!e.paths.includes(u.path)) e.paths.push(u.path);
     if (u.inferred) e.inferred = true;
+    // Confidence per use: the link counts as inferred only if every use behind it was (see below).
+    if (u.why) { e.inferredUses = (e.inferredUses || 0) + 1; e.whyFirst ??= u.why; const st = e.sites.find((x) => x.line === u.line); if (st && !st.why) st.why = u.why; }
   };
   const maskedPaths = new Set();
   for (const [from, data] of dataByFile) {
@@ -1490,6 +1526,10 @@ function main() {
       addEdge(from, `collection:${u.collection}`, u);
       if (sub) { (u.op === 'reads' ? sub.readers : sub.writers).add(from); addEdge(from, `subcollection:${u.sub.key}`, u); }
     }
+  }
+  for (const e of dataEdges.values()) {
+    if (e.inferredUses === e.count) e.why = e.whyFirst; // an explicit use anywhere makes the link extracted
+    delete e.inferredUses; delete e.whyFirst;
   }
   edges.push(...dataEdges.values());
   for (const [name, c] of [...collections].sort((a, b) => a[0].localeCompare(b[0]))) {
@@ -1541,9 +1581,29 @@ function main() {
     n.reachableFromAppEntry = fromAppEntry.has(n.path);
   }
 
+  // --- confidence: every edge is extracted (written out in the code) or inferred (derived by the mapper)
+  const subPattern = new Map(nodes.filter((n) => n.kind === 'subcollection').map((n) => [n.id, n]));
+  for (const e of edges) {
+    if (!e.why && subPattern.has(e.to)) {
+      // A subcollection whose placeholders were named differently in this file and merged by position.
+      const node = subPattern.get(e.to), parts = node.key.split('/');
+      const own = (e.paths || []).map((p) => p.split('/').slice(0, parts.length).join('/'));
+      if (own.some((p) => p !== node.pattern)) e.why = 'placeholders merged by position';
+    }
+    e.tag = e.why ? 'inferred' : 'extracted';
+  }
+
   // --- subsystems: groups of related files (community detection on the file graph; see map-groups.js)
-  const det = detectGroups(fileNodes, edges);
-  const rawGroups = det.groups.sort((a, b) => b.length - a.length || a[0].localeCompare(b[0]));
+  // Detected separately for each root (app, functions/, scripts/), so admin scripts and cloud functions never
+  // join app groups; links across roots still show in a group's "depends on" and "used by".
+  const det = { groups: [], isolated: [], adj: new Map(), root: new Map() };
+  for (const g of rootGroups) {
+    const part = detectGroups(fileNodes.filter((n) => n.rootGroup === g.name), edges);
+    for (const grp of part.groups.sort((a, b) => b.length - a.length || a[0].localeCompare(b[0]))) { det.groups.push(grp); det.root.set(grp, g.name); }
+    det.isolated.push(...part.isolated);
+    for (const [k, v] of part.adj) det.adj.set(k, v);
+  }
+  const rawGroups = det.groups;
   const names = nameGroups(rawGroups, fileNodes, edges, screens);
   const groupOfFile = new Map();
   rawGroups.forEach((g, i) => g.forEach(f => groupOfFile.set(f, i + 1)));
@@ -1552,7 +1612,7 @@ function main() {
   const groupList = rawGroups.map((g, i) => {
     const cols = new Map();
     for (const e of edges) if ((e.kind === 'reads' || e.kind === 'writes') && e.to.startsWith('collection:') && groupOfFile.get(e.from) === i + 1) cols.set(e.to.slice(11), (cols.get(e.to.slice(11)) || 0) + 1);
-    return { id: i + 1, label: names[i].label, terms: names[i].terms, size: g.length,
+    return { id: i + 1, root: det.root.get(g), label: names[i].label, terms: names[i].terms, size: g.length,
       central: [...g].sort((a, b) => internal(b) - internal(a) || a.localeCompare(b)).slice(0, 3),
       collections: [...cols].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([c]) => c), files: g };
   });
@@ -1563,7 +1623,7 @@ function main() {
   }
   for (const n of fileNodes) n.group = groupOfFile.get(n.id) ?? 0;
   const groupsOut = {
-    algorithm: 'Louvain with Leiden-style refinement (groups split into connected parts), modularity, resolution 1',
+    algorithm: 'Louvain with Leiden-style refinement (groups split into connected parts), modularity, resolution 1, per root group',
     seed: GROUP_SEED, weights: GROUP_WEIGHTS, list: groupList, isolated: det.isolated,
     links: [...between].map(([k, w]) => { const [a, b] = k.split('-').map(Number); return { a, b, weight: Math.round(w * 100) / 100 }; })
       .sort((x, y) => y.weight - x.weight || x.a - y.a || x.b - y.b).slice(0, 40),
@@ -1585,7 +1645,7 @@ function main() {
       unresolved: unresolved.length, unresolvedByKind: countBy(unresolved, (u) => u.kind),
       missingRelative: missing.length, assets: assetTotals.total, parseFailures: parseFailures.length,
       screens: screens.length, navigationCalls: navStats.calls, functionCalls: fnStats.calls,
-      functionCallsSameFile: localCallCount, functionCallSites: callStats.calls, functionCallsResolved: callStats.resolved, functionCallsViaValue: callStats.viaValue || 0, functionCallsUnresolved: callStats.unresolved,
+      notes: notes.length, edgesByConfidence: countBy(edges, (e) => e.tag), functionCallsSameFile: localCallCount, functionCallSites: callStats.calls, functionCallsResolved: callStats.resolved, functionCallsViaValue: callStats.viaValue || 0, functionCallsUnresolved: callStats.unresolved,
       collections: collections.size, subcollections: subs.size, documentIdPathsMasked: maskedPaths.size, dataUsesWithUnknownOperation: dataOpUnknown.length,
     },
     nodes, edges, unresolved, missingRelative: missing, assetTotals, parseFailures,
@@ -1594,6 +1654,7 @@ function main() {
     // Paths in which a literal document ID was replaced by {id} (masked form only; the raw ID is never stored).
     data: { usesWithUnknownOperation: dataOpUnknown, documentIdPathsMasked: [...maskedPaths].sort() },
     groups: groupsOut,
+    notes,
   };
 
   fs.mkdirSync(outDir, { recursive: true });
@@ -1645,7 +1706,9 @@ function main() {
   }
   console.log(`Function calls between files: ${callStats.resolved} resolved (${callStats.viaValue || 0} via a value passed on), ${callStats.unresolved} unresolved (kind call); inside the same file: ${localCallCount}`);
   console.log(`Groups: ${groupList.length} (+${det.isolated.length} isolated files)`);
-  for (const g of groupList) console.log(`  ${g.id}. ${g.label}  (${g.size})  ${g.central.join(', ')}`);
+  for (const g of groupList) console.log(`  ${g.id}. [${g.root}] ${g.label}  (${g.size})  ${g.central.join(', ')}`);
+  console.log(`Edges by confidence: ${kv(countBy(edges, (e) => e.tag))}; inferred by reason: ${kv(countBy(edges.filter((e) => e.why), (e) => e.why))}`);
+  console.log(`Notes: ${notes.length} (${kv(countBy(notes, (n) => n.tag))})`);
   console.log(`Parse failures: ${parseFailures.length}`);
   for (const f of parseFailures) console.log(`  ${f.file}:${f.line ?? '?'} ${f.reason}`);
 }

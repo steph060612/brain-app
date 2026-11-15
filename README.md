@@ -58,7 +58,7 @@ Starts Vite on port 5174 (with hot reload) and the API on port 3001 in parallel.
 
 A project's panel can link a code folder (stored in `~/.brain/code-folders.json`, never in `~/Brain`) and
 **Map project**: the server runs `node src/mapper.js <folder> <slug>` (spawned with an argument list, 60 second
-limit) and writes `~/.brain/maps/<slug>/map.json` (schemaVersion 8). Literal document IDs in Firestore paths (generated-looking
+limit) and writes `~/.brain/maps/<slug>/map.json` (schemaVersion 9). Literal document IDs in Firestore paths (generated-looking
 values, UUIDs, email addresses, long numbers) are replaced by `{id}` before anything is stored, so they never appear in
 the map, the diagram or brainmap; short fixed document names such as `stats/exercisePRs` are kept. Firestore use is read in every folder (app,
 functions/, scripts/): one node per top-level collection (counting everything under it) and one per subcollection
@@ -83,7 +83,17 @@ The mapper also runs on its own: `node src/mapper.js <project folder> <output na
 
 `brainmap` answers structure questions from the saved map, in compact plain text (each list shows its first
 items with "(+N more, use --all)"): `overview`, `files <folder>`, `file <path>`, `impact <path>`, `screen <name>`,
-`collection <name>`, `function <name>`, `callers <name|file:name>`, `find <text>`, `unused`, `path <A> <B>`, `report`, `query "<question>"`, `groups` and `group <label|number>`.
+`collection <name>`, `function <name>`, `callers <name|file:name>`, `find <text>`, `unused`, `path <A> <B>`, `report`, `query "<question>"`, `groups`, `group <label|number>` and `notes <file|function|--all>`.
+Groups are detected separately for each root (app, functions/, scripts/), so scripts and cloud functions never join
+app groups; links across roots still show in a group's "depends on" and "used by".
+Every link is tagged extracted (written out in the code) or inferred (derived by the mapper: a function passed as a
+value, a screen name inferred from a variable or condition, data reached through a helper-built reference or a
+resolved value, subcollection placeholders merged by position); output marks inferred links, `path` ends with its
+confidence, `report` counts both, and the diagram draws inferred links lighter.
+`notes` lists comments that start with NOTE, WHY, HACK, FIXME, TODO, IMPORTANT or WARNING (in capitals, or followed
+by a colon, dash or parenthesis) and comments citing an ADR or RFC, attached to their function (or the file), with
+line and the first 200 characters; `file` and `callers` show how many there are, and `query` matches their words at
+a lower weight than names.
 `groups` lists subsystems: groups of related files found by community detection on the file graph (Louvain with a
 Leiden-style refinement that keeps every group connected; fixed seed, so the same code gives the same groups). Links
 are weighted per kind (imports 1, calls +1 and a little per call site, navigation 1.5, shared collections 2/(k−1),
@@ -109,7 +119,7 @@ contents. `install.sh` links it next to `brainpack` (`~/.brain/brainmap.sh`, sym
 `/usr/local/bin`).
 
 **Tools for Claude Code (MCP).** `src/brainmap-mcp.js` is a local stdio tool server with the same queries as tools
-(`overview`, `file`, `impact`, `callers`, `collection`, `screen`, `find`, `unused`, `path`, `report`, `query`, `groups`, `group`, each with an `all` option). Each tool
+(`overview`, `file`, `impact`, `callers`, `collection`, `screen`, `find`, `unused`, `path`, `report`, `query`, `groups`, `group`, `notes`, each with an `all` option). Each tool
 runs `brainmap` in the assistant's working folder, so the text, limits and automatic refresh are the same; in a folder
 that is not linked it answers in one line. Read-only. `install.sh` registers it at user scope (every project, no
 project files touched):

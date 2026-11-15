@@ -1,4 +1,4 @@
-// Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (schemaVersion 8; subcollection nodes and function call edges are not drawn).
+// Code map diagram: a force-directed view of ~/.brain/maps/<slug>/map.json (schemaVersion 9; subcollection nodes and function call edges are not drawn).
 // Replaces the brain visual on the left while open. Canvas 2D with pre-rendered glow sprites, so it
 // stays smooth at around 1,000 nodes; d3-force is bundled by Vite, so nothing is fetched from outside.
 //
@@ -9,7 +9,7 @@ import { forceSimulation, forceManyBody, forceLink, forceX, forceY, forceCollide
 import { setBrainPaused } from './brain.js';
 import { computeReport, callerTree, callIndex } from './map-report.js';
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 const BG = '#05070F';
 let TOP = 96;             // below the toolbar; follows its height when it wraps
 const SIDE_W = 300;       // findings column and selection card
@@ -333,12 +333,16 @@ function rebuildEdges() {
     const s = repOf(byId.get(e.from)), t = repOf(byId.get(e.to));
     if (s === t) continue;
     const key = `${e.layer}|${s.id}|${t.id}`;
-    const m = merged.get(key) ?? merged.set(key, { layer: e.layer, source: s, target: t, count: 0, value: 0 }).get(key);
+    const m = merged.get(key) ?? merged.set(key, { layer: e.layer, source: s, target: t, count: 0, value: 0, inferred: 0 }).get(key);
     m.count++;
     if (e.via === 'value') m.value++;
+    if (e.tag === 'inferred') m.inferred++;
   }
   drawEdges = [...merged.values()].filter(e => nodeVisible(e.source) && nodeVisible(e.target));
-  for (const e of drawEdges) e.dashed = e.value > 0 && e.value === e.count; // only calls through a value passed on
+  for (const e of drawEdges) {
+    e.dashed = e.value > 0 && e.value === e.count; // only calls through a value passed on
+    e.light = e.inferred > 0 && e.inferred === e.count; // every link in the pair was inferred by the mapper: drawn lighter
+  }
   tethers = nodes.filter(n => n.kind === 'subcollection' && nodeVisible(n) && nodeVisible(n.parent)).map(n => ({ source: n, target: n.parent, tether: true }));
   degree = new Map();
   for (const e of drawEdges) {
@@ -571,19 +575,26 @@ function draw() {
     ctx.beginPath();
     let any = false;
     for (const e of drawEdges) {
-      if (e.layer !== L.id || touchesSel(e) || isBubbleEdge(e) || e.dashed) continue;
+      if (e.layer !== L.id || touchesSel(e) || isBubbleEdge(e) || e.dashed || e.light) continue;
       ctx.moveTo(e.source.x, e.source.y); ctx.lineTo(e.target.x, e.target.y); any = true;
     }
     ctx.strokeStyle = hexA(L.color, focus ? 0.05 : 0.2);
     ctx.lineWidth = 0.9 / k;
     if (any) ctx.stroke();
+    // Inferred links (not written out in the code): lighter.
+    ctx.beginPath(); any = false;
+    for (const e of drawEdges) {
+      if (e.layer !== L.id || touchesSel(e) || isBubbleEdge(e) || e.dashed || !e.light) continue;
+      ctx.moveTo(e.source.x, e.source.y); ctx.lineTo(e.target.x, e.target.y); any = true;
+    }
+    if (any) { ctx.strokeStyle = hexA(L.color, focus ? 0.025 : 0.08); ctx.stroke(); }
     // Calls made through a function handed over as a value: dashed.
     ctx.beginPath(); any = false;
     for (const e of drawEdges) {
       if (e.layer !== L.id || touchesSel(e) || isBubbleEdge(e) || !e.dashed) continue;
       ctx.moveTo(e.source.x, e.source.y); ctx.lineTo(e.target.x, e.target.y); any = true;
     }
-    if (any) { ctx.strokeStyle = hexA(L.color, focus ? 0.08 : 0.4); ctx.setLineDash([4 / k, 3 / k]); ctx.stroke(); ctx.setLineDash([]); }
+    if (any) { ctx.strokeStyle = hexA(L.color, focus ? 0.05 : 0.22); ctx.setLineDash([4 / k, 3 / k]); ctx.stroke(); ctx.setLineDash([]); } // via value: inferred too, so light
   }
   // Subcollections: a short tether to the collection they belong to.
   if (tethers.length) {
@@ -602,7 +613,7 @@ function draw() {
     for (const e of drawEdges) {
       if (!touchesSel(e)) continue;
       const L = LAYER_BY_ID[e.layer];
-      ctx.strokeStyle = hexA(L.color, 0.9);
+      ctx.strokeStyle = hexA(L.color, e.light ? 0.45 : 0.9);
       if (e.dashed) ctx.setLineDash([5 / k, 4 / k]);
       if (isBubbleEdge(e)) strokeOffset(e, edgeWidth(e.count) + 0.6, onLayers.indexOf(e.layer));
       else {
@@ -814,7 +825,7 @@ function showEdgeTooltip(e, x, y) {
     const L = LAYER_BY_ID[d.layer];
     const what = d.layer === 'calls'
       ? `${plural(d.count, 'call')}${d.value ? ` (${d.value} through a function passed as a value)` : ''}`
-      : plural(d.count, 'link');
+      : `${plural(d.count, 'link')}${d.inferred ? ` (${d.inferred} inferred)` : ''}`;
     return `<div><span style="color:${L.color}">●</span> ${esc(L.label)}: ${esc(what)} <span style="color:#8090b0;word-break:break-all">${esc(nodeName(d.source))} → ${esc(nodeName(d.target))}</span></div>`;
   }).join('');
   tooltip.style.display = 'block';

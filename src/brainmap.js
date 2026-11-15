@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // brainmap: read-only answers about a mapped code project, for coding assistants. Reads
-// ~/.brain/maps/<slug>/map.json (schemaVersion 8); refreshes it first when the code changed (the same check
+// ~/.brain/maps/<slug>/map.json (schemaVersion 9); refreshes it first when the code changed (the same check
 // as the Brain app's "Map is current"). Prints paths, names and numbers only, never file contents.
 // No network, no model calls.
 import { stat } from 'fs/promises';
@@ -23,6 +23,7 @@ Usage: brainmap <command> [argument] [--all] [--depth 2] [--project <name>] [--n
   callers <name>        files and lines that call an exported function (or file:name)
   path <A> <B>          shortest path between two files, functions, screens or collections (--all-shortest: up to 5)
   query "<question>"    plain-words question: matching files, functions, screens, collections and the links around them
+  notes <file|function|--all>  NOTE / WHY / HACK / FIXME / TODO / IMPORTANT / WARNING comments (and ADR/RFC citations)
   groups                subsystems: groups of related files with a name, size, central files and links between groups
   group <label|number>  one group: its files by folder, collections, and the groups it depends on
   report                most-connected files, most-called functions, busiest data, bridges, rare links, next questions
@@ -243,7 +244,8 @@ function filesCmd(P, ix, q) {
 function fileCmd(P, ix, q) {
   const f = resolveFile(ix, q);
   const out = ix.out.get(f.path) || [], inn = ix.inn.get(f.path) || [];
-  say(`${f.path}  ${f.lines} lines  folder ${folderOf(f)}${f.rootGroup !== 'app' ? ` (own root: ${f.rootGroup})` : ''}${f.parseError ? '  (could not be parsed)' : ''}`);
+  const nn = notesOf(P, f.path).length, grp = P.map.groups?.list.find(g => g.id === f.group);
+  say(`${f.path}  ${f.lines} lines  folder ${folderOf(f)}${f.rootGroup !== 'app' ? ` (own root: ${f.rootGroup})` : ''}${grp ? `  group ${grp.id}. ${grp.label}` : ''}${nn ? `  ${plural(nn, 'note')} (brainmap notes ${f.path})` : ''}${f.parseError ? '  (could not be parsed)' : ''}`);
   wrapList(`Exports (${(f.exports || []).length}): `, f.exports || [], 20);
   const imp = out.filter(e => IMPORT_KINDS.has(e.kind)), impBy = inn.filter(e => IMPORT_KINDS.has(e.kind));
   const impTo = groupBy(imp, e => e.to), impFrom = groupBy(impBy, e => e.from);
@@ -365,6 +367,34 @@ function screenCmd(P, ix, q) {
   if (!to.size) say('  none found');
 }
 
+// ─── notes ───────────────────────────────────────────────────────────────────
+const noteRow = n => `${n.file}:${n.line}${n.function ? ` (${n.function})` : ''}  ${n.tag}: ${n.text.replace(new RegExp(`^${n.tag}\\b[\\s:(\\-]*`, 'i'), '')}`;
+const notesOf = (P, file, fn) => (P.map.notes || []).filter(n => n.file === file && (fn === undefined || n.function === fn));
+
+function notesCmd(P, ix, q) {
+  const all = P.map.notes || [];
+  if (!q) {
+    if (!ALL) die('Give a file, a function (or file:function), or --all, for example: brainmap notes utils/pendingSessions.js');
+    const tags = {}; for (const n of all) tags[n.tag] = (tags[n.tag] || 0) + 1;
+    say(`${plural(all.length, 'note')} (${Object.entries(tags).sort((a, b) => b[1] - a[1]).map(([t, c]) => `${c} ${t}`).join(', ')}), by file:`);
+    for (const [f, ns] of groupBy(all, n => n.file)) { say(`  ${f} (${ns.length})`); for (const n of ns) say(`    ${noteRow(n).slice(f.length + 1)}`); }
+    return;
+  }
+  let file = null, fn;
+  const colon = q.lastIndexOf(':');
+  if (colon > 0 && !/^\d+$/.test(q.slice(colon + 1))) { file = resolveFile(ix, q.slice(0, colon)).path; fn = q.slice(colon + 1); }
+  else if (all.some(n => n.function === q) && !ix.byPath.has(q)) {
+    const hits = all.filter(n => n.function === q);
+    const files = [...new Set(hits.map(n => n.file))];
+    if (files.length > 1) die(`"${q}" names functions with notes in ${files.length} files; use file:${q}:\n${files.map(f => `  ${f}:${q}`).join('\n')}`);
+    file = files[0]; fn = q;
+  } else file = resolveFile(ix, q).path;
+  const ns = notesOf(P, file, fn);
+  say(`${plural(ns.length, 'note')} in ${fn ? `${fn} (${file})` : file}${ns.length ? ':' : ''}`);
+  if (!fn) for (const [f, list] of groupBy(ns, n => n.function ?? '(top level)')) { say(`  ${f}`); items(list.map(n => `  line ${n.line}  ${noteRow(n).split('  ').slice(1).join('  ')}`), 12); }
+  else items(ns.map(n => `line ${n.line}  ${noteRow(n).split('  ').slice(1).join('  ')}`));
+}
+
 // ─── path and report ─────────────────────────────────────────────────────────
 function pathCmd(P, ix, args) {
   const [a, b] = Array.isArray(args) ? args : [];
@@ -381,11 +411,13 @@ function pathCmd(P, ix, args) {
   if (r.paths.length > 1) say(`${r.paths.length} shortest paths${r.paths.length === 5 ? ' (first 5)' : ''}:`);
   r.paths.forEach((path, i) => {
     if (r.paths.length > 1) say(`Path ${i + 1}:`);
+    path.conf = path.some(h => h.edges[0].inferred) ? 'inferred (at least one hop was derived by the mapper)' : 'extracted (every hop is written in the code)';
     path.forEach((h, j) => {
       const e = h.edges[0];
       say(`  ${j + 1}. ${h.from} —${e.kind}${e.what ? ` ${e.what}` : ''}→ ${h.to}  (${e.at})${h.loose ? '  [files connect here, but no call reaches the next step]' : ''}`);
       if (h.edges.length > 1) say(`     also: ${h.edges.slice(1, ALL ? undefined : 3).map(x => `${x.kind}${x.what ? ` ${x.what}` : ''} (${x.at})`).join('; ')}${!ALL && h.edges.length > 3 ? `; +${h.edges.length - 3} more` : ''}`);
     });
+    say(`  Confidence: ${path.conf}`);
   });
 }
 
@@ -417,7 +449,7 @@ function groupsCmd(P) {
   const G = P.map.groups;
   if (!G?.list?.length) die('This map has no groups.');
   say(`${plural(G.list.length, 'group')} of related files (${G.algorithm.split(' (')[0]}, seed ${G.seed})${G.isolated.length ? `, plus ${plural(G.isolated.length, 'isolated file')}` : ''}:`);
-  items(G.list.map(g => `${groupName(g)}  (${plural(g.size, 'file')})  central: ${g.central.join(', ')}`), 30);
+  items(G.list.map(g => `${groupName(g)}  [${g.root}]  (${plural(g.size, 'file')})  central: ${g.central.join(', ')}`), 30);
   const byId = new Map(G.list.map(g => [g.id, g]));
   say('Strongest links between groups:');
   items(G.links.map(l => `${byId.get(l.a).label}  ↔  ${byId.get(l.b).label}  (weight ${l.weight})`), 8);
@@ -475,6 +507,9 @@ function reportCmd(P) {
   items(r.bridges.length ? r.bridges.map(x => `${x.file}  cuts off ${plural(x.cutOff, 'file')} (parts: ${x.parts.slice(0, 5).join(', ')}${x.parts.length > 5 ? ', …' : ''})`) : ['none']);
   say('Rare links (between folders joined by fewer than 3 links):');
   items(r.surprising.length ? r.surprising.map(x => `${x.from} —${x.kind}${x.what ? ` ${x.what}` : ''}→ ${x.to}  (${x.from}:${x.line ?? '?'}; ${x.folders.join(' ↔ ')}: ${plural(x.pairLinks, 'link')})`) : ['none']);
+  const c = r.confidence;
+  say(`Links by confidence: ${c.byTag.extracted} extracted, ${c.byTag.inferred} inferred${Object.keys(c.byWhy).length ? ` (${Object.entries(c.byWhy).sort((a, b) => b[1] - a[1]).map(([w, n]) => `${n} ${w}`).join(', ')})` : ''}`);
+  if (Object.keys(r.noteTags).length) say(`Notes: ${Object.entries(r.noteTags).sort((a, b) => b[1] - a[1]).map(([t, n]) => `${n} ${t}`).join(', ')} (brainmap notes --all)`);
   if (P.map.groups?.list?.length) {
     say(`Groups (related files; brainmap groups):`);
     items(P.map.groups.list.map(g => `${groupName(g)}  (${g.size})  central: ${g.central[0]}`), 12);
@@ -503,7 +538,7 @@ function mergeNodes(nodes) {
 const rowText = g => {
   const ls = [...g.lines].sort((x, y) => x - y);
   return `${g.e.from} (line${ls.length > 1 ? 's' : ''} ${ls.slice(0, 6).join(', ')}${ls.length > 6 ? ', …' : ''})${g.e.caller ? ` in ${g.e.caller}` : ' at top level'}`
-    + `${g.e.sameFile ? ', same file' : ''}${g.e.via === 'value' ? `, via value from ${g.e.passedFrom}:${g.e.passedLine}` : ''}`;
+    + `${g.e.sameFile ? ', same file' : ''}${g.e.via === 'value' ? `, via value from ${g.e.passedFrom}:${g.e.passedLine}` : ''}${g.e.tag === 'inferred' && g.e.via !== 'value' ? ` [inferred: ${g.e.why}]` : g.e.via === 'value' ? ' [inferred]' : ''}`;
 };
 // Callers of callers, indented with "←".
 function sayTree(nodes, pad, limit = 4) {
@@ -588,6 +623,8 @@ function callersCmd(P, ix, q) {
     if (byTarget.size > 1) say('');
     const nodes = tree(P, target, name, DEPTH);
     const other = es.filter(e => !e.sameFile), same = es.length - other.length;
+    const nn = notesOf(P, target, name).length;
+    if (nn) say(`${name} has ${plural(nn, 'note')}: brainmap notes ${target}:${name}`);
     say(other.length
       ? `${name} (${target}): ${plural(other.length, 'call')} from ${plural(new Set(other.map(e => e.from)).size, 'file')}${same ? `, ${plural(same, 'call')} inside its own file` : ''}${DEPTH > 1 ? `, callers to depth ${DEPTH}` : ''}, by folder:`
       : `${name} (${target}): called only inside its own file (${plural(same, 'place')})${DEPTH > 1 ? `, callers to depth ${DEPTH}` : ''}:`);
@@ -661,7 +698,7 @@ function collectionCmd(P, ix, q) {
     for (const kind of ['writes', 'reads']) {
       const list = es.filter(e => e.kind === kind);
       say(`${kind === 'writes' ? 'Written by' : 'Read by'} ${plural(list.length, 'file')}${list.length ? ', by folder:' : ''}`);
-      groupedByFolder(ix, list.map(e => ({ file: e.from, text: `${e.from}  ${plural(e.count || 1, 'use')}${linesOf([e])}` })), hits.length > 1 ? 10 : 15);
+      groupedByFolder(ix, list.map(e => ({ file: e.from, text: `${e.from}  ${plural(e.count || 1, 'use')}${linesOf([e])}${e.tag === 'inferred' ? `  [inferred: ${e.why}]` : ''}` })), hits.length > 1 ? 10 : 15);
     }
     if (unknown.length) {
       say(`Read or write unknown (${unknown.length}), by folder:`);
@@ -723,7 +760,7 @@ function unusedCmd(P, ix) {
 }
 
 // ─── main ────────────────────────────────────────────────────────────────────
-const COMMANDS = { groups: groupsCmd, group: groupCmd, query: queryCmd, path: pathCmd, report: reportCmd, callers: callersCmd, overview, files: filesCmd, file: fileCmd, impact: impactCmd, screen: screenCmd, collection: collectionCmd, function: functionCmd, find: findCmd, unused: unusedCmd };
+const COMMANDS = { notes: notesCmd, groups: groupsCmd, group: groupCmd, query: queryCmd, path: pathCmd, report: reportCmd, callers: callersCmd, overview, files: filesCmd, file: fileCmd, impact: impactCmd, screen: screenCmd, collection: collectionCmd, function: functionCmd, find: findCmd, unused: unusedCmd };
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));

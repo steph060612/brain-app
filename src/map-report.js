@@ -1,4 +1,4 @@
-// Path between two things, and a project report, computed from a map (schemaVersion 8). Pure functions with no
+// Path between two things, and a project report, computed from a map (schemaVersion 9). Pure functions with no
 // Node or browser dependencies: used by the brainmap command (and its tools) and by the diagram. Deterministic.
 
 const IMPORT_KINDS = new Set(['import', 'require', 're-export', 'dynamic']);
@@ -197,7 +197,8 @@ function edgeText(e, fn, via = null) {
     what = site ? `in ${fn}` : e.sites?.[0]?.function ? `in ${e.sites[0].function}` : '';
   }
   if (via) what = `${what}${what ? ' ' : ''}(${via}, same file)`;
-  return { kind: KIND_LABEL[e.kind] || e.kind, what, at: line ? `${e.from}:${line}` : e.from };
+  if (e.tag === 'inferred') what = `${what}${what ? ' ' : ''}[inferred: ${e.why}]`;
+  return { kind: KIND_LABEL[e.kind] || e.kind, what, at: line ? `${e.from}:${line}` : e.from, inferred: e.tag === 'inferred' };
 }
 
 // { status: 'ambiguous' | 'notfound' | 'none' | 'found', ... }
@@ -222,6 +223,7 @@ export function findPath(map, aQuery, bQuery, { allShortest = false } = {}) {
       if (!paths.length) continue;
       return {
         status: 'found', direction: dir, only, ...base, length: paths[0].length - 1,
+        // A path is only as sure as its least sure hop.
         paths: paths.map(p => {
           const hops = chooseEdges(p.slice(1).map((id, i) => ({ from: nodeLabel(byId.get(p[i])), to: nodeLabel(byId.get(id)), edges: adj.get(p[i]).get(id) })), local);
           return hops.map((h, i) => {
@@ -340,7 +342,10 @@ export function computeReport(map, top = 10) {
   const mostDependent = rankBy(out)[0];
   if (questions.length < 5 && mostDependent) questions.push({ cmd: `brainmap file ${mostDependent.file}`, why: 'the file that depends on the most others' });
 
-  return { dependedOn: rankBy(inc), dependent: rankBy(out), functions, data, bridges: bridgeList, surprising, questions: questions.slice(0, 5) };
+  const byTag = { extracted: 0, inferred: 0 }, byWhy = {};
+  for (const e of map.edges) { byTag[e.tag === 'inferred' ? 'inferred' : 'extracted']++; if (e.why) byWhy[e.why] = (byWhy[e.why] || 0) + 1; }
+  const noteTags = {}; for (const n of map.notes || []) noteTags[n.tag] = (noteTags[n.tag] || 0) + 1;
+  return { dependedOn: rankBy(inc), dependent: rankBy(out), functions, data, bridges: bridgeList, surprising, questions: questions.slice(0, 5), confidence: { byTag, byWhy }, noteTags };
 }
 
 // ─── query: plain words → matching nodes and the links around them ──────────────────────────────────────
@@ -391,6 +396,8 @@ export function queryMap(map, question, { maxMatches = 5 } = {}) {
   }
   for (const s of map.navigation?.screens || []) if (s.file)
     cands.push({ key: `screen:${s.name}:${s.file}`, kind: 'screen', label: `screen ${s.name} (${s.file})`, node: s.file, screen: s.name, full: s.name, name: splitWords(s.name), path: s.file.split('/').flatMap(splitWords), folder: s.file.split('/')[0] });
+  // Notes: their words count as path words (1, not 3 like a name), at three quarters.
+  for (const n of map.notes || []) cands.push({ key: `note:${n.file}:${n.line}`, kind: 'note', label: `${n.tag} note in ${n.file}${n.function ? ` (${n.function})` : ''}, line ${n.line}: ${n.text.slice(0, 90)}${n.text.length > 90 ? '…' : ''}`, node: n.file, fn: n.function, full: '', name: [], path: splitWords(n.text), half: true });
   for (const g of map.groups?.list || []) cands.push({ key: `group:${g.id}`, kind: 'group', label: `group ${g.id}. ${g.label} (${g.size} files)`, node: `group:${g.id}`, full: g.label, name: g.terms.slice(0, 3), path: g.terms.slice(3), group: g });
   for (const n of map.nodes) {
     if (n.kind === 'collection') cands.push({ key: n.id, kind: 'collection', label: `collection ${n.name}`, node: n.id, full: n.name, name: splitWords(n.name), path: [] });
@@ -414,7 +421,7 @@ export function queryMap(map, question, { maxMatches = 5 } = {}) {
       const k = c.kind === 'collection' || c.kind === 'subcollection' ? 'data' : c.kind === 'file' && c.folder === 'screens' ? 'screen' : c.kind;
       if (kinds.has(k)) score += 2;
     }
-    c.score = score; c.hit = hit;
+    c.score = c.half ? score * 0.75 : score; c.hit = hit; // note words: path weight (1, not 3) and three quarters of that
   }
   const MIN = 4; // at least one exact word of a name (3 + 1), or two weaker matches
   let ranked = cands.filter(c => c.score >= MIN).sort((a, b) => b.score - a.score || b.hit.length - a.hit.length || a.label.localeCompare(b.label));
@@ -442,6 +449,7 @@ export function queryMap(map, question, { maxMatches = 5 } = {}) {
   const add = (e, why) => { const k = `${e.kind}|${e.from}|${e.to}|${e.line ?? e.lines?.[0]}|${e.function ?? ''}`; if (!links.has(k)) links.set(k, { e, why }); };
   // fn: the matched function whose read/write line a data link should show
   for (const c of matches) {
+    if (c.kind === 'note' || c.kind === 'group') continue; // listed as they are; their file's links would be noise
     for (const e of map.edges) {
       if (!PATH_KINDS.has(e.kind) || String(e.to).startsWith('subcollection:') && c.kind === 'collection') continue;
       if (c.kind === 'function') {
@@ -495,11 +503,11 @@ export function queryMap(map, question, { maxMatches = 5 } = {}) {
   const dup = new Set(matches.filter(c => c.kind === 'function').map(c => c.fn).filter((f, i, a) => a.indexOf(f) !== i));
   const fnRef = c => (dup.has(c.fn) ? `${c.node}:${c.fn}` : c.fn);
   const depth = kinds.has('screen') ? ' --depth 2' : '';
-  const cmdFor = c => (c.kind === 'group' ? `brainmap group ${c.group.id}` : c.kind === 'screen' ? `brainmap screen ${c.screen}` : c.kind === 'function' ? `brainmap callers ${fnRef(c)}`
+  const cmdFor = c => (c.kind === 'note' ? `brainmap notes ${c.node}` : c.kind === 'group' ? `brainmap group ${c.group.id}` : c.kind === 'screen' ? `brainmap screen ${c.screen}` : c.kind === 'function' ? `brainmap callers ${fnRef(c)}`
     : c.kind === 'collection' || c.kind === 'subcollection' ? `brainmap collection ${c.kind === 'subcollection' ? c.node.slice(14) : c.full}${depth}` : `brainmap file ${c.node}`);
   for (const c of matches) { const cmd = cmdFor(c); if (!next.includes(cmd)) next.push(cmd); if (next.length >= 2) break; }
   // A path between the first two matches that are different files or collections.
-  const ref = c => (c.kind === 'group' ? c.group.central[0] : c.kind === 'function' ? `${c.node}:${c.fn}` : c.kind === 'screen' ? c.screen : c.kind === 'file' ? c.node : c.kind === 'subcollection' ? c.node.slice(14) : c.full);
+  const ref = c => (c.kind === 'note' ? c.node : c.kind === 'group' ? c.group.central[0] : c.kind === 'function' ? `${c.node}:${c.fn}` : c.kind === 'screen' ? c.screen : c.kind === 'file' ? c.node : c.kind === 'subcollection' ? c.node.slice(14) : c.full);
   const other = matches.find(c => c.node !== matches[0].node);
   if (other) next.push(`brainmap path ${ref(matches[0])} ${ref(other)}`);
   else if (fileById.has(matches[0].node)) next.push(`brainmap impact ${matches[0].node}`);
