@@ -4,8 +4,8 @@
 # Downloads a fixed, tested release (not the latest code), checks it, then runs its installer.
 set -euo pipefail
 
-VERSION="v0.1.1"
-SHA256="30c79311a0cb45680f450c4105b7c78dfc30155c9aa3bd949594c642a93c22ec"
+VERSION="v0.2.0"
+SHA256="75e9459c2ffae8f9bbd60aafa94f0d8a3f5f5a94f0401b07692846d1a355a4bd"
 URL="https://github.com/steph060612/brain-app/releases/download/$VERSION/brain-app-$VERSION.tar.gz"
 
 [ "$(uname)" = "Darwin" ] || { echo "Stopped: the Brain runs on macOS only." >&2; exit 1; }
