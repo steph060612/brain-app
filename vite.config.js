@@ -6,8 +6,11 @@ import { SCHEMA_VERSION } from './src/map-schema.js';
 // Every build gets an id. It is baked into the bundle (__BRAIN_BUILD__) and written to dist/build-info.json, which the
 // server reads at startup and reports at /api/version. An open page compares the two and reloads itself when the
 // server runs a newer build, so a long-lived tab can never keep reading maps with an old schema.
-let commit = 'nogit';
-try { commit = execFileSync('git', ['rev-parse', '--short', 'HEAD'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(); } catch {}
+// BRAIN_COMMIT: set by scripts/release.sh, which builds in an export of the commit that has no .git folder.
+let commit = process.env.BRAIN_COMMIT || 'nogit';
+if (!process.env.BRAIN_COMMIT) {
+  try { commit = execFileSync('git', ['rev-parse', '--short', 'HEAD'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(); } catch {}
+}
 const BUILD = { id: `${SCHEMA_VERSION}-${commit}-${Date.now().toString(36)}`, schemaVersion: SCHEMA_VERSION, commit, builtAt: new Date().toISOString() };
 
 export default defineConfig({
