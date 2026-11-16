@@ -462,7 +462,7 @@ function nestedScreens(params, A) {
   return { levels, computed: false };
 }
 
-// A web path written as a template or concatenation, `/clients/${id}` → '/clients/:*' (a parameter the map
+// A web path written as a template or concatenation, `/orders/${id}` → '/orders/:*' (a parameter the map
 // cannot know), or null when it is not a path.
 function pathTemplate(node) {
   node = unwrapTS(node);
@@ -1231,7 +1231,7 @@ const cartesian = (a, b) => { const out = []; for (const x of a) for (const y of
 
 // The possible texts of one path argument: a literal, a template or '+' concatenation (with named
 // placeholders for the parts it cannot know), or the few string values a variable or conditional can hold.
-// A const holding a template or concatenation (const p = `patients/${uid}`; db.doc(p)) gives that template's
+// A const holding a template or concatenation (const p = `orders/${orderId}`; db.doc(p)) gives that template's
 // pattern, marked as resolved from a value.
 function segValues(node, A, depth = 0) {
   node = unwrapTS(node);
@@ -1252,7 +1252,7 @@ function segValues(node, A, depth = 0) {
   }
   if (node.type === 'Identifier') {
     const b = A.lookup(node.name, node);
-    // for (const path of [`users/${uid}`, `patients/${uid}`]): each element's pattern.
+    // for (const path of [`users/${uid}`, `orders/${orderId}`]): each element's pattern.
     if (b?.forOf) {
       const arr = objectOf(b.forOf, A, depth + 1);
       if (arr?.type === 'ArrayExpression' && arr.elements.length && arr.elements.length <= MAX_VARIANTS
@@ -1287,7 +1287,7 @@ function refPath(node, A, depth = 0) {
   if (node.type === 'AwaitExpression') return null;
   if (!isCall(node)) return null;
   const fn = fsFn(node, FS_REF_FNS, A) ?? fsFn(node, FS_QUERY_FNS, A);
-  // A helper defined in this file that returns a reference, such as workoutLogsRef(uid).
+  // A helper defined in this file that returns a reference, such as ordersRef(uid).
   if (!fn && node.callee.type === 'Identifier') {
     const ret = returnedExpr(localFunction(node.callee, A));
     if (ret) { const r = refPath(ret, A, depth + 1); return r && !r.unresolved ? { ...r, helper: true } : r; }
@@ -1315,7 +1315,7 @@ function refPath(node, A, depth = 0) {
   }
   if (prop === 'doc' || CHAIN_QUERY.has(prop)) {
     const base = refPath(recv, A, depth + 1);
-    // firebase-admin: db.doc('patients/' + uid), getFirestore().doc(`patients/${uid}`): a full path on the database.
+    // firebase-admin: db.doc('orders/' + orderId), getFirestore().doc(`users/${uid}`): a full path on the database.
     if (!base && prop === 'doc' && args.length && isDbLike(recv, A)) return { segs: [segOf(args[0], A)] };
     if (!base || base.unresolved) return base;
     return prop === 'doc' ? { segs: [...base.segs, segOf(args[0], A)] } : base;
@@ -1412,8 +1412,8 @@ function opsFor(node, A, depth = 0, seen = new Set()) {
 const isHole = (seg) => seg.includes('{');
 
 // A literal document ID that must never be stored or shown: a generated-looking value (16+ letters and digits
-// mixed), a UUID, an email address or a long number. Short fixed names the app uses as documents (stats,
-// exercisePRs, settings, state) are kept.
+// mixed), a UUID, an email address or a long number. Short fixed names the app uses as documents (such as
+// settings/general) are kept.
 export const looksLikeId = (seg) => !seg.includes('{') && (
   (seg.length >= 16 && /[A-Za-z]/.test(seg) && /\d/.test(seg) && /^[A-Za-z0-9_-]+$/.test(seg))
   || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(seg)
@@ -1421,12 +1421,12 @@ export const looksLikeId = (seg) => !seg.includes('{') && (
   || /^\d{6,}$/.test(seg));
 // Document positions are the odd segments of a path (after each collection name); collection names stay.
 const maskIds = (parts, group) => (group ? parts : parts.map((p, i) => (i % 2 === 1 && looksLikeId(p) ? '{id}' : p)));
-// One key per subcollection, whatever the document ids are called: users/{uid}/workoutLogs -> users/{}/workoutLogs.
+// One key per subcollection, whatever the document ids are called: users/{uid}/orders -> users/{}/orders.
 const subKey = (colParts) => colParts.map((p, i) => (i % 2 ? '{}' : p)).join('/');
 
 // Firestore references in one file. Each use names its top-level collection (as in schema 2) and, when the
 // path goes deeper, the subcollection pattern it reaches (a document path counts as its collection's).
-// When a reference is what a helper in the same file returns (function workoutLogsRef(uid) { return collection(...) }),
+// When a reference is what a helper in the same file returns (function ordersRef(uid) { return collection(...) }),
 // it is really used where the helper is called: those call nodes, or null.
 function helperCallSites(n, A) {
   let cur = n, p = A.parent(cur);
@@ -1916,7 +1916,7 @@ function buildMap(root) {
 
   const nodeSet = new Set(jsFiles);
   const nodes = [], edges = [], unresolved = [], missing = [], parseFailures = [];
-  const webRedirects = new Map(); // redirect route path → where it sends (<Route path="/" element={<Navigate to="/clients" />} />)
+  const webRedirects = new Map(); // redirect route path → where it sends (<Route path="/" element={<Navigate to="/orders" />} />)
   const rawScreens = [], navCallsByFile = new Map(), callablesByFile = new Map(), dataByFile = new Map();
   const exportTables = new Map(), callsByFile = new Map(), paramCallsByFile = new Map(), importNames = new Map();
   let localCallCount = 0;

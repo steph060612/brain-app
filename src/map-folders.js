@@ -9,7 +9,7 @@ export const isMulti = map => (map?.folders?.length || 0) > 1;
 // Is this file id written with its folder in front (app:src/x.js)?
 export const prefixed = f => !!f && f.relPath !== undefined && f.relPath !== f.path;
 
-// "ptdash:src/pages/X.jsx" → { folder: 'ptdash', rest: 'src/pages/X.jsx' }; no known folder in front → { folder: null, rest: q }.
+// "web:src/pages/X.jsx" → { folder: 'web', rest: 'src/pages/X.jsx' }; no known folder in front → { folder: null, rest: q }.
 export function scopeQuery(map, q) {
   const s = String(q ?? '');
   for (const name of folderNames(map)) if (s.toLowerCase().startsWith(`${name}:`)) return { folder: name, rest: s.slice(name.length + 1) };

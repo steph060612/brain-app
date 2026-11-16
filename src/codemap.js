@@ -224,7 +224,7 @@ function resize() {
 }
 
 // ─── data ────────────────────────────────────────────────────────────────────
-// With several code folders each folder key carries the code folder (cf:ptdash/folder:src → "ptdash: src/"), so the
+// With several code folders each folder key carries the code folder (cf:web/folder:src → "web: src/"), so the
 // same folder name in two repositories stays two bubbles. A single-folder map has the keys it always had.
 const baseKeyOf = f => (f.rootGroup !== 'app' ? `group:${f.rootGroup}` : `folder:${f.topFolder}`);
 const folderKeyOf = f => (prefixed(f) ? `cf:${f.codeFolder}/` : '') + baseKeyOf(f);
@@ -277,8 +277,8 @@ function prepare() {
   });
   nodes = [...bubbles, ...fileNodes, ...colNodes, ...subNodes];
   byId = new Map(nodes.map(n => [n.id, n]));
-  // A subcollection hangs off its nearest mapped ancestor: users/{}/myWorkouts/{}/sessions off
-  // users/{}/myWorkouts when that is mapped, otherwise off the top-level collection (users).
+  // A subcollection hangs off its nearest mapped ancestor: users/{}/orders/{}/items off
+  // users/{}/orders when that is mapped, otherwise off the top-level collection (users).
   for (const sub of subNodes) {
     const parts = sub.raw.key.split('/');
     let parent = null;

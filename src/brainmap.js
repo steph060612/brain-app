@@ -2,7 +2,7 @@
 // brainmap: read-only answers about a mapped code project, for coding assistants. Reads
 // ~/.brain/maps/<slug>/map.json (format version: map-schema.js); refreshes it first when the code changed in any linked
 // folder (the same check as the Brain app's "Map is current"). A project can link several code folders mapped
-// into one map: paths then start with the folder's short name (ptdash:src/x.js), --folder limits the output to
+// into one map: paths then start with the folder's short name (web:src/x.js), --folder limits the output to
 // one folder, and report, groups, query and unused run per folder. Prints paths, names and numbers only, never
 // file contents.
 // No network, no model calls.
@@ -24,8 +24,8 @@ Usage: brainmap <command> [argument] [--all] [--depth 2] [--types] [--folder <na
   file <path>           exports, imports, importers, navigation, collections and functions of one file
   impact <path>         files that depend on it through imports, up to 3 steps away (--types: type imports too;
                         impact file:function: through calls)
-  screen <name>         a navigation screen or web route (screen name, route path like /clients/:id, a concrete
-                        path like /clients/123, or the page file): its file, where it navigates and is reached from
+  screen <name>         a navigation screen or web route (screen name, route path like /orders/:orderId, a concrete
+                        path like /orders/123, or the page file): its file, where it navigates and is reached from
   callers <name>        files and lines that call an exported function (or file:name)
   path <A> <B>          shortest path between two files, functions, screens, routes or collections (navigation first
                         between two screens or pages; --all-shortest: up to 5)
@@ -34,7 +34,7 @@ Usage: brainmap <command> [argument] [--all] [--depth 2] [--types] [--folder <na
   groups                subsystems: groups of related files with a name, size, central files and links between groups
   group <label|number>  one group: its files by folder, collections, and the groups it depends on
   report                most-connected files, most-called functions, busiest data, bridges, rare links, next questions
-  collection <name>     files that read and write a collection or subcollection (name or path, e.g. users/{uid}/workoutLogs)
+  collection <name>     files that read and write a collection or subcollection (name or path, e.g. users/{uid}/orders)
   function <name>       a cloud function: where it is defined and who calls it
   find <text>           matches in file paths, exported names, screens and collections
   unused                files not reached from their folder's entry files, screens with no incoming navigation found
@@ -42,7 +42,7 @@ Usage: brainmap <command> [argument] [--all] [--depth 2] [--types] [--folder <na
 The project is the one whose linked folder contains the current folder (any of its folders), or --project <name>.
 Each list shows its first items with "(+N more, use --all)"; --all shows everything. Paths are relative to the project folder.
 Several code folders: a project can link several folders (an app and a website on one database), mapped as one.
-  Paths then start with the folder's short name (ptdash:src/lib/x.js); a path without it works when it is unique.
+  Paths then start with the folder's short name (web:src/lib/x.js); a path without it works when it is unique.
   Readers, writers and callers are grouped by folder; collection says which folders touch it; path can cross
   folders through shared data or a cloud function, and marks that hop. report, groups, query and unused are
   computed per folder (report adds the shared collections). --folder <name> limits any command to one folder.`;
@@ -185,12 +185,12 @@ function index(map) {
   return { map, files, byPath, out, inn, screens, collections, subs, unresolvedCalls };
 }
 
-// With several code folders, the folder's short name goes in front: ptdash:src.
+// With several code folders, the folder's short name goes in front: web:src.
 const cfPrefix = f => (prefixed(f) ? `${f.codeFolder}:` : '');
 const folderOf = f => cfPrefix(f) + (f.rootGroup !== 'app' ? f.rootGroup : f.topFolder === '(root)' ? '(root)' : f.topFolder);
 
 // A path from the user: exact, then path suffix, then file name, then name without extension. With several code
-// folders, "ptdash:src/x.js" looks only in that folder and "src/x.js" in all of them (it must be unique).
+// folders, "web:src/x.js" looks only in that folder and "src/x.js" in all of them (it must be unique).
 function resolveFile(ix, q) {
   q = String(q || '').replace(/^\.\//, '');
   if (!q) die('Give a file path, for example: brainmap file src/App.js');
@@ -376,9 +376,9 @@ function impactCmd(P, ix, q) {
 
 function findScreens(ix, q) {
   const low = String(q || '').toLowerCase().replace(/screen$/, '');
-  if (!q) die('Give a screen name, a route path or a page file, for example: brainmap screen Home, brainmap screen /clients/:id');
+  if (!q) die('Give a screen name, a route path or a page file, for example: brainmap screen Home, brainmap screen /orders/:orderId');
   if (q.startsWith('/')) {
-    // A route path, or a concrete path such as /clients/123 (matched to /clients/:clientUid).
+    // A route path, or a concrete path such as /orders/123 (matched to /orders/:orderId).
     const hits = routesFor(ix.screens, q);
     if (!hits.length) die(`No route matches "${q}". Routes: ${ix.screens.filter(s => s.route).map(s => s.name).slice(0, 30).join(', ') || 'none in this map'}`);
     return hits;
@@ -450,7 +450,7 @@ function notesCmd(P, ix, q) {
 // ─── path and report ─────────────────────────────────────────────────────────
 function pathCmd(P, ix, args) {
   const [a, b] = Array.isArray(args) ? args : [];
-  if (!a || !b) die('Give two things, for example: brainmap path screens/TrackerScreen.js workoutLogs  (quote names with spaces)');
+  if (!a || !b) die('Give two things, for example: brainmap path screens/HomeScreen.js orders  (quote names with spaces)');
   const r = findPath(P.map, a, b, { allShortest: ALL_SHORTEST });
   if (r.status === 'notfound') die(`Nothing in the map matches "${r.query}" (a file, exported function, screen, collection or subcollection).`);
   if (r.status === 'ambiguous') die(`"${r.query}" matches ${r.matches.length} things; use a fuller name or file:function:\n${r.matches.map(m => `  ${m}`).join('\n')}`);
@@ -476,7 +476,7 @@ function pathCmd(P, ix, args) {
 }
 
 function queryCmd(P, ix, q) {
-  if (!q) die('Ask in words, for example: brainmap query "what saves completed workout sessions"');
+  if (!q) die('Ask in words, for example: brainmap query "what saves a new order"');
   const r = queryMap(P.map, q);
   say(`Terms: ${r.terms.join(', ') || 'none'}${r.dropped.length ? `   (ignored: ${r.dropped.join(', ')})` : ''}`);
   if (!r.matches.length) {
@@ -679,7 +679,7 @@ function indent(fn) {
 }
 
 function callersCmd(P, ix, q) {
-  if (!q) die('Give a function name, or file:name (any function defined in that file), for example: brainmap callers logWorkout');
+  if (!q) die('Give a function name, or file:name (any function defined in that file), for example: brainmap callers createOrder');
   let file = null, name = q;
   const colon = q.lastIndexOf(':');
   if (colon > 0) { file = resolveFile(ix, q.slice(0, colon)).path; name = q.slice(colon + 1); }
@@ -734,7 +734,7 @@ function groupedByFolder(ix, rows, limit = 15) {
   if (shown < rows.length) say(`  (+${rows.length - shown} more, use --all)`);
 }
 
-// A path the user typed, as the mapper keys it: users/{uid}/workoutLogs/{id} -> users/{}/workoutLogs.
+// A path the user typed, as the mapper keys it: users/{uid}/orders/{id} -> users/{}/orders.
 function patternKey(q) {
   const parts = q.split('/').filter(Boolean);
   const col = parts.length % 2 === 0 ? parts.slice(0, -1) : parts;

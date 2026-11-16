@@ -1,9 +1,12 @@
 #!/bin/bash
 # Build a release package of the Brain app from the current commit, and point get.sh at it. Publishes nothing.
 #
-#   scripts/release.sh v0.2.0 --dry-run      print what would be built and published, change nothing
-#   scripts/release.sh v0.2.0                print the same, ask, then build release/brain-app-v0.2.0.tar.gz
+#   scripts/release.sh v0.2.0 --notes-file notes.md --dry-run   print what would be built and published, change nothing
+#   scripts/release.sh v0.2.0 --notes-file notes.md             print the same, ask, then build
+#                                                               release/brain-app-v0.2.0.tar.gz
 #                                            and update VERSION and SHA256 in get.sh
+#   --notes-file F     the release notes (Markdown). Required to build: without it a dry run shows the plan but no
+#                      publish command. Keep it outside the repository, or commit it: untracked files stop a release.
 #   --yes              do not ask (still prints everything first)
 #   --allow-untracked  proceed although untracked files exist (they are never packaged: the package is made
 #                      from `git archive` of the commit, plus the built dist/)
@@ -19,17 +22,26 @@ cd "$REPO"
 fail() { echo "✗ RELEASE REFUSED: $1" >&2; exit 1; }
 say()  { echo "==> $1"; }
 
-VERSION="" DRY=no YES=no ALLOW_UNTRACKED=no
-for a in "$@"; do
+VERSION="" DRY=no YES=no ALLOW_UNTRACKED=no NOTES=""
+while [ $# -gt 0 ]; do
+  a="$1"; shift
   case "$a" in
+    --notes-file) NOTES="${1:-}"; [ -n "$NOTES" ] || fail "--notes-file needs a file."; shift ;;
+    --notes-file=*) NOTES="${a#--notes-file=}" ;;
     --dry-run) DRY=yes ;;
     --yes) YES=yes ;;
     --allow-untracked) ALLOW_UNTRACKED=yes ;;
     v[0-9]*) VERSION="$a" ;;
-    *) fail "unknown argument $a. Usage: scripts/release.sh vX.Y.Z [--dry-run] [--yes] [--allow-untracked]" ;;
+    *) fail "unknown argument $a. Usage: scripts/release.sh vX.Y.Z --notes-file FILE [--dry-run] [--yes] [--allow-untracked]" ;;
   esac
 done
 [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.]+)?$ ]] || fail "give a version like v0.2.0."
+# Release notes: required to build and to print the publish command.
+if [ -n "$NOTES" ]; then
+  [ -f "$NOTES" ] || fail "notes file $NOTES does not exist."
+  [ -n "$(tr -d '[:space:]' < "$NOTES")" ] || fail "notes file $NOTES is empty."
+  NOTES="$(cd "$(dirname "$NOTES")" && pwd)/$(basename "$NOTES")"
+fi
 
 # ── Checks that change nothing ─────────────────────────────────────────────────────────────────────────────────
 TRACKED="$(git status --porcelain --untracked-files=no)"
@@ -74,13 +86,20 @@ echo "  package        release/brain-app-$VERSION.tar.gz: the $(git ls-files | w
 echo "  build          clean export of the commit, npm ci, npm run build, scripts/check-build.mjs, then a live check of the"
 echo "                 package started on a spare port with an empty home folder"
 echo "  get.sh         VERSION=\"$CURRENT\" -> \"$VERSION\"; SHA256 -> the new package's checksum (shown after the build)"
-echo "  publishes      nothing. After it finishes, you publish with:"
-echo "                   gh release create $VERSION release/brain-app-$VERSION.tar.gz --repo $REPO_SLUG --title $VERSION --notes '...'"
-echo "                 which serves $ASSET_URL"
-echo "                 and only then commit and push get.sh (pushing it first would break the one-line install)."
+if [ -n "$NOTES" ]; then
+  echo "  notes          $NOTES ($(wc -l < "$NOTES" | tr -d ' ') lines; first: $(grep -m1 -v '^[[:space:]]*$' "$NOTES" | cut -c1-80))"
+  echo "  publishes      nothing. After it finishes, you publish with:"
+  echo "                   gh release create $VERSION release/brain-app-$VERSION.tar.gz --repo $REPO_SLUG --target $HEAD_SHA --title $VERSION --notes-file $NOTES"
+  echo "                 which tags commit $(git rev-parse --short HEAD) (the one packaged) and serves $ASSET_URL"
+  echo "                 and only then commit and push get.sh (pushing it first would break the one-line install)."
+else
+  echo "  notes          none given"
+  echo "  publishes      nothing, and no publish command is shown without release notes. Add --notes-file FILE."
+fi
 if [ -n "$UNTRACKED" ]; then echo "  left out       untracked: $(echo "$UNTRACKED" | tr '\n' ' ')"; fi
 echo
 [ "$DRY" = yes ] && { echo "Dry run: nothing was built or changed."; exit 0; }
+[ -n "$NOTES" ] || fail "release notes are required to build: add --notes-file FILE (Markdown, kept outside the repository or committed)."
 if [ "$YES" = no ]; then
   read -r -p "Build $VERSION now? [y/N] " ok
   [ "$ok" = y ] || [ "$ok" = Y ] || { echo "Nothing done."; exit 1; }
@@ -132,7 +151,7 @@ echo "  build     $BUILD_ID (map schema $SCHEMA, commit $(git rev-parse --short 
 echo "  get.sh    now VERSION=\"$VERSION\", SHA256 as above (uncommitted)"
 echo
 echo "To publish, in this order:"
-echo "  1. gh release create $VERSION $OUT --repo $REPO_SLUG --title $VERSION --notes '...'"
+echo "  1. gh release create $VERSION $OUT --repo $REPO_SLUG --target $HEAD_SHA --title $VERSION --notes-file $NOTES"
 echo "  2. curl -fsSL $ASSET_URL | shasum -a 256    # must print $SUM"
 echo "  3. git commit -m \"get.sh: $VERSION\" get.sh && git push"
 echo "To abandon: git checkout get.sh && rm $OUT"

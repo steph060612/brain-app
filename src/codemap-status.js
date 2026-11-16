@@ -176,7 +176,7 @@ export async function projectStatus(links, map, useGit) {
   };
 }
 
-// Why a status is not current, in words: "2 source files changed in ptdash", "ptdash is not in the map yet".
+// Why a status is not current, in words: "2 source files changed in web", "web is not in the map yet".
 export function statusReason(st) {
   const parts = [];
   for (const f of st.folders) {

@@ -7,7 +7,7 @@ const KIND_LABEL = { import: 'imports', require: 'requires', 're-export': 're-ex
   calls: 'calls', navigate: 'navigates to', 'calls-function': 'calls cloud function', reads: 'reads', writes: 'writes', 'read-by': 'is read by' };
 const PATH_KINDS = new Set([...IMPORT_KINDS, 'calls', 'navigate', 'calls-function', 'reads', 'writes']);
 
-// The folder a file is listed under; with several code folders, the code folder's name in front (ptdash:src).
+// The folder a file is listed under; with several code folders, the code folder's name in front (web:src).
 export const folderOf = f => (prefixed(f) ? `${f.codeFolder}:` : '') + (f.rootGroup !== 'app' ? f.rootGroup : f.topFolder === '(root)' ? '(root)' : f.topFolder);
 const firstLine = e => e.line ?? e.lines?.[0] ?? null;
 const nodeLabel = n => (n.kind === 'file' ? n.path : n.kind === 'subcollection' ? n.pattern : n.name);
@@ -67,7 +67,7 @@ const screenWord = name => `${String(name).startsWith('/') ? 'route' : 'screen'}
 const isScreenHow = how => how.startsWith('screen ') || how.startsWith('route ');
 
 // ─── web routes ──────────────────────────────────────────────────────────────
-// Does a path (/clients/123, or /clients/:id) match a route pattern (/clients/:clientUid)? 'exact', 'param'
+// Does a path (/orders/123, or /orders/:id) match a route pattern (/orders/:orderId)? 'exact', 'param'
 // (a parameter took a value) or null. The same rule as the mapper's.
 export function routeMatch(target, pattern) {
   const clean = p => String(p).split(/[?#]/)[0].replace(/(.)\/$/, '$1');
@@ -97,7 +97,7 @@ export function routesFor(screens, q) {
 // a screen, a collection, or a subcollection (name or path pattern). Functions and screens resolve to the file
 // that defines them, with a note.
 export function resolveEndpoint(map, q) {
-  // ptdash:src/x.js or ptdash:/clients: only that folder's files and screens.
+  // web:src/x.js or web:/orders: only that folder's files and screens.
   const scope = scopeQuery(map, String(q || '').trim());
   const inScope = x => !scope.folder || x.codeFolder === scope.folder;
   const files = map.nodes.filter(n => n.kind === 'file' && inScope(n));
@@ -109,7 +109,7 @@ export function resolveEndpoint(map, q) {
   const add = (node, how) => { if (!node) return; const h = hits.get(node.id); if (!h || (h.how === 'file' && isScreenHow(how))) hits.set(node.id, { node, how }); };
   if (!low) return [];
   const screens = (map.navigation?.screens || []).filter(inScope);
-  // A web path (/clients or /clients/123): the routes it matches, as screens.
+  // A web path (/orders or /orders/123): the routes it matches, as screens.
   if (low.startsWith('/')) {
     for (const s of routesFor(screens, q.trim())) add(files.find(f => f.path === s.file), screenWord(s.name));
     return [...hits.values()];
@@ -459,12 +459,12 @@ export function queryMap(map, question, { maxMatches = 5 } = {}) {
       cands.push({ key: `fn:${f.id}:${x}`, kind: 'function', label: `${x} (${f.path})`, node: f.id, fn: x, full: x, name: splitWords(x), path: segs.flatMap(splitWords), folder: segs[0] });
   }
   for (const s of map.navigation?.screens || []) if (s.file) {
-    // A web route: named by its path and its page (/clients/:clientUid → clients, client, uid + ClientDetailPage).
+    // A web route: named by its path and its page (/orders/:orderId → orders, order, id + OrderDetailPage).
     const page = s.route ? s.file.split('/').pop() : null;
     cands.push({ key: `screen:${s.name}:${s.file}`, kind: 'screen', label: `${s.route ? 'route' : 'screen'} ${s.name} (${s.file})`, node: s.file, screen: s.name, route: !!s.route,
       full: s.route ? page.replace(/\.[^.]+$/, '') : s.name, name: [...splitWords(s.name), ...(page ? splitWords(page) : [])], path: s.file.split('/').flatMap(splitWords), folder: s.file.split('/')[0] });
   }
-  // Paths written in the question (/clients/123) point at their routes directly.
+  // Paths written in the question (/orders/123) point at their routes directly.
   const asked = (question.match(/(^|\s)\/[^\s,;"'`]*/g) || []).map(x => x.trim());
   // Notes: their words count as path words (1, not 3 like a name), at three quarters.
   for (const n of map.notes || []) cands.push({ key: `note:${n.file}:${n.line}`, kind: 'note', label: `${n.tag} note in ${n.file}${n.function ? ` (${n.function})` : ''}, line ${n.line}: ${n.text.slice(0, 90)}${n.text.length > 90 ? '…' : ''}`, node: n.file, fn: n.function, full: '', name: [], path: splitWords(n.text), half: true });
