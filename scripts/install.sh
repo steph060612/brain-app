@@ -138,12 +138,14 @@ else
 fi
 
 step "Building the Brain app"
-if [ -f "$APP_DIR/dist/index.html" ]; then
-  # Shared folder already contains the built app: only the server's packages are needed.
+if "$NODE" "$APP_DIR/scripts/check-build.mjs" --quiet 2>/dev/null; then
+  # The package contains a build that matches its own map schema: only the server's packages are needed.
   ( cd "$APP_DIR" && "$NPM" ci --omit=dev --no-audit --no-fund )
 else
+  # No build, or one that reads a different map schema than this package's mapper: build it here.
   ( cd "$APP_DIR" && "$NPM" ci --no-audit --no-fund && "$NPM" run build )
 fi
+"$NODE" "$APP_DIR/scripts/check-build.mjs" || fail "the app build does not match its map schema. Send $STATE_DIR/brain-app.log to whoever gave you the Brain."
 
 step "Background jobs"
 mkdir -p "$AGENTS_DIR"
@@ -189,6 +191,8 @@ echo
 if [ "$UP" = no ]; then
   fail "the Brain app did not start. Send this file to whoever gave you the Brain: $STATE_DIR/brain-app.log"
 fi
+BRAIN_PORT="$PORT" "$NODE" "$APP_DIR/scripts/check-build.mjs" --live --quiet \
+  || fail "the running Brain app is not the build just installed. Send this file to whoever gave you the Brain: $STATE_DIR/brain-app.log"
 if [ "$MODE" = update ]; then
   echo "Updated. The Brain app is running at $URL"
   exit 0

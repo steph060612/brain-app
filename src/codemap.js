@@ -11,6 +11,7 @@ import { computeReport, callerTree, callIndex } from './map-report.js';
 import { isMulti, prefixed, folderNames } from './map-folders.js';
 
 import { SCHEMA_VERSION } from './map-schema.js';
+import { checkBuild } from './build-guard.js';
 const BG = '#05070F';
 let TOP = 96;             // below the toolbar; follows its height when it wraps
 const SIDE_W = 300;       // findings column and selection card
@@ -62,10 +63,14 @@ export function isCodeMapOpen() { return !!root && root.style.display !== 'none'
 
 // project: { slug, name }. Resolves after the map is shown; throws with a readable message otherwise.
 export async function openCodeMap(proj, { onBack } = {}) {
-  const r = await fetch(`/api/code/${encodeURIComponent(proj.slug)}/map`);
+  // An open page from before a rebuild reloads itself here instead of refusing a newer map.
+  const b = await checkBuild();
+  if (!b.ok) throw new Error(b.message);
+  const r = await fetch(`/api/code/${encodeURIComponent(proj.slug)}/map`, { cache: 'no-store' });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `Could not load the map (HTTP ${r.status}).`);
   if (data.schemaVersion !== SCHEMA_VERSION) {
+    // The page and server agree (checked above), so the map file itself is older or newer than both.
     throw new Error(`This map uses schema version ${data.schemaVersion ?? 'unknown'}; this app reads only version ${SCHEMA_VERSION}. Re-map the project to replace it.`);
   }
   build();

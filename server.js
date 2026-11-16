@@ -13,6 +13,10 @@ import { parseConversations as parseChatgptConversations, getConvDir as getChatg
 import { parseConversations as parseGeminiConversations, getConvDir as getGeminiConvDir } from './src/gemini-parser.js';
 import { parseProposals, toInboxFile, batchLines, readInboxBody, applyProposal, ACTIONS } from './src/proposals.js';
 import { registerCodeMapRoutes } from './src/codemap-routes.js';
+import { SCHEMA_VERSION } from './src/map-schema.js';
+import { buildProblem, readBuildInfo } from './src/build-check.js';
+import { existsSync } from 'fs';
+import { execFileSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -1572,11 +1576,49 @@ registerCodeMapRoutes(app, { gitAvailable });
 
 // ── STATIC ────────────────────────────────────────────────────────────────────
 
-// Serve the Vite production build; fall through to index.html for SPA
-app.use(express.static(join(__dirname, 'dist')));
-app.use((_req, res) =>
-  res.sendFile(join(__dirname, 'dist', 'index.html'))
-);
+// ── BUILD CHECK ───────────────────────────────────────────────────────────────
+// The page in the browser must come from a build that reads the same map schema as the mapper this server spawns
+// (both from this copy of the app). A stale or missing build is rebuilt here when Vite is installed (a development
+// copy); otherwise the app is not served at all, with a page and a log line saying why, instead of failing later
+// on a map. /api/version reports the build, and open pages reload themselves when it changes (src/build-guard.js).
+let BUILD_STALE = buildProblem(__dirname);
+if (BUILD_STALE) {
+  const vite = join(__dirname, 'node_modules', 'vite', 'bin', 'vite.js');
+  console.error(`[build] ${BUILD_STALE}`);
+  if (existsSync(vite)) {
+    console.error('[build] Rebuilding the app before serving it...');
+    try { execFileSync(process.execPath, [vite, 'build'], { cwd: __dirname, stdio: ['ignore', 'ignore', 'inherit'], timeout: 180_000 }); }
+    catch (e) { console.error(`[build] Rebuild failed: ${e.message}`); }
+    BUILD_STALE = buildProblem(__dirname);
+  }
+  if (BUILD_STALE) console.error(`[build] NOT SERVING THE APP: ${BUILD_STALE} Run \`npm run build\` in ${__dirname} (or reinstall), then restart.`);
+  else console.error('[build] Rebuilt; build and schema match.');
+}
+const BUILD = readBuildInfo(__dirname);
+if (!BUILD_STALE) console.log(`[build] serving build ${BUILD.id} (map schema ${SCHEMA_VERSION})`);
+
+app.get('/api/version', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ schemaVersion: SCHEMA_VERSION, buildId: BUILD?.id ?? null, buildSchemaVersion: BUILD?.schemaVersion ?? null,
+    builtAt: BUILD?.builtAt ?? null, appDir: __dirname, stale: BUILD_STALE });
+});
+
+if (BUILD_STALE) {
+  app.use((_req, res) => res.status(503).type('html').send(
+    `<!doctype html><meta charset="utf-8"><title>Brain app</title><body style="font:15px system-ui;padding:40px;max-width:640px">` +
+    `<h2>The Brain app needs to be rebuilt</h2><p>${BUILD_STALE.replace(/</g, '&lt;')}</p>` +
+    `<p>Run <code>npm run build</code> in <code>${__dirname}</code>, then restart the app.</p>`));
+}
+
+// Serve the Vite production build; fall through to index.html for SPA. index.html is always revalidated so a reload
+// gets the current bundle; the hashed bundle files never change and can be cached.
+app.use(express.static(join(__dirname, 'dist'), {
+  setHeaders: (res, p) => res.set('Cache-Control', p.endsWith('.html') || p.endsWith('build-info.json') ? 'no-cache' : 'public, max-age=31536000, immutable'),
+}));
+app.use((_req, res) => {
+  res.set('Cache-Control', 'no-cache');
+  res.sendFile(join(__dirname, 'dist', 'index.html'));
+});
 
 recoverInterruptedRuns();
 

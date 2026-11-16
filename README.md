@@ -10,15 +10,26 @@ The server starts automatically at login via a macOS LaunchAgent and restarts if
 
 ## After code changes
 
-Run these commands in order:
-
 ```sh
 cd ~/Projects/brain-app
-npm run build
-launchctl kickstart -k gui/$(id -u)/com.steph.brain-app
+npm run restart
 ```
 
-`npm run build` compiles the frontend into `dist/`. The kickstart command replaces the running process with the updated one.
+This builds the frontend into `dist/`, restarts the LaunchAgent that runs this folder's `server.js` (on this Mac
+`com.steph.brain-app`; an installed copy in `~/.brain/app` is `com.brain.app` and is updated by the installer), and
+then checks the running app: it must run from this folder, serve the build just made, and read the same map schema as
+`src/map-schema.js`. Any mismatch fails with a ✗ message and a non-zero exit; "Restarted and verified" is the only
+success. `npm run check-build` runs the same check without rebuilding.
+
+How the parts stay in step:
+- **Mapper and server:** the server spawns `src/mapper.js` from its own folder, and both import the version from
+  `src/map-schema.js`.
+- **Server and browser bundle:** every build writes `dist/build-info.json` with a build id and its schema, and bakes
+  the same id into the bundle. At startup the server refuses a build whose schema differs. It rebuilds the build
+  itself when Vite is installed; otherwise it serves a "needs to be rebuilt" page instead of the app.
+- **An open page and the server:** `/api/version` reports the server's build id. An open page compares it with its
+  own at start, when the window comes back into view, and before opening a map, and reloads itself when they differ.
+  A page left open across a rebuild never refuses a newer map. `index.html` is served with `no-cache`.
 
 ## Log
 

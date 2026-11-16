@@ -8,8 +8,10 @@ import { initDistill } from './distill.js';
 import { initImport } from './import.js';
 import { initList } from './list.js';
 import { fetchItems } from './api.js';
+import { watchBuild } from './build-guard.js';
 
 async function boot() {
+  watchBuild();
   initPanel();
   initTopbar();
   initInbox();

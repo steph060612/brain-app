@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "concurrently --names vite,api --prefix-colors cyan,yellow \"vite\" \"node server.js\"",
     "api": "node server.js",
-    "build": "vite build",
-    "preview": "vite preview"
+    "build": "vite build && node scripts/check-build.mjs",
+    "preview": "vite preview",
+    "restart": "node scripts/restart.mjs",
+    "check-build": "node scripts/check-build.mjs --live"
   },
   "devDependencies": {
     "sharp": "^0.35.5",
