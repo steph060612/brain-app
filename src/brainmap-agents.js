@@ -14,12 +14,21 @@ export const FILES = ['CLAUDE.md', 'AGENTS.md'];
 // when the app made it and nothing else was added since. A file that existed before is never deleted.
 export const start = created => `<!-- brainmap:start created-file=${created ? 'yes' : 'no'} (added by the Brain app, "Enable for assistants"; remove it there or delete this block) -->`;
 export const END = '<!-- brainmap:end -->';
-export const block = created => `${start(created)}
+// env (src/assistant-env.js) says whether Claude Code is installed and how `brainmap` is run. With Claude Code the
+// block names its tools first (it has them as mcp__brainmap__*); without it (Codex and others) it names only the
+// command, as a full path when `brainmap` does not run by name. No env means Claude Code is present.
+const CLAUDE_ENV = { claude: true, brainmapCommand: 'brainmap' };
+export const block = (created, env = CLAUDE_ENV) => (env.claude ? `${start(created)}
 ## Code map: use brainmap first
 - For questions about how this code fits together (who calls, uses or depends on what, where something happens), use the brainmap tools (mcp__brainmap__*) or the \`brainmap\` command before searching the repository.
 - Start with \`report\` or \`overview\`; for a question in words, use \`query\`.
 - The tool list or \`brainmap help\` shows the rest. The map covers JavaScript and TypeScript, is read-only and refreshes itself.
-${END}`;
+${END}` : `${start(created)}
+## Code map: use brainmap first
+- For questions about how this code fits together (who calls, uses or depends on what, where something happens), run \`${env.brainmapCommand} overview\` in a shell before searching the repository.
+- Then the matching command: \`${env.brainmapCommand} query "<question in words>"\`, \`${env.brainmapCommand} impact <file>\`, \`${env.brainmapCommand} callers <function>\`, \`${env.brainmapCommand} collection <name>\`, \`${env.brainmapCommand} report\`.
+- \`${env.brainmapCommand} help\` lists every command. The map covers JavaScript and TypeScript, is read-only and refreshes itself.
+${END}`);
 
 const BLOCK_RE = /\n*<!-- brainmap:start[^\n]*-->[\s\S]*?<!-- brainmap:end -->[ \t]*\n?/g;
 const ONE_BLOCK_RE = /<!-- brainmap:start[^\n]*-->[\s\S]*?<!-- brainmap:end -->/;
@@ -71,7 +80,9 @@ function withOneBlock(text, current) {
 
 // What Enable would do to each file: create it, add the block, update an existing block, or nothing.
 // When CLAUDE.md is a link to AGENTS.md (or the reverse), the shared file gets the block once.
-async function plan(folder) {
+// Without Claude Code only AGENTS.md is written: CLAUDE.md is never created, and an existing one is left as it is
+// ('no-claude'), though Remove still takes out a block found in it.
+async function plan(folder, env = CLAUDE_ENV) {
   const files = [];
   for (const name of FILES) files.push(await read(folder, name));
   const neither = files.every(f => f.text === null);
@@ -83,17 +94,19 @@ async function plan(folder) {
     const enabled = hasBlock(f.text);
     let action, created, after = null;
     if (shared) { action = 'shared'; created = false; }
+    else if (!env.claude && f.name === 'CLAUDE.md') { action = 'no-claude'; created = enabled && createdByApp(f.text); }
     else if (!exists) {
-      action = neither ? 'create' : 'skip';
+      const make = neither || (!env.claude && f.name === 'AGENTS.md');
+      action = make ? 'create' : 'skip';
       created = true;
-      if (neither) after = `${block(true)}\n`;
+      if (make) after = `${block(true, env)}\n`;
     } else if (enabled) {
       created = createdByApp(f.text);
-      after = withOneBlock(f.text, block(created)); // keeps this file's marker
+      after = withOneBlock(f.text, block(created, env)); // keeps this file's marker
       action = after === f.text ? 'current' : 'update';
     } else {
       created = false;
-      after = f.text.trim() ? `${f.text}${f.text.endsWith('\n') ? '' : '\n'}\n${block(false)}\n` : `${f.text}${block(false)}\n`;
+      after = f.text.trim() ? `${f.text}${f.text.endsWith('\n') ? '' : '\n'}\n${block(false, env)}\n` : `${f.text}${block(false, env)}\n`;
       action = 'add';
     }
     const rest = enabled && !shared ? removed(f.text) : null;
@@ -112,8 +125,8 @@ function checkUnchanged(files, expect) {
   if (changed.length) throw fail(409, `${changed.join(' and ')} changed since the preview. Review the text again.`);
 }
 
-export async function assistantsPreview(folder) {
-  const files = await plan(folder);
+export async function assistantsPreview(folder, env = CLAUDE_ENV) {
+  const files = await plan(folder, env);
   const work = files.filter(f => ['create', 'add', 'update'].includes(f.action));
   return {
     enabled: files.some(f => f.enabled),
@@ -121,15 +134,15 @@ export async function assistantsPreview(folder) {
     files: files.map(f => ({
       name: f.name, path: tilde(f.path), exists: f.exists, enabled: f.enabled, action: f.action, sharedWith: f.sharedWith,
       createdByApp: f.enabled ? createdByApp(f.text) : f.action === 'create',
-      text: ['create', 'add', 'update'].includes(f.action) ? block(f.created) : null,
+      text: ['create', 'add', 'update'].includes(f.action) ? block(f.created, env) : null,
       removeDeletes: f.removeDeletes, removeLeavesEmpty: f.removeLeavesEmpty,
     })),
     expect: expectOf(files),
   };
 }
 
-export async function enableAssistants(folder, expect) {
-  const files = await plan(folder);
+export async function enableAssistants(folder, expect, env = CLAUDE_ENV) {
+  const files = await plan(folder, env);
   checkUnchanged(files, expect);
   const done = [];
   for (const f of files) {
@@ -140,8 +153,8 @@ export async function enableAssistants(folder, expect) {
   return { ok: true, files: done };
 }
 
-export async function removeAssistants(folder, expect) {
-  const files = await plan(folder);
+export async function removeAssistants(folder, expect, env = CLAUDE_ENV) {
+  const files = await plan(folder, env);
   checkUnchanged(files, expect);
   const done = [];
   for (const f of files) {

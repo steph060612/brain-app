@@ -272,6 +272,7 @@ const ACTION_TEXT = {
   update: 'already has a brainmap block in older wording; it is replaced in place by the text below.',
   current: 'already has the current block; nothing changes.',
   skip: 'does not exist and is not created, because the other file exists.',
+  'no-claude': 'is not written: Claude Code is not installed on this Mac. Codex and other assistants read AGENTS.md.',
 };
 
 // The block goes into every linked folder; each folder's files are listed (and removed) on their own.
@@ -303,7 +304,9 @@ function renderAgents() {
     const label = list => (several ? list.map(x => `${x.F.name} (${fileNames(x.names)})`).join(', ') : fileNames(list[0]?.names || []));
     const okLabel = enable ? `Write to ${label(changing)}` : `Remove from ${label(removing)}`;
     box.innerHTML = `<div style="border:1px solid rgba(100,120,200,0.22); border-radius:6px; padding:8px 10px; font-size:11.5px; color:#c8d0e8;">
-        <div>${enable ? `Claude Code reads CLAUDE.md by itself and other assistants read AGENTS.md, so the block goes into each${several ? ', in every linked folder' : ''}.` : `Only the marked block is taken out${several ? ', in each folder according to what that folder\'s files record' : ''}.`} Nothing is committed.</div>
+        <div>${enable ? (agents.env?.claude === false
+          ? `Claude Code is not installed, so only AGENTS.md gets the block${several ? ', in every linked folder' : ''}. It tells Codex and other assistants to run ${agents.env.brainmapOnPath ? 'the brainmap command' : 'brainmap by its full path (it is not on your PATH)'}.`
+          : `Claude Code reads CLAUDE.md by itself and other assistants read AGENTS.md, so the block goes into each${several ? ', in every linked folder' : ''}.`) : `Only the marked block is taken out${several ? ', in each folder according to what that folder\'s files record' : ''}.`} Nothing is committed.</div>
         ${rows}
         <div style="display:flex; gap:6px; align-items:center; margin-top:8px">
           <button class="cm-agents-ok" style="${BTN}">${esc(okLabel)}</button>
@@ -321,7 +324,7 @@ function renderAgents() {
         <span>in ${esc(several ? where.map(x => `${x.F.name}: ${fileNames(x.names)}`).join('; ') : fileNames(where[0]?.names || []))}</span>
         ${agents.upToDate ? '' : `<button class="cm-agents-enable" style="${LINK} font-size:11px">Update</button>`}
         <button class="cm-agents-remove" style="${LINK} font-size:11px; color:#8090b0">Remove</button></div>`
-    : `<button class="cm-agents-enable" style="${BTN2}" title="Adds a short block to the CLAUDE.md and AGENTS.md of ${several ? 'every linked folder' : 'the project'} that tells coding assistants to use the brainmap command">Enable for assistants</button>`;
+    : `<button class="cm-agents-enable" style="${BTN2}" title="Adds a short block to the ${agents.env?.claude === false ? 'AGENTS.md' : 'CLAUDE.md and AGENTS.md'} of ${several ? 'every linked folder' : 'the project'} that tells coding assistants to use the brainmap command">Enable for assistants</button>`;
   box.querySelector('.cm-agents-enable')?.addEventListener('click', () => askAgents('enable'));
   box.querySelector('.cm-agents-remove')?.addEventListener('click', () => askAgents('remove'));
   renderStrict(box);
@@ -332,6 +335,9 @@ function renderAgents() {
 // JSON) is skipped with its reason. Each folder is restored on its own by Remove.
 function renderStrict(box) {
   if (!strict) return;
+  // Strict mode is a Claude Code hook: without Claude Code it is not offered, unless it is already on (then only
+  // its status and Remove are shown).
+  if (strict.claude === false && !(strict.folders || []).some(F => F.enabled)) return;
   const row = document.createElement('div');
   row.style.cssText = 'margin-top:6px;';
   const folders = strict.folders || [];

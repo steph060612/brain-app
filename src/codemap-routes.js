@@ -13,6 +13,7 @@ import {
 } from './codemap-status.js';
 import { assistantsPreview, enableAssistants, removeAssistants } from './brainmap-agents.js';
 import { strictPreview, enableStrict, removeStrict } from './brainmap-strict.js';
+import { assistantEnv } from './assistant-env.js';
 
 const SLUG_RE  = /^[a-z0-9][a-z0-9-]*$/;
 const send = (res, e) => res.status(e.status || 500).json({ error: e.message });
@@ -246,10 +247,12 @@ export function registerCodeMapRoutes(app, { gitAvailable }) {
     if (!f.length) throw fail(404, `No linked folder named ${name}.`);
     return f;
   };
-  const previewAll = async folders => {
+  // env: is Claude Code installed, and how does `brainmap` run? It decides which files get the block and its wording.
+  const previewAll = async (folders, env) => {
+    env ||= await assistantEnv();
     const out = [];
-    for (const f of folders) out.push({ name: f.name, display: tilde(f.path), ...(await assistantsPreview(f.path)) });
-    return { folders: out, enabled: out.some(f => f.enabled), upToDate: out.every(f => f.upToDate), expect: Object.fromEntries(out.map(f => [f.name, f.expect])) };
+    for (const f of folders) out.push({ name: f.name, display: tilde(f.path), ...(await assistantsPreview(f.path, env)) });
+    return { env, folders: out, enabled: out.some(f => f.enabled), upToDate: out.every(f => f.upToDate), expect: Object.fromEntries(out.map(f => [f.name, f.expect])) };
   };
   app.get('/api/code/:slug/assistants', async (req, res) => {
     try { res.json(await previewAll(await validFolders(slugOf(req)))); } catch (e) { send(res, e); }
@@ -259,11 +262,11 @@ export function registerCodeMapRoutes(app, { gitAvailable }) {
       try {
         const folders = pick(await validFolders(slugOf(req)), req.body?.folder);
         // Every folder is checked against its preview before anything is written in any of them.
-        const now = await previewAll(folders);
+        const now = await previewAll(folders, await assistantEnv());
         const changed = now.folders.filter(f => JSON.stringify(f.expect) !== JSON.stringify(req.body?.expect?.[f.name])).map(f => f.name);
         if (changed.length) throw fail(409, `${changed.join(' and ')}: the files changed since the preview. Review the text again.`);
         const done = [];
-        for (const f of folders) done.push({ name: f.name, ...(await act(f.path, req.body.expect[f.name])) });
+        for (const f of folders) done.push({ name: f.name, ...(await act(f.path, req.body.expect[f.name], now.env)) });
         res.json({ ok: true, folders: done, files: done.flatMap(d => d.files.map(x => ({ ...x, folder: d.name }))) });
       } catch (e) { send(res, e); }
     });
@@ -275,7 +278,8 @@ export function registerCodeMapRoutes(app, { gitAvailable }) {
   const strictAll = async folders => {
     const out = [];
     for (const f of folders) out.push({ name: f.name, display: tilde(f.path), ...(await strictPreview(f.path)) });
-    return { folders: out, enabled: out.some(f => f.enabled), allEnabled: out.every(f => f.enabled || f.refused),
+    // claude: strict mode is a Claude Code hook; the panel offers it only when Claude Code is installed.
+    return { claude: (await assistantEnv()).claude, folders: out, enabled: out.some(f => f.enabled), allEnabled: out.every(f => f.enabled || f.refused),
       expect: Object.fromEntries(out.map(f => [f.name, f.expect])) };
   };
   app.get('/api/code/:slug/strict', async (req, res) => {

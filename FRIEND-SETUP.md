@@ -16,7 +16,18 @@ The Brain is a folder of plain notes on your Mac (`~/Brain`) that any AI assista
 3. Type your first name when asked.
 4. Safari opens the Brain app. Keep it: File > Add to Dock.
 
-macOS may show "Background Items Added": that is the app starting at login, leave it on. If it offers to install developer tools, accept; it enables local backups. The same line later updates the app without touching your brain.
+macOS may show "Background Items Added": that is the app starting at login, leave it on. If it offers to install developer tools, accept; it enables local backups.
+
+The installer says which Node it uses. If your Mac already has a recent one (22.18 or newer, or 24.11 or newer) it uses that; otherwise it downloads its own copy into `~/.brain/node` and leaves yours alone. It also puts the `brainmap` and `brainpack` commands in `~/.local/bin` and, if a new Terminal window would not find them, adds that folder to your PATH in `~/.zprofile` (it says so when it does).
+
+## Update
+Paste the same line again in Terminal:
+```sh
+curl -fsSL https://raw.githubusercontent.com/steph060612/brain-app/main/get.sh | bash
+```
+It sees the existing install and updates the app only. Your brain (`~/Brain`), your settings (`~/.brain/config`), your imports and packs are not touched, and it does not ask for your name again. It ends with "Updated. The Brain app is running at …". Reload any open Brain app window (the app also reloads itself the next time you open a map).
+
+If you installed before 10 November and running the line says `~/Brain already exists and was not made by this installer`, stop and send that message: nothing was changed.
 
 ## First session: fill your brain
 1. In the app, click **Copy setup interview** (top bar; it shows only while you have no projects).
@@ -37,6 +48,16 @@ Use **Copy project only** when the chat already has your pack and you only need 
 - Only facts you stated or confirmed go in. The assistant proposes, you approve.
 - Never store passwords, card or account numbers, ID numbers or balances.
 - Your brain is yours: it is not shared with anyone and has no online backup unless you add a private GitHub repository yourself.
+
+## Code map, for coding with Codex
+If you write JavaScript or TypeScript, the Brain app can map a project so Codex answers structure questions (who calls this, what breaks if I change that) from the map instead of searching every file.
+1. Open the project in the app (it needs a project in your brain first), click **Link code folder**, type the folder's path (for example `~/Projects/my-app`) and click **Link**, then **Map project**. **View map** shows it as a diagram.
+2. Click **Enable for assistants**. It shows the exact text first, then adds a short marked block to the folder's `AGENTS.md`, which Codex reads. Without Claude Code on your Mac it writes only `AGENTS.md` (never `CLAUDE.md`), and the block tells Codex to run `brainmap overview`, `brainmap query "..."` and the other commands in a shell. Nothing is committed; **Remove** takes the block out again.
+3. In a new Terminal window, `brainmap help` lists the commands. Run them inside the code folder.
+
+Two features are Claude Code only and are not offered without it: **strict mode** (a Claude Code hook that sends the first code search of a session to the map) and the **brainmap tool server** (map tools registered inside Claude Code). With Codex you use the `brainmap` command instead.
+
+Codex may run commands in a sandbox that cannot write outside your project. Then `brainmap` cannot refresh a map after code changes and answers from the last map, saying so; click **Re-map** in the app to refresh it.
 
 ## Optional, to check on install day
 - **Codex** (included with ChatGPT plans) can let the app turn pasted free text or exported chats into suggestions (Distill). The app offers Codex only if `codex` is installed, signed in, and passes a one-time test when the app starts.

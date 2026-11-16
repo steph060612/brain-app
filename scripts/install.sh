@@ -57,16 +57,40 @@ else
 fi
 
 step "Checking tools"
+# The code mapper's parser (@babel/parser 8) needs Node ^22.18.0 || >=24.11.0. A Node on the Mac that does not meet
+# that is left alone and a private copy in ~/.brain/node is used instead, on first install and on update.
+NODE_NEED="22.18 or newer in the 22 line, or 24.11 or newer"
+node_fits() {
+  local v; v="$("$1" -p 'process.versions.node' 2>/dev/null)" || return 1
+  local major="${v%%.*}" rest="${v#*.}"; local minor="${rest%%.*}"
+  [ "$major" -eq 22 ] && [ "$minor" -ge 18 ] && return 0
+  [ "$major" -eq 24 ] && [ "$minor" -ge 11 ] && return 0
+  [ "$major" -ge 25 ] && return 0
+  return 1
+}
 NODE_DIR="$STATE_DIR/node"
-NODE="$(command -v node || true)"
-if [ -n "$NODE" ] && [ "$("$NODE" -p 'process.versions.node.split(".")[0]')" -ge 20 ]; then
-  echo "Using Node $("$NODE" -v) already on this Mac."
-elif [ -x "$NODE_DIR/bin/node" ]; then
-  NODE="$NODE_DIR/bin/node"; echo "Using Node from a previous install."
-else
+NODE=""
+SYS_NODE="$(command -v node || true)"
+if [ -n "$SYS_NODE" ] && node_fits "$SYS_NODE"; then
+  NODE="$SYS_NODE"
+  echo "Using Node $("$NODE" -v) already on this Mac ($NODE): it meets the minimum ($NODE_NEED)."
+elif [ -n "$SYS_NODE" ]; then
+  echo "Node $("$SYS_NODE" -v 2>/dev/null || echo '(unreadable)') on this Mac ($SYS_NODE) is too old for the code map, which needs $NODE_NEED."
+  echo "It is not changed; the Brain uses its own copy in $NODE_DIR instead."
+fi
+if [ -z "$NODE" ] && [ -x "$NODE_DIR/bin/node" ]; then
+  if node_fits "$NODE_DIR/bin/node"; then
+    NODE="$NODE_DIR/bin/node"; echo "Using the Brain's own Node $("$NODE" -v) from a previous install ($NODE)."
+  else
+    echo "The Brain's own Node $("$NODE_DIR/bin/node" -v) from a previous install is too old ($NODE_NEED is needed); replacing it."
+    rm -rf "$NODE_DIR"
+  fi
+fi
+if [ -z "$NODE" ]; then
   # Private copy of Node inside ~/.brain: no Homebrew, no password, nothing installed system-wide.
   case "$(uname -m)" in arm64) ARCH=arm64 ;; x86_64) ARCH=x64 ;; *) fail "unsupported processor $(uname -m)." ;; esac
-  echo "Downloading Node (about 50 MB)..."
+  [ -n "$SYS_NODE" ] || echo "No Node on this Mac."
+  echo "Downloading the Brain's own copy of Node (about 50 MB)..."
   BASE="https://nodejs.org/dist/latest-v22.x"
   LINE="$(curl -fsSL --retry 5 --retry-delay 3 --connect-timeout 20 "$BASE/SHASUMS256.txt" | grep -E " node-v[0-9.]+-darwin-$ARCH\.tar\.gz$" | head -1)" || fail "could not reach nodejs.org."
   SUM="${LINE%% *}"; FILE="${LINE##* }"
@@ -77,7 +101,8 @@ else
   tar -xzf "$TMP/$FILE" -C "$NODE_DIR" --strip-components 1
   rm -rf "$TMP"
   NODE="$NODE_DIR/bin/node"
-  echo "Node $("$NODE" -v) ready."
+  node_fits "$NODE" || fail "the downloaded Node $("$NODE" -v) does not meet the minimum ($NODE_NEED)."
+  echo "Using the Brain's own Node $("$NODE" -v) ($NODE)."
 fi
 NPM="$(dirname "$NODE")/npm"
 [ -x "$NPM" ] || NPM="$(command -v npm || true)"
@@ -122,12 +147,39 @@ cp "$APP_DIR/scripts/brainpack.sh" "$APP_DIR/scripts/autocommit.sh" "$STATE_DIR/
 chmod +x "$STATE_DIR/brainpack.sh" "$STATE_DIR/autocommit.sh"
 /usr/bin/sed -e "s|__NODE__|$NODE|" -e "s|__APP_DIR__|$APP_DIR|" "$APP_DIR/scripts/brainmap.sh" > "$STATE_DIR/brainmap.sh"
 chmod +x "$STATE_DIR/brainmap.sh"
-for bin in /opt/homebrew/bin /usr/local/bin; do
-  if [ -d "$bin" ] && [ -w "$bin" ]; then
-    ln -sf "$STATE_DIR/brainpack.sh" "$bin/brainpack"; ln -sf "$STATE_DIR/brainmap.sh" "$bin/brainmap"
-    echo "brainpack and brainmap commands linked in $bin."; break
+# The brainmap and brainpack commands go in ~/.local/bin, which is always writable (no Homebrew, no password).
+# If a new login shell would not find them there, ~/.local/bin is added to the PATH in the shell's profile.
+BIN_DIR="$HOME/.local/bin"
+if mkdir -p "$BIN_DIR" 2>/dev/null && ln -sf "$STATE_DIR/brainpack.sh" "$BIN_DIR/brainpack" && ln -sf "$STATE_DIR/brainmap.sh" "$BIN_DIR/brainmap"; then
+  echo "brainmap and brainpack commands installed in $BIN_DIR."
+else
+  echo "Could not install the brainmap and brainpack commands in $BIN_DIR. They still work by full path: $STATE_DIR/brainmap.sh"
+fi
+# BRAIN_LOGIN_SHELL overrides the shell checked (the installer test uses it to isolate a test home).
+LOGIN_SHELL="${BRAIN_LOGIN_SHELL:-$(dscl . -read "/Users/$(id -un)" UserShell 2>/dev/null | awk '{print $2}')}"
+[ -n "$LOGIN_SHELL" ] || LOGIN_SHELL="${SHELL:-/bin/zsh}"
+# Not finding it is an answer, not an error (the installer runs with set -e and pipefail).
+found_in_shell() { { "$LOGIN_SHELL" -lc 'command -v brainmap' 2>/dev/null </dev/null || true; } | tail -1; }
+FOUND="$(found_in_shell)"
+if [ -n "$FOUND" ]; then
+  echo "A new Terminal window finds brainmap at $FOUND."
+else
+  case "$(basename "$LOGIN_SHELL")" in
+    zsh) PROFILE="$HOME/.zprofile" ;;
+    bash) PROFILE="$HOME/.bash_profile" ;;
+    *) PROFILE="" ;;
+  esac
+  if [ -z "$PROFILE" ]; then
+    echo "Your shell is $LOGIN_SHELL, which this installer does not set up. To run brainmap by name, add $BIN_DIR to your PATH yourself."
+  elif { printf '\n# Added by the Brain installer: commands in ~/.local/bin (brainmap, brainpack)\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$PROFILE"; } 2>/dev/null; then
+    echo "Added $BIN_DIR to your PATH in $PROFILE (two lines at the end, marked \"Added by the Brain installer\")."
+    FOUND="$(found_in_shell)"
+    if [ -n "$FOUND" ]; then echo "New Terminal windows now find brainmap at $FOUND (this window does not; open a new one)."
+    else echo "A new Terminal window still does not find brainmap. Run it by full path: $STATE_DIR/brainmap.sh"; fi
+  else
+    echo "Could not write to $PROFILE. To run brainmap by name, add this line to it yourself: export PATH=\"\$HOME/.local/bin:\$PATH\""
   fi
-done
+fi
 # Code map tools for Claude Code (user scope: every project, no project files touched). Re-added on update so
 # the path stays current. Remove with: bash install.sh --remove-assistant-tools
 if command -v claude >/dev/null 2>&1; then
