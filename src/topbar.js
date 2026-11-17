@@ -34,21 +34,44 @@ export function initTopbar() {
     text: CLOSE_SESSION_PROMPT,
   }), gitTime);
 
-  // Fetch git log once and display
-  fetchGitLog().then(({ lastCommit }) => {
+  // Last commit time, and a failing automatic save as a banner under the bar. Refreshed when the window comes back
+  // into view and every 5 minutes, so a backup that starts failing while the app is open still shows up.
+  refreshGitStatus();
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refreshGitStatus(); });
+  setInterval(refreshGitStatus, 5 * 60_000);
+}
+
+const fmtTime = iso => new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+function refreshGitStatus() {
+  fetchGitLog().then(({ lastCommit, backupProblem }) => {
     const el = document.getElementById('git-time');
-    if (!el) return;
-    if (lastCommit) {
-      const d = new Date(lastCommit);
-      const fmt = d.toLocaleString(undefined, {
-        month: 'short', day: 'numeric',
-        hour: '2-digit', minute: '2-digit',
-      });
-      el.textContent = `Last commit ${fmt}`;
-    } else {
-      el.textContent = '';
-    }
+    if (el) el.textContent = lastCommit ? `Last commit ${fmtTime(lastCommit)}` : '';
+    showBackupProblem(backupProblem);
   }).catch(() => {});
+}
+
+// A red banner under the top bar while the last automatic save failed; gone once a save succeeds again.
+function showBackupProblem(problem) {
+  let banner = document.getElementById('backup-alert');
+  if (!problem) { banner?.remove(); return; }
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'backup-alert';
+    banner.setAttribute('role', 'alert');
+    document.body.appendChild(banner);
+  }
+  const since = problem.since ? ` since ${fmtTime(problem.since)}` : '';
+  banner.replaceChildren();
+  const title = document.createElement('strong');
+  title.textContent = `Your brain is not being saved: automatic saves have failed${since}.`;
+  const detail = document.createElement('div');
+  detail.className = 'backup-alert-detail';
+  detail.textContent = problem.message || 'No details were recorded.';
+  const where = document.createElement('div');
+  where.className = 'backup-alert-where';
+  where.textContent = 'Full history: ~/.brain/autocommit.log. This message goes away after the next save that works.';
+  banner.append(title, detail, where);
 }
 
 // The setup interview is offered only while the brain has no projects yet.

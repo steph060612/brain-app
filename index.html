@@ -47,6 +47,15 @@
       #topbar::-webkit-scrollbar { display: none; }
       #topbar > * { flex-shrink: 0; }
       #git-time { white-space: nowrap; }
+      /* A failing automatic save (src/topbar.js): always visible, at every width. */
+      #backup-alert {
+        position: fixed; top: 44px; left: 0; right: 0; z-index: 39;
+        padding: 8px 18px; max-height: 40vh; overflow-y: auto;
+        background: #5a1218; border-bottom: 1px solid #c0303c; color: #ffe3e5;
+        font: 13px/1.4 system-ui, -apple-system, sans-serif;
+      }
+      #backup-alert .backup-alert-detail { margin-top: 4px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; white-space: pre-wrap; color: #ffc9ce; }
+      #backup-alert .backup-alert-where { margin-top: 4px; font-size: 11px; color: #e8a2a8; }
       @media (max-width: 1150px) { #topbar .btn-hint { display: none; } #topbar { gap: 10px; } }
       @media (max-width: 860px)  { #search-input { width: 110px; } #git-time { display: none; } #topbar { gap: 8px; padding: 0 10px; } }
     </style>

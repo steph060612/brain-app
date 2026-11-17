@@ -2,6 +2,8 @@
 # Brain: download and install (or update) in one line, from Terminal:
 #   curl -fsSL https://raw.githubusercontent.com/steph060612/brain-app/main/get.sh | bash
 # Downloads a fixed, tested release (not the latest code), checks it, then runs its installer.
+# Arguments go to the installer, for example to keep the brain in another folder (releases after v0.2.0):
+#   curl -fsSL https://raw.githubusercontent.com/steph060612/brain-app/main/get.sh | bash -s -- --brain ~/Notes/brain
 set -euo pipefail
 
 VERSION="v0.2.0"

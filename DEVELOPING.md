@@ -63,7 +63,15 @@ the `gh release create` command, with `--target` set to the commit and your note
 
 To test the installer without touching your own setup, run it with `HOME` set to an empty folder and a minimal `PATH`.
 `BRAIN_LOGIN_SHELL` makes the installer and the app ask a different login shell whether `brainmap` and `claude` are
-on the PATH, so a test shell can stand in for a Mac without Homebrew or Claude Code.
+on the PATH, so a test shell can stand in for a Mac without Homebrew or Claude Code. Put a stand-in `launchctl`
+first on that `PATH` (and keep `claude` off it): the real one loads the test home's LaunchAgents into your own login
+session. A stand-in that starts `server.js` with the plist's `BRAIN_PORT` and `BRAIN_DIR` lets the installer's live
+check run; give the started server its own stdin, stdout and stderr, or the installer's output pipe stays open.
+
+The brain folder comes from `src/brain-dir.js`: `BRAIN_DIR` in the environment (the LaunchAgent sets it), else
+`BRAIN_DIR` in `~/.brain/config`, else `~/Brain`. `scripts/autocommit.sh` writes every run's outcome to
+`~/.brain/autocommit.log` and the latest one to `~/.brain/autocommit-status` (outcome, time, start of the current
+failures, git's message); `/api/gitlog` returns a failure as `backupProblem` and the page shows it as a red banner.
 
 ## Code maps
 

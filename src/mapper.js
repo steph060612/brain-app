@@ -15,6 +15,7 @@ import { parse } from '@babel/parser';
 import { detectGroups, nameGroups, SEED as GROUP_SEED, WEIGHTS as GROUP_WEIGHTS } from './map-groups.js';
 
 import { SCHEMA_VERSION } from './map-schema.js';
+import { BRAIN as BRAIN_DIR, BRAIN_LABEL } from './brain-dir.js';
 const IMPORT_KINDS = ['import', 're-export', 'require', 'dynamic'];
 const KINDS = {
   nodes: ['file', 'collection', 'subcollection'],
@@ -1815,13 +1816,13 @@ function main() {
   if (!outName) usage();
   if (!/^[A-Za-z0-9._-]+$/.test(outName) || outName === '.' || outName === '..') usage('Output name may only use letters, digits, dot, dash and underscore.');
   const outDir = path.join(os.homedir(), '.brain', 'maps', outName);
-  const brainDir = path.join(os.homedir(), 'Brain');
+  const brainDir = BRAIN_DIR;
   const inside = (p, dir) => p === dir || p.startsWith(dir + path.sep);
   const folders = specs.map((f) => {
     const root = path.resolve(f.dir.replace(/^~(?=$|\/)/, os.homedir()));
     if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) usage(`Not a folder: ${root}`);
     if (inside(outDir, root)) usage('Refusing to write inside the project folder.');
-    if (inside(outDir, brainDir)) usage('Refusing to write inside ~/Brain.');
+    if (inside(outDir, brainDir)) usage(`Refusing to write inside the brain (${BRAIN_LABEL}).`);
     const name = f.name ?? defaultFolderName(root);
     if (!FOLDER_NAME_RE.test(name) || RESERVED_FOLDER_NAMES.has(name)) usage(`Folder name "${name}": use up to 24 lower-case letters, digits, dash or underscore (not collection or subcollection).`);
     return { name, root };

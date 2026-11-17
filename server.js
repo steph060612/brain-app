@@ -1,5 +1,5 @@
-// Local API server — reads and writes ~/Brain .md files.
-// Listens only on localhost. Brain content stays in ~/Brain; app state (staging, packs, code maps) in ~/.brain.
+// Local API server — reads and writes the brain's .md files (~/Brain, or the folder chosen at install: src/brain-dir.js).
+// Listens only on localhost. Brain content stays in the brain folder; app state (staging, packs, code maps) in ~/.brain.
 import express from 'express';
 import { readdir, readFile, writeFile, stat, access, unlink, mkdir, rm, rename } from 'fs/promises';
 import { resolve, join, sep, extname, basename, dirname, relative } from 'path';
@@ -16,6 +16,7 @@ import { registerCodeMapRoutes } from './src/codemap-routes.js';
 import { SCHEMA_VERSION } from './src/map-schema.js';
 import { buildProblem, readBuildInfo } from './src/build-check.js';
 import { existsSync } from 'fs';
+import { BRAIN, BRAIN_LABEL } from './src/brain-dir.js';
 import { execFileSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -23,12 +24,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const execAsync = promisify(exec);
 const app   = express();
 const PORT  = Number(process.env.BRAIN_PORT) || 5180; // set per install in the LaunchAgent
-const BRAIN = resolve(homedir(), 'Brain');
 
 app.use(express.json({ limit: '2mb' }));
 
 // ─── SECURITY ────────────────────────────────────────────────────────────────
-// Resolve and validate that the requested path is inside ~/Brain and is .md
+// Resolve and validate that the requested path is inside the brain folder and is .md
 function safe(rel) {
   if (!rel || typeof rel !== 'string') throw err400('Missing path');
   if (extname(rel) !== '.md') throw err400('Only .md files are allowed');
@@ -109,8 +109,8 @@ function makeRunId() {
   return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}-${Math.random().toString(36).slice(2,6)}`;
 }
 
-// Walk ~/Brain and return "rel/path.md | title" lines
-// Every .md file in ~/Brain except inbox/, .git/ and the top-level README.md, as [{rel, content}]
+// Walk the brain folder and return "rel/path.md | title" lines
+// Every .md file in the brain folder except inbox/, .git/ and the top-level README.md, as [{rel, content}]
 async function brainMdFiles() {
   const files = [];
   async function walk(dir, pfx) {
@@ -158,11 +158,11 @@ async function buildBrainContent() {
   ].join('\n');
 }
 
-// Every change the app itself makes to ~/Brain goes through these two, which record the file and its
+// Every change the app itself makes to the brain folder goes through these two, which record the file and its
 // resulting checksum (null once deleted). The distill safety check ignores a change that matches the
 // record, so an outside edit, even to a file the app wrote earlier, still counts as tampering.
 // Recorded before the write, so a check running at the same moment can't miss it.
-const appWrites = new Map(); // path relative to ~/Brain → latest checksum the app left there
+const appWrites = new Map(); // path relative to the brain folder → latest checksum the app left there
 
 async function writeBrainFile(abs, content) {
   appWrites.set(relative(BRAIN, abs), md5(content));
@@ -236,7 +236,7 @@ async function checkOutFiles(outDir) {
   return { accepted, dropped };
 }
 
-// Copy accepted out/ files into ~/Brain/inbox/ without overwriting existing items.
+// Copy accepted out/ files into the brain's inbox/ without overwriting existing items.
 // batch: { id, source, at }, whose cards are numbered from firstOrder (later calls of a run continue the count).
 async function moveToInbox(outDir, files, batch = null, firstOrder = 0) {
   await mkdir(join(BRAIN, 'inbox'), { recursive: true });
@@ -515,7 +515,7 @@ app.post('/api/file', async (req, res) => {
   }
 });
 
-// Last git commit in ~/Brain
+// Last git commit in the brain folder, and the outcome of the last automatic save (scripts/autocommit.sh)
 // On a Mac without the developer tools, running git opens Apple's install dialog; check once instead.
 let hasGit = null;
 async function gitAvailable() {
@@ -525,14 +525,28 @@ async function gitAvailable() {
   return hasGit;
 }
 
+// autocommit.sh writes ~/.brain/autocommit-status after every run: the outcome (committed, no-changes, skipped or
+// error), when it ran, when the current run of failures began, then git's message. A failure is returned as
+// `backupProblem` so the page can show it on screen instead of only in a log file.
+const BACKUP_STATUS = resolve(homedir(), '.brain', 'autocommit-status');
+async function backupProblem() {
+  let text;
+  try { text = await readFile(BACKUP_STATUS, 'utf8'); } catch { return null; } // never ran here (or not installed)
+  const [status, at, since, ...rest] = text.split('\n');
+  if (status !== 'error') return null;
+  const message = rest.join('\n').trim();
+  return { at: at || null, since: since || at || null, message: message.length > 1500 ? message.slice(0, 1500) + '…' : message };
+}
+
 app.get('/api/gitlog', async (_req, res) => {
-  if (!(await gitAvailable())) return res.json({ lastCommit: null });
+  const problem = await backupProblem();
+  if (!(await gitAvailable())) return res.json({ lastCommit: null, backupProblem: problem });
   try {
-    const { stdout } = await execAsync(`git -C "${BRAIN}" log -1 --format="%ci"`, { timeout: 5000 });
+    const { stdout } = await promisify(execFile)('git', ['-C', BRAIN, 'log', '-1', '--format=%ci'], { timeout: 5000 });
     const raw = stdout.trim();
-    res.json({ lastCommit: raw ? new Date(raw).toISOString() : null });
+    res.json({ lastCommit: raw ? new Date(raw).toISOString() : null, backupProblem: problem });
   } catch {
-    res.json({ lastCommit: null });
+    res.json({ lastCommit: null, backupProblem: problem });
   }
 });
 
@@ -1161,7 +1175,7 @@ async function executeRun(state, run) {
       // The agent has no tools, so a change the app didn't make means something is wrong: don't trust this reply.
       const changed = await outsideChanges(preBrain);
       if (changed.length > 0) {
-        const reason = `~/Brain changed during call ${i + 1}: ${changed.join('; ')}.`;
+        const reason = `${BRAIN_LABEL} changed during call ${i + 1}: ${changed.join('; ')}.`;
         await appendDistillLog(`${callLabel} | ${seconds(durationMs)} | exit 0 | FAIL: ${reason}`);
         return await stopRun(state, run, reason);
       }

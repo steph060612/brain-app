@@ -1,7 +1,7 @@
 // Code maps: link a Brain project to one or more code folders and map them with src/mapper.js into one map.
 // Links live in ~/.brain/code-folders.json (slug → [{ name, path }]; the older slug → path is read and upgraded
 // on the next write), maps in ~/.brain/maps/<slug>/map.json.
-// Nothing here writes to ~/Brain. The only writes to a linked folder are the marked brainmap block in its
+// Nothing here writes to the brain folder. The only writes to a linked folder are the marked brainmap block in its
 // CLAUDE.md / AGENTS.md and the strict-mode hook in .claude/settings.local.json, each after the person confirms
 // it (brainmap-agents.js, brainmap-strict.js). Git is only read, with
 // --no-optional-locks so that `git status` never refreshes the folder's index; nothing is committed.
@@ -14,6 +14,7 @@ import {
 import { assistantsPreview, enableAssistants, removeAssistants } from './brainmap-agents.js';
 import { strictPreview, enableStrict, removeStrict } from './brainmap-strict.js';
 import { assistantEnv } from './assistant-env.js';
+import { BRAIN_LABEL } from './brain-dir.js';
 
 const SLUG_RE  = /^[a-z0-9][a-z0-9-]*$/;
 const send = (res, e) => res.status(e.status || 500).json({ error: e.message });
@@ -24,7 +25,7 @@ function slugOf(req) {
   return slug;
 }
 
-// Accept only an existing directory under the home folder, never ~/Brain or ~/.brain (or anything in them).
+// Accept only an existing directory under the home folder, never the brain folder or ~/.brain (or anything in them).
 async function validateFolder(input) {
   if (typeof input !== 'string' || !input.trim()) throw fail(400, 'Type a folder path.');
   let p = input.trim();
@@ -35,7 +36,7 @@ async function validateFolder(input) {
   if (!(await stat(real)).isDirectory()) throw fail(400, 'That path is a file, not a folder.');
   const home = await realOrSelf(HOME);
   if (!real.startsWith(home + sep)) throw fail(400, 'Only folders inside your home folder can be linked.');
-  if (inside(real, await realOrSelf(BRAIN))) throw fail(400, 'Folders inside ~/Brain cannot be linked.');
+  if (inside(real, await realOrSelf(BRAIN))) throw fail(400, `Folders inside your brain (${BRAIN_LABEL}) cannot be linked.`);
   if (inside(real, await realOrSelf(DOT))) throw fail(400, 'Folders inside ~/.brain cannot be linked.');
   return real;
 }

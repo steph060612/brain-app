@@ -1,12 +1,14 @@
 #!/bin/bash
-# Brain installer for a new Mac user. Run in Terminal:  bash ~/Downloads/brain-app/install.sh
-# Creates an empty brain at ~/Brain, settings in ~/.brain, and two background jobs that start at login:
-# the Brain app (http://localhost:5180, or the next free address) and a local auto-commit every 15 minutes. Never overwrites ~/Brain.
+# Brain installer for a new Mac user. Run in Terminal:  bash ~/Downloads/brain-app/install.sh [NAME] [--brain PATH]
+# Creates an empty brain at ~/Brain (or at --brain PATH; an existing folder there is used as it is, with its git
+# history), settings in ~/.brain, and two background jobs that start at login: the Brain app
+# (http://localhost:5180, or the next free address) and a local auto-commit every 15 minutes. Never overwrites a brain.
+# Run again later to update: the brain folder saved in ~/.brain/config is found and left untouched.
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BRAIN_DIR="$HOME/Brain"
 STATE_DIR="$HOME/.brain"
+CONFIG="$STATE_DIR/config"
 AGENTS_DIR="$HOME/Library/LaunchAgents"
 TODAY="$(date +%Y-%m-%d)"
 
@@ -23,8 +25,23 @@ fetch() {
   return 1
 }
 
+# Arguments, in any order: an optional first name, --brain PATH (or --brain=PATH); or --remove-assistant-tools alone.
+NAME_ARG=""; BRAIN_ARG=""; REMOVE_TOOLS=no
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --remove-assistant-tools) REMOVE_TOOLS=yes ;;
+    --brain) [ $# -ge 2 ] && [ -n "$2" ] || fail "--brain needs a folder, for example --brain ~/Notes/brain."
+             BRAIN_ARG="$2"; shift ;;
+    --brain=*) BRAIN_ARG="${1#--brain=}"; [ -n "$BRAIN_ARG" ] || fail "--brain needs a folder, for example --brain ~/Notes/brain." ;;
+    -*) fail "unknown option $1. The options are --brain PATH and --remove-assistant-tools." ;;
+    *) [ -z "$NAME_ARG" ] || fail "give one first name only (got \"$NAME_ARG\" and \"$1\")."
+       NAME_ARG="$1" ;;
+  esac
+  shift
+done
+
 # Uninstall the assistant tools only:  bash install.sh --remove-assistant-tools
-if [ "${1:-}" = "--remove-assistant-tools" ]; then
+if [ "$REMOVE_TOOLS" = yes ]; then
   if command -v claude >/dev/null 2>&1; then claude mcp remove --scope user brainmap && echo "brainmap tools removed from Claude Code."
   else echo "Claude Code is not installed; nothing to remove."; fi
   exit 0
@@ -33,18 +50,116 @@ fi
 [ "$(uname)" = "Darwin" ] || fail "this installer is for macOS only."
 [ -f "$AGENTS_DIR/com.steph.brain-app.plist" ] && fail "this Mac runs the developer version of the Brain app; do not install over it."
 
-# Install on a fresh Mac; update when a previous install exists. An update never touches ~/Brain.
-if [ -e "$BRAIN_DIR" ]; then
-  [ -f "$STATE_DIR/config" ] && [ -f "$AGENTS_DIR/com.brain.app.plist" ] \
-    || fail "$BRAIN_DIR already exists and was not made by this installer. Nothing was changed."
+# ─── Where the brain lives ───────────────────────────────────────────────────
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+tilde() { case "$1" in "$HOME") echo "~" ;; "$HOME"/*) echo "~${1#"$HOME"}" ;; *) echo "$1" ;; esac; }
+expand() { case "$1" in "~") echo "$HOME" ;; "~/"*) echo "$HOME/${1#"~/"}" ;; *) echo "$1" ;; esac; }
+# $1 with symlinks resolved in the deepest part that exists; the part that does not exist yet is appended as written.
+physical() {
+  local p="${1%/}" rest=""
+  [ -n "$p" ] || p=/
+  while [ ! -d "$p" ] && [ "$p" != / ]; do rest="/$(basename "$p")$rest"; p="$(dirname "$p")"; done
+  printf '%s%s' "$(cd -P "$p" 2>/dev/null && pwd -P || printf '%s' "$p")" "$rest"
+}
+# The name a path has on disk. The Mac's disk usually ignores case, so ~/Brain finds a folder named ~/brain.
+on_disk() {
+  local parent base hit
+  parent="$(dirname "$1")"; base="$(basename "$1")"
+  hit="$(find "$parent" -maxdepth 1 -mindepth 1 -name "$base" -print 2>/dev/null | head -1)"
+  [ -n "$hit" ] || hit="$(find "$parent" -maxdepth 1 -mindepth 1 -iname "$base" -print 2>/dev/null | head -1)"
+  printf '%s' "${hit:-$1}"
+}
+# The folder macOS keeps from background jobs that holds $1, if any. LaunchAgents (the app and the automatic saves)
+# get "Operation not permitted" in Desktop, Documents, Downloads, iCloud Drive and cloud storage folders.
+# Same list as autocommit.sh.
+protected_place() {
+  local p h d label
+  for p in "$1" "$(physical "$1")"; do
+    p="$(lower "$p")/"
+    for h in "$HOME" "$(physical "$HOME")"; do
+      h="$(lower "$h")"
+      for d in Desktop Documents Downloads "Library/Mobile Documents" "Library/CloudStorage"; do
+        case "$p" in
+          "$h/$(lower "$d")"/*)
+            case "$d" in
+              "Library/Mobile Documents") label="iCloud Drive" ;;
+              "Library/CloudStorage") label="a cloud storage folder (~/Library/CloudStorage)" ;;
+              *) label="~/$d" ;;
+            esac
+            echo "$label"; return 0 ;;
+        esac
+      done
+    done
+  done
+  return 1
+}
+# Stop unless $1 is a place the background jobs can reach and the settings file can hold.
+check_brain_place() {
+  local p="$1" place home_p
+  case "$p" in /*) ;; *) fail "--brain needs a full path, for example --brain ~/Notes/brain." ;; esac
+  case "$p" in *[\"\$\`\\\<\>\&]*) fail "the brain folder's path cannot contain quotes, \$, backticks, backslashes, <, > or &." ;; esac
+  case "$p" in *$'\n'*) fail "the brain folder's path cannot contain a line break." ;; esac
+  home_p="$(lower "$(physical "$HOME")")"
+  case "$(lower "$(physical "$p")")/" in
+    "$home_p/.brain/"*) fail "the brain cannot be inside ~/.brain, where the app keeps its own files." ;;
+    "$home_p/"?*) ;;
+    *) fail "the brain must be a folder inside your home folder ($HOME), not $(tilde "$p")." ;;
+  esac
+  if place="$(protected_place "$p")"; then
+    fail "$(tilde "$p") is in $place. macOS does not let background jobs open files there (\"Operation not permitted\"), so the Brain app and the automatic saves could not reach your brain. Choose a folder in your home folder outside Desktop, Documents, Downloads and iCloud Drive, for example --brain ~/Brain or --brain ~/Notes/brain. If your brain is there now, move it first (for example: mv ~/Documents/brain ~/Brain) and pass the new place. Nothing was changed."
+  fi
+}
+# Stop unless the existing folder $1 can be adopted as a brain as it is.
+check_adoptable() {
+  local p="$1" shown marker top
+  shown="$(tilde "$p")"
+  [ -d "$p" ] || fail "$shown exists but is not a folder. Nothing was changed."
+  for marker in package.json pyproject.toml setup.py requirements.txt Pipfile Cargo.toml go.mod Gemfile pom.xml build.gradle Makefile; do
+    [ -e "$p/$marker" ] && fail "$shown looks like a code project (it has $marker), not a brain. Nothing was changed. Choose the folder that holds your brain's notes, or a new folder."
+  done
+  [ -n "$(find "$p" -maxdepth 3 -name '*.md' -not -path '*/.git/*' -print 2>/dev/null | head -1)" ] \
+    || fail "$shown has no Markdown (.md) notes, so it does not look like a brain. Nothing was changed. Choose the folder that holds your notes, or a new folder."
+  if [ ! -e "$p/.git" ] && xcode-select -p >/dev/null 2>&1 && top="$(git -C "$p" rev-parse --show-toplevel 2>/dev/null)"; then
+    fail "$shown is inside the git repository $(tilde "$top"). The brain needs its own history: choose a folder that is not inside another repository. Nothing was changed."
+  fi
+}
+
+# Install on a fresh Mac; update when a previous install exists. The brain folder is the one saved in ~/.brain/config
+# (always ~/Brain before --brain existed). An update never touches it.
+ADOPT=no
+if [ -f "$CONFIG" ] && [ -f "$AGENTS_DIR/com.brain.app.plist" ]; then
   MODE=update
-  . "$STATE_DIR/config"
+  BRAIN_NAME=""; BRAIN_DIR=""; BRAIN_PORT=""
+  . "$CONFIG"
   NAME="${BRAIN_NAME:-}"
   PORT="${BRAIN_PORT:-5180}"
-  echo "Updating the Brain app for $NAME. Your brain at $BRAIN_DIR is not touched."
+  BRAIN_DIR="${BRAIN_DIR:-$HOME/Brain}"
+  if [ -n "$BRAIN_ARG" ] && [ "$(lower "$(physical "$(expand "$BRAIN_ARG")")")" != "$(lower "$(physical "$BRAIN_DIR")")" ]; then
+    fail "this Mac already has a brain at $(tilde "$BRAIN_DIR") (saved in $CONFIG), and the installer does not move it. To move it: move the folder, set BRAIN_DIR in $CONFIG to the new place, then run the install line again without --brain. Nothing was changed."
+  fi
+  [ -d "$BRAIN_DIR" ] || fail "your brain should be at $BRAIN_DIR (saved in $CONFIG), but that folder is not there. Nothing was changed. Put the folder back, or set BRAIN_DIR in $CONFIG to where it is now, then run the install line again."
+  echo "Updating the Brain app for $NAME. Your brain at $(tilde "$BRAIN_DIR") is not touched."
+  if PLACE="$(protected_place "$BRAIN_DIR")"; then
+    echo "WARNING: your brain is in $PLACE. macOS does not let background jobs open files there, so it is not being saved automatically and the app may not be able to read it. Move it to a folder outside Desktop, Documents, Downloads and iCloud Drive (for example ~/Brain), set BRAIN_DIR in $CONFIG to the new place, and run the install line again." >&2
+  fi
 else
   MODE=install
-  NAME="${1:-}"
+  if [ -n "$BRAIN_ARG" ]; then BRAIN_DIR="$(expand "$BRAIN_ARG")"; else BRAIN_DIR="$HOME/Brain"; fi
+  check_brain_place "$BRAIN_DIR"
+  BRAIN_DIR="$(physical "$BRAIN_DIR")"
+  if [ -e "$BRAIN_DIR" ] || [ -L "$BRAIN_DIR" ]; then
+    FOUND="$(on_disk "$BRAIN_DIR")"
+    if [ -z "$BRAIN_ARG" ]; then
+      if [ "$FOUND" != "$BRAIN_DIR" ]; then
+        fail "a folder named $(tilde "$FOUND") already exists. This Mac's disk does not tell upper from lower case, so ~/Brain would be that same folder. Nothing was changed. To start a new brain, run the install line again with a new folder, for example --brain ~/MyBrain. If $(tilde "$FOUND") already is your brain, pass --brain $(tilde "$FOUND") to use it as it is."
+      fi
+      fail "~/Brain already exists and was not made by this installer. Nothing was changed. If it is your brain, run the install line again with --brain ~/Brain to use it as it is (its history is kept). To start a new brain, pass --brain with a new folder."
+    fi
+    BRAIN_DIR="$FOUND"
+    check_adoptable "$BRAIN_DIR"
+    ADOPT=yes
+  fi
+  NAME="$NAME_ARG"
   if [ -z "$NAME" ]; then
     if [ -t 0 ]; then read -r -p "Your first name (used in your packs and rules): " NAME
     else read -r -p "Your first name (used in your packs and rules): " NAME < /dev/tty; fi
@@ -125,8 +240,17 @@ if [ "$SRC_DIR" != "$APP_DIR" ]; then
   rsync -a --delete --exclude node_modules --exclude .git --exclude .claude "$SRC_DIR/" "$APP_DIR/"
 fi
 
-if [ "$MODE" = install ]; then
-step "Creating your brain at $BRAIN_DIR"
+if [ "$MODE" = install ] && [ "$ADOPT" = yes ]; then
+step "Using your brain at $(tilde "$BRAIN_DIR")"
+echo "Nothing in it is changed, added or removed."
+if [ -e "$BRAIN_DIR/.git" ]; then
+  echo "Its git history is kept; automatic saves add to it."
+else
+  echo "It has no git history yet; the first automatic save starts one."
+fi
+elif [ "$MODE" = install ]; then
+step "Creating your brain at $(tilde "$BRAIN_DIR")"
+mkdir -p "$(dirname "$BRAIN_DIR")"
 cp -R "$APP_DIR/templates/brain" "$BRAIN_DIR"
 mv "$BRAIN_DIR/gitignore" "$BRAIN_DIR/.gitignore"
 for f in "$BRAIN_DIR"/*.md; do
@@ -142,7 +266,7 @@ fi
 
 step "Settings and scripts in $STATE_DIR"
 mkdir -p "$STATE_DIR/packs" "$STATE_DIR/imports"
-[ "$MODE" = install ] && printf 'BRAIN_NAME="%s"\nBRAIN_DIR="%s"\nBRAIN_PORT="%s"\n' "$NAME" "$BRAIN_DIR" "$PORT" > "$STATE_DIR/config"
+[ "$MODE" = install ] && printf 'BRAIN_NAME="%s"\nBRAIN_DIR="%s"\nBRAIN_PORT="%s"\n' "$NAME" "$BRAIN_DIR" "$PORT" > "$CONFIG"
 cp "$APP_DIR/scripts/brainpack.sh" "$APP_DIR/scripts/autocommit.sh" "$STATE_DIR/"
 chmod +x "$STATE_DIR/brainpack.sh" "$STATE_DIR/autocommit.sh"
 /usr/bin/sed -e "s|__NODE__|$NODE|" -e "s|__APP_DIR__|$APP_DIR|" "$APP_DIR/scripts/brainmap.sh" > "$STATE_DIR/brainmap.sh"
@@ -208,7 +332,7 @@ cat > "$AGENTS_DIR/com.brain.app.plist" <<PLIST
   <key>Label</key><string>com.brain.app</string>
   <key>ProgramArguments</key><array><string>$NODE</string><string>$APP_DIR/server.js</string></array>
   <key>WorkingDirectory</key><string>$APP_DIR</string>
-  <key>EnvironmentVariables</key><dict><key>BRAIN_PORT</key><string>$PORT</string></dict>
+  <key>EnvironmentVariables</key><dict><key>BRAIN_PORT</key><string>$PORT</string><key>BRAIN_DIR</key><string>$BRAIN_DIR</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>$STATE_DIR/brain-app.log</string>
@@ -251,5 +375,6 @@ if [ "$MODE" = update ]; then
 fi
 open -a Safari "$URL" 2>/dev/null || true
 echo "Done. The Brain app is open in Safari at $URL. Keep it in the Dock: File > Add to Dock."
-echo "First step: click 'Copy setup interview' and paste it into a new chat with your assistant."
-echo "Backups: your brain is saved on this Mac every 15 minutes. It is sent nowhere."
+[ "$ADOPT" = yes ] || echo "First step: click 'Copy setup interview' and paste it into a new chat with your assistant."
+echo "Backups: your brain ($(tilde "$BRAIN_DIR")) is saved on this Mac every 15 minutes. It is sent nowhere."
+echo "If a save fails, the Brain app shows a red message at the top saying why."
