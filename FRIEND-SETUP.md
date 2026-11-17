@@ -1,6 +1,6 @@
 # Brain: setup for a new user
 
-The Brain is a folder of plain notes on your Mac (`~/Brain`) that any AI assistant can work from, plus a small app at http://localhost:5180 to read it, copy context packs and approve changes. Nothing leaves your Mac unless you paste it into a chat yourself.
+The Brain is a folder of plain notes on your Mac (`~/Brain`, or a folder you choose) that any AI assistant can work from, plus a small app at http://localhost:5180 to read it, copy context packs and approve changes. Nothing leaves your Mac unless you paste it into a chat yourself.
 
 ## What you need
 - A Mac (personal, not a work-managed one).
@@ -16,6 +16,12 @@ The Brain is a folder of plain notes on your Mac (`~/Brain`) that any AI assista
 3. Type your first name when asked.
 4. Safari opens the Brain app. Keep it: File > Add to Dock.
 
+To keep your brain somewhere other than `~/Brain`, or to use a folder of notes you already have, add `--brain` and the folder:
+```sh
+curl -fsSL https://raw.githubusercontent.com/steph060612/brain-app/main/get.sh | bash -s -- --brain ~/Notes/brain
+```
+An existing folder is used as it is: nothing in it is changed and its git history is kept. Desktop, Documents, Downloads, iCloud Drive and cloud storage folders (Dropbox, Google Drive, OneDrive) are refused: macOS does not let background jobs open files there, so the app could not read your brain and could not save it. If `~/Brain` (or `~/brain`) already exists, the installer stops without changing anything; run it again with `--brain`.
+
 macOS may show "Background Items Added": that is the app starting at login, leave it on. If it offers to install developer tools, accept; it enables local backups.
 
 The installer says which Node it uses. If your Mac already has a recent one (22.18 or newer, or 24.11 or newer) it uses that; otherwise it downloads its own copy into `~/.brain/node` and leaves yours alone. It also puts the `brainmap` and `brainpack` commands in `~/.local/bin` and, if a new Terminal window would not find them, adds that folder to your PATH in `~/.zprofile` (it says so when it does).
@@ -25,9 +31,18 @@ Paste the same line again in Terminal:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/steph060612/brain-app/main/get.sh | bash
 ```
-It sees the existing install and updates the app only. Your brain (`~/Brain`), your settings (`~/.brain/config`), your imports and packs are not touched, and it does not ask for your name again. It ends with "Updated. The Brain app is running at …". Reload any open Brain app window (the app also reloads itself the next time you open a map).
+It sees the existing install and updates the app only. Your brain (wherever it is), your settings (`~/.brain/config`), your imports and packs are not touched, and it does not ask for your name again. It ends with "Updated. The Brain app is running at …". Reload any open Brain app window (the app also reloads itself the next time you open a map).
 
 If you installed before 10 November and running the line says `~/Brain already exists and was not made by this installer`, stop and send that message: nothing was changed.
+
+If the update warns that your brain is in Documents, Desktop or Downloads, it is not being saved. Move it:
+1. Pick a new place that does not exist yet, for example `~/Brain`. Check: `ls ~/Brain` should say "No such file or directory".
+2. Move the folder, for example `mv ~/Documents/Brain ~/Brain`.
+3. Tell the Brain where it is now (change `~/Brain` if you picked another place):
+   ```sh
+   sed -i '' "s|^BRAIN_DIR=.*|BRAIN_DIR=\"$(cd ~/Brain && pwd)\"|" ~/.brain/config
+   ```
+4. Paste the install line again. The red banner in the app goes away after the next save, within 15 minutes.
 
 ## First session: fill your brain
 1. In the app, click **Copy setup interview** (top bar; it shows only while you have no projects).
@@ -64,6 +79,7 @@ Codex may run commands in a sandbox that cannot write outside your project. Then
 - **Direct reading**: Codex can connect to tools such as Basic Memory, which would let it read the brain without a pack. Not set up or tested yet.
 
 ## If something breaks
+- A red banner at the top of the app means your brain is not being saved. It says why; send that text if it is not clear.
 - App log: `~/.brain/brain-app.log`
 - Restart the app: `launchctl kickstart -k gui/$(id -u)/com.brain.app`
-- Backup log: `~/.brain/autocommit.log`
+- Backup log (the result of every save): `~/.brain/autocommit.log`
