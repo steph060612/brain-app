@@ -10,10 +10,17 @@
 # directions pack. The text comes from `brainmap pack code|directions`; without a linked folder nothing is added.
 # BRAINPACK_NO_CLIPBOARD=1 saves the pack without copying it (used for checks).
 
-# Settings: ~/.brain/config sets BRAIN_NAME (the owner's first name) and optionally BRAIN_DIR.
+# Settings: ~/.brain/config sets BRAIN_DIR (where the brain is; the installer's default is ~/Brain) and BRAIN_NAME
+# (the owner's first name). Without BRAIN_NAME the name comes from the "Name:" line of the brain's profile.md, and
+# without that the packs say "the owner". Nothing here is specific to one person.
 [ -f "$HOME/.brain/config" ] && . "$HOME/.brain/config"
-BRAIN_NAME="${BRAIN_NAME:-the owner}"
 BRAIN_DIR="${BRAIN_DIR:-$HOME/Brain}"
+BRAIN_DIR="${BRAIN_DIR/#\~/$HOME}"
+if [ -z "$BRAIN_NAME" ] && [ -f "$BRAIN_DIR/profile.md" ]; then
+    BRAIN_NAME="$(/usr/bin/sed -n -E 's/^[-*][[:space:]]*(\*\*)?Name(\*\*)?:(\*\*)?[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\4/p' "$BRAIN_DIR/profile.md" | /usr/bin/head -1)"
+    case "$BRAIN_NAME" in *"{{"*) BRAIN_NAME="" ;; esac # an unfilled template
+fi
+BRAIN_NAME="${BRAIN_NAME:-the owner}"
 PACKS_DIR="$HOME/.brain/packs"
 DATE="/bin/date"
 BRAINMAP="$HOME/.brain/brainmap.sh"

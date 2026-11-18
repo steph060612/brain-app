@@ -279,6 +279,15 @@ if mkdir -p "$BIN_DIR" 2>/dev/null && ln -sf "$STATE_DIR/brainpack.sh" "$BIN_DIR
 else
   echo "Could not install the brainmap and brainpack commands in $BIN_DIR. They still work by full path: $STATE_DIR/brainmap.sh"
 fi
+# Installers before 15 November linked the commands in /opt/homebrew/bin or /usr/local/bin, which every account on
+# the Mac shares, so another account's assistants would run this account's copy. Such a link is removed, only when
+# it is a symlink to this account's own script; anything else there is left alone.
+for old in /opt/homebrew/bin /usr/local/bin; do
+  for cmd in brainmap brainpack; do
+    [ -L "$old/$cmd" ] && [ "$(readlink "$old/$cmd")" = "$STATE_DIR/$cmd.sh" ] && rm -f "$old/$cmd" 2>/dev/null \
+      && echo "Removed the old shared command link $old/$cmd (the command is now in $BIN_DIR)."
+  done
+done
 # BRAIN_LOGIN_SHELL overrides the shell checked (the installer test uses it to isolate a test home).
 LOGIN_SHELL="${BRAIN_LOGIN_SHELL:-$(dscl . -read "/Users/$(id -un)" UserShell 2>/dev/null | awk '{print $2}')}"
 [ -n "$LOGIN_SHELL" ] || LOGIN_SHELL="${SHELL:-/bin/zsh}"

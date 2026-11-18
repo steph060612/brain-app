@@ -18,10 +18,14 @@ run('npm', ['run', 'build']); // includes the dist check
 
 const serverJs = join(APP, 'server.js');
 const agents = [];
+let port = Number(process.env.BRAIN_PORT) || 0; // else the agent's own BRAIN_PORT, else 5180
 for (const f of readdirSync(AGENTS).filter((x) => x.endsWith('.plist'))) {
   let text = '';
   try { text = execFileSync('plutil', ['-convert', 'xml1', '-o', '-', join(AGENTS, f)]).toString(); } catch { continue; }
-  if (text.includes(`<string>${serverJs}</string>`)) agents.push(f.replace(/\.plist$/, ''));
+  if (!text.includes(`<string>${serverJs}</string>`)) continue;
+  agents.push(f.replace(/\.plist$/, ''));
+  const m = text.match(/<key>BRAIN_PORT<\/key>\s*<string>(\d+)<\/string>/);
+  if (m && !port) port = Number(m[1]);
 }
 if (!agents.length) {
   const others = readdirSync(AGENTS).filter((x) => /brain/.test(x) && x.endsWith('.plist'));
@@ -37,11 +41,11 @@ for (const label of agents) {
 console.log('==> Waiting for the app');
 let up = false;
 for (let i = 0; i < 30 && !up; i++) {
-  try { await fetch('http://localhost:' + (process.env.BRAIN_PORT || 5180) + '/api/version'); up = true; }
+  try { await fetch(`http://localhost:${port || 5180}/api/version`); up = true; }
   catch { await new Promise((r) => setTimeout(r, 1000)); }
 }
 if (!up) fail('the app did not answer within 30 s. See ~/.brain/brain-app.log.');
 
 console.log('==> Checking the running app');
-run(process.execPath, [join(APP, 'scripts', 'check-build.mjs'), '--live']);
+execFileSync(process.execPath, [join(APP, 'scripts', 'check-build.mjs'), '--live'], { cwd: APP, stdio: 'inherit', env: { ...process.env, ...(port ? { BRAIN_PORT: String(port) } : {}) } });
 console.log('\nRestarted and verified. Open pages reload themselves on their next focus or map open.');

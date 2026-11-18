@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "concurrently --names vite,api --prefix-colors cyan,yellow \"vite\" \"node server.js\"",
+    "dev": "concurrently --names vite,api --prefix-colors cyan,yellow \"vite\" \"BRAIN_PORT=3001 node server.js\"",
     "api": "node server.js",
     "build": "vite build && node scripts/check-build.mjs",
     "preview": "vite preview",

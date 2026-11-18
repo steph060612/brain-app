@@ -960,11 +960,33 @@ async function packCmd(opts, kind) {
   flush();
 }
 
+// A project name where a command or its argument goes (brainmap collection powerpump users, brainmap powerpump
+// overview): a clear error with the corrected command, instead of the help text or a search for "powerpump users".
+// Checked only where a project name cannot be a real argument: the command itself, a command that takes no
+// argument, or the first of several words given to a command that takes one (query, which takes words, and path,
+// which takes two, are left alone).
+const NO_ARG = new Set(['overview', 'report', 'groups', 'unused']);
+const ONE_ARG = new Set(['file', 'files', 'impact', 'screen', 'callers', 'notes', 'group', 'collection', 'function', 'find']);
+async function misplacedProject(cmd, rest, opts) {
+  if (opts.project) return;
+  const slugs = Object.keys(await loadProjects());
+  const slug = w => slugs.find(x => x.toLowerCase() === String(w).toLowerCase());
+  const q = a => (/[\s{}"'$*?[\]]/.test(a) ? `"${a.replace(/"/g, '\\"')}"` : a);
+  const fix = (c, args, p) => `  brainmap ${[c, ...args.map(q)].join(' ')} --project ${p}`;
+  if (!COMMANDS[cmd] && slug(cmd)) {
+    const [c, ...args] = COMMANDS[rest[0]] ? rest : ['overview'];
+    die(`"${cmd}" is a project name, not a command. The command comes first and the project goes after --project, for example:\n${fix(c, args, slug(cmd))}`);
+  }
+  if (NO_ARG.has(cmd) && rest.length && slug(rest[0])) die(`brainmap ${cmd} takes no argument, and "${rest[0]}" is a project name. Name the project with --project:\n${fix(cmd, [], slug(rest[0]))}`);
+  if (ONE_ARG.has(cmd) && rest.length > 1 && slug(rest[0])) die(`brainmap ${cmd} takes one argument, and "${rest[0]}" is a project name. The project goes after --project, for example:\n${fix(cmd, rest.slice(1), slug(rest[0]))}`);
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const [cmd = 'help', ...rest] = opts.pos;
   if (cmd === 'help') die(HELP, 0);
   if (cmd === 'pack') return packCmd(opts, rest[0]);
+  await misplacedProject(cmd, rest, opts);
   const run = COMMANDS[cmd];
   if (!run) die(`Unknown command "${cmd}".\n\n${HELP}`);
   ALL = opts.all;
