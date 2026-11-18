@@ -55,7 +55,12 @@ async function callTool(name, args = {}) {
   if (!tool) return { text: `Unknown tool ${name}.`, isError: true };
   for (const r of tool.required || []) if (typeof args[r] !== 'string' || !args[r].trim()) return { text: `Missing "${r}".`, isError: true };
   const cwd = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  if (!(await linkedProject(cwd))) return { text: 'No code map: this folder is not linked to a Brain project; search the code directly.' };
+  if (!(await linkedProject(cwd))) {
+    const old = await projectFor(cwd, { includeArchived: true });
+    return { text: old
+      ? `No code map by default: this folder belongs to the Brain project "${old.slug}", which is archived. Search the code directly, or run \`brainmap overview --project ${old.slug}\` to use its last map.`
+      : 'No code map: this folder is not linked to a Brain project; search the code directly.' };
+  }
   const r = await runBrainmap(cwd, [tool.name, ...tool.args(args), ...(args.all ? ['--all'] : []), ...(typeof args.folder === 'string' && args.folder.trim() ? ['--folder', args.folder.trim()] : [])]);
   return { text: r.text || '(no output)', isError: r.code !== 0 && !r.text };
 }

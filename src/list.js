@@ -1,10 +1,10 @@
 // List view: every Brain item by group, newest first. An opaque layer over the brain, which keeps running behind it.
-import { fetchItems } from './api.js';
+import { fetchItems, moveProject } from './api.js';
 import { STYLE } from './labels.js';
 
 const GROUPS = [
   { title: 'Active projects', categories: ['projects'] },
-  { title: 'Archive',         categories: ['archive'] },
+  { title: 'Archived',        categories: ['archive'], collapsible: true },
   { title: 'People',          categories: ['people'] },
   { title: 'Topics',          categories: ['topics'] },
   { title: 'Profile and Preferences', categories: ['profile', 'preferences'] },
@@ -13,6 +13,8 @@ const VIEW_KEY = 'brain-view';
 
 let items    = [];
 let query    = '';
+let archivedOpen = false; // the Archived section starts collapsed; a search opens it while it has matches
+let rowNote  = new Map(); // item id → message shown under its row (an unarchive that was refused)
 let onClick  = null;
 let listEl   = null;
 let toggleEl = null;
@@ -66,6 +68,12 @@ function setVisible(show) {
   fetchItems().then(fresh => { items = fresh; render(); }).catch(() => { /* keep what's shown */ });
 }
 
+// New items from elsewhere (a project archived from its page): shown the next time the list renders.
+export function setListItems(fresh) {
+  items = fresh;
+  if (listEl && listEl.style.display !== 'none') render();
+}
+
 export function setListQuery(q) {
   query = q.trim().toLowerCase();
   if (listEl && listEl.style.display !== 'none') render();
@@ -86,15 +94,21 @@ function render() {
   wrap.style.cssText = 'width:max(280px, min(640px, calc(100vw - var(--panel-w, 380px) - 48px)));'; // rows stay clear of the open panel
 
   const matches = items.filter(i => !query || i.name.toLowerCase().includes(query));
-  for (const { title, categories } of GROUPS) {
+  for (const { title, categories, collapsible } of GROUPS) {
     const rows = matches.filter(i => categories.includes(i.category)).sort(newestFirst);
     if (rows.length === 0) continue;
 
-    const heading = document.createElement('div');
-    heading.style.cssText = 'font-size:12px; color:#5a6890; letter-spacing:0.05em; text-transform:uppercase; margin:18px 0 6px;';
-    heading.textContent = `${title} (${rows.length})`;
+    const open = !collapsible || archivedOpen || !!query;
+    const heading = document.createElement(collapsible ? 'button' : 'div');
+    heading.style.cssText = `font-size:12px; color:#5a6890; letter-spacing:0.05em; text-transform:uppercase; margin:18px 0 6px;
+      ${collapsible ? 'background:none; border:none; padding:0; cursor:pointer; font-family:inherit;' : ''}`;
+    heading.textContent = `${collapsible ? (open ? '▾ ' : '▸ ') : ''}${title} (${rows.length})`;
+    if (collapsible) {
+      heading.setAttribute('aria-expanded', String(open));
+      heading.addEventListener('click', () => { archivedOpen = !open; render(); });
+    }
     wrap.appendChild(heading);
-    for (const item of rows) wrap.appendChild(buildRow(item));
+    if (open) for (const item of rows) wrap.appendChild(buildRow(item));
   }
 
   if (matches.length === 0) {
@@ -129,5 +143,32 @@ function buildRow(item) {
 
   row.appendChild(name);
   row.appendChild(date);
-  return row;
+  if (item.category !== 'archive') return row;
+
+  // An archived project: an Unarchive button on its row, and the reason under it if the move was refused.
+  const btn = document.createElement('span');
+  btn.setAttribute('role', 'button');
+  btn.tabIndex = 0;
+  btn.textContent = 'Unarchive';
+  btn.style.cssText = `font-size:12px; color:#9FD8FF; flex-shrink:0; padding:1px 8px; border:1px solid rgba(100,120,200,0.25);
+    border-radius:4px; background:rgba(255,255,255,0.04);`;
+  const run = async e => {
+    e.stopPropagation();
+    if (btn.dataset.busy) return;
+    btn.dataset.busy = '1'; btn.textContent = 'Moving…';
+    try { await moveProject('unarchive', item.path.split('/').pop()); rowNote.delete(item.id); }
+    catch (err) { rowNote.set(item.id, err.message); }
+    items = await fetchItems().catch(() => items);
+    render();
+  };
+  btn.addEventListener('click', run);
+  btn.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') run(e); });
+  row.appendChild(btn);
+  if (!rowNote.has(item.id)) return row;
+  const box = document.createElement('div');
+  const note = document.createElement('div');
+  note.style.cssText = 'font-size:12px; color:#e08a70; padding:2px 10px 8px;';
+  note.textContent = rowNote.get(item.id);
+  box.appendChild(row); box.appendChild(note);
+  return box;
 }

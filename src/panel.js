@@ -1,5 +1,5 @@
 // Right-side panel: shows item content, tabs per file, edit/save.
-import { fetchFile, saveFile } from './api.js';
+import { fetchFile, saveFile, fetchItems, moveProject } from './api.js';
 import { setPanelOpen } from './labels.js';
 import { packButton } from './pack.js';
 import { createCodeSection, showCodeSection } from './codemap-panel.js';
@@ -158,6 +158,13 @@ export function initPanel() {
   projectPack('Copy directions', 'assistant that can read my files', 'directions');
   header.appendChild(packRow);
 
+  // Archive / Unarchive (projects and archive only): a move of the folder, so no confirmation; the page says where
+  // the folder went.
+  const archiveRow = document.createElement('div');
+  archiveRow.id = 'archive-row';
+  archiveRow.style.cssText = 'display:none; align-items:center; flex-wrap:wrap; gap:8px; margin:-4px 0 12px; font-size:12px; color:#8090b0;';
+  header.appendChild(archiveRow);
+
   // Code folder link and Map project (projects and archive only)
   header.appendChild(createCodeSection());
 
@@ -228,6 +235,7 @@ export async function openPanel(item) {
   document.getElementById('panel-title').textContent = item.name;
   const isProject = item.type === 'folder' && (item.category === 'projects' || item.category === 'archive');
   document.getElementById('pack-row').style.display = isProject ? 'flex' : 'none';
+  renderArchiveRow(isProject ? item : null);
   showCodeSection(isProject ? { slug: item.path.split('/').pop(), name: item.name } : null);
 
   buildTabs();
@@ -406,6 +414,46 @@ async function doSave(path) {
     const btn = document.getElementById('save-btn');
     if (btn) btn.disabled = false;
   }
+}
+
+// ─── ARCHIVE ─────────────────────────────────────────────────────────────────
+const ARCHIVE_BTN = `padding:4px 10px; background:rgba(255,255,255,0.04); border:1px solid rgba(100,120,200,0.25); color:#9FD8FF;
+  border-radius:4px; font-size:12px; cursor:pointer; font-family:inherit; white-space:nowrap;`;
+function renderArchiveRow(item) {
+  const row = document.getElementById('archive-row');
+  row.innerHTML = '';
+  if (!item) { row.style.display = 'none'; return; }
+  row.style.display = 'flex';
+  const name = item.path.split('/').pop();
+  const archived = item.category === 'archive';
+  if (archived) {
+    const where = document.createElement('span');
+    where.textContent = `Archived: its folder is archive/${name}/ in the brain.`;
+    row.appendChild(where);
+  }
+  const btn = document.createElement('button');
+  btn.textContent = archived ? 'Unarchive project' : 'Archive project';
+  btn.title = archived ? `Moves the folder back to projects/${name}/` : `Moves the folder to archive/${name}/; Unarchive brings it back`;
+  btn.style.cssText = ARCHIVE_BTN;
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    btn.textContent = 'Moving…';
+    try {
+      const r = await moveProject(archived ? 'unarchive' : 'archive', name);
+      const moved = (await fetchItems()).find(i => i.id === r.to);
+      if (moved && currentItem?.path === item.path) await openPanel(moved);
+      const bm = r.basicMemory?.state === 'reindexing' ? ' Basic Memory is re-indexing the brain.'
+        : r.basicMemory?.state === 'manual' ? ` Basic Memory has not seen the move yet: run ${r.basicMemory.command}` : '';
+      setStatus((archived
+        ? `Unarchived: the folder is back at ${r.location}`
+        : `Archived: the folder moved to ${r.location} (Unarchive on this page or in the list's Archived section brings it back).`) + bm, '#6FE3D0');
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = archived ? 'Unarchive project' : 'Archive project';
+      setStatus(e.message, '#c0503a');
+    }
+  });
+  row.appendChild(btn);
 }
 
 // ─── COPY PACK ───────────────────────────────────────────────────────────────

@@ -5,6 +5,19 @@ export async function fetchItems() {
   return r.json();
 }
 
+// Archive ('archive') or unarchive ('unarchive') a project folder by name. Resolves to { from, to, location };
+// rejects with the server's message (a name already used on the other side moves nothing). On success the page's
+// labels and list are refreshed through the brain-items-changed event.
+export async function moveProject(action, name) {
+  const r = await fetch(`/api/projects/${action}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  window.dispatchEvent(new CustomEvent('brain-items-changed'));
+  return data;
+}
+
 export async function fetchFile(path) {
   const r = await fetch(`/api/file?path=${encodeURIComponent(path)}`);
   if (!r.ok) throw new Error(`file fetch failed: ${r.status}`);

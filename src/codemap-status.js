@@ -15,6 +15,7 @@ export const DOT   = join(HOME, '.brain');
 export const LINKS = join(DOT, 'code-folders.json');
 export const MAPS  = join(DOT, 'maps');
 export { BRAIN } from './brain-dir.js';
+import { BRAIN as BRAIN_DIR } from './brain-dir.js';
 import { SCHEMA_VERSION } from './map-schema.js';
 export { SCHEMA_VERSION };
 export const MAP_TIMEOUT_MS = 60_000;
@@ -45,14 +46,26 @@ export async function loadProjects() {
   const d = await loadLinks();
   return Object.fromEntries(Object.entries(d).map(([k, v]) => [k, foldersOf(v)]).filter(([, v]) => v.length));
 }
-// The project whose linked folder contains `cwd` (the deepest one): { slug, folders, folder }, or null.
-export async function projectFor(cwd) {
+// Is the project active (projects/<slug>/ in the brain), archived (only archive/<slug>/), or neither (a link whose
+// brain folder is gone, treated as active as before)? Archiving moves the folder; links and maps keep the slug.
+export async function projectState(slug) {
+  const isDir = async p => { try { return (await stat(p)).isDirectory(); } catch { return false; } };
+  if (await isDir(join(BRAIN_DIR, 'projects', slug))) return 'active';
+  if (await isDir(join(BRAIN_DIR, 'archive', slug))) return 'archived';
+  return 'none';
+}
+// The project whose linked folder contains `cwd` (the deepest one): { slug, folders, folder, archived }, or null.
+// An archived project is inactive: it is skipped unless includeArchived (brainmap uses that only to explain why
+// nothing was found; asking by name with --project still reaches it).
+export async function projectFor(cwd, { includeArchived = false } = {}) {
   const here = await realOrSelf(cwd);
   let best = null;
   for (const [slug, folders] of Object.entries(await loadProjects())) {
+    const archived = (await projectState(slug)) === 'archived';
+    if (archived && !includeArchived) continue;
     for (const f of folders) {
       const real = await realOrSelf(f.path);
-      if (inside(here, real) && (!best || real.length > best.folder.path.length)) best = { slug, folders, folder: { ...f, path: real } };
+      if (inside(here, real) && (!best || real.length > best.folder.path.length)) best = { slug, folders, folder: { ...f, path: real }, archived };
     }
   }
   return best;

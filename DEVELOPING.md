@@ -83,6 +83,15 @@ place on the next write) and **Map project**: the server runs `node src/mapper.j
 `src/map-schema.js`). The mapper also runs on its own: `node src/mapper.js <project folder> <output name>`, or
 `node src/mapper.js --folder app=~/Projects/shop-app --folder web=~/Projects/shop-web <output name>` for several folders.
 
+**Archive.** `POST /api/projects/archive` and `/unarchive` with `{ name }` rename `projects/<name>/` to
+`archive/<name>/` or back, refusing when the destination exists (even empty: `rename` would replace an empty
+folder). Code links and maps are keyed by the name, so they follow; `projectState(slug)` in `codemap-status.js` says
+active or archived, and `projectFor` (brainmap by folder, the strict hook, the tool server) skips archived projects
+unless asked. An inbox suggestion aimed at a project's old side is refused on approve instead of recreating the old
+folder. Basic Memory's watcher does not index a folder moved in one rename (one folder event, no file events), so
+after a move `src/basic-memory.js` runs `basic-memory project index <project>` for the Basic Memory project whose
+folder is the brain; its scan matches the moved files by checksum, so nothing is duplicated.
+
 **Packs and the code map.** `scripts/brainpack.sh` (installed as `~/.brain/brainpack.sh`, run by `/api/pack`) asks
 `brainmap pack code --project <slug>` for the Code section of the full and project-only packs, and `brainmap pack
 directions --project <slug>` for the code lines of the directions pack (`--directions`). Both print nothing when the

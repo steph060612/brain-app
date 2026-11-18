@@ -59,6 +59,12 @@ free port). Keep it in the Dock from Safari with File > Add to Dock.
 - **Import** and **Distill**: turn exported chats (Claude, ChatGPT, Gemini) into suggestions, using an assistant
   installed on your Mac (Claude Code, Codex or Gemini's command-line tool) when one is available.
 - **List**: every brain item as a list instead of the 3D view. Click any item to read it or edit the Markdown.
+- **Archive project / Unarchive**: on a project's page, Archive moves its folder from `projects/` to `archive/` in
+  your brain (nothing is deleted or rewritten) and the page says where it went. Archived projects leave the active
+  list and the packs' project lists; the List view's **Archived** section (collapsed) has an **Unarchive** button for
+  each, and an archived project's page has one too. If the other side already has a folder with that name, nothing
+  moves. The code folder link and code map stay with the project; `brainmap` uses an archived project only when you
+  name it (`--project <name>`). If Basic Memory is set up for your brain, the app has it re-index after the move.
 
 Your brain is saved locally with git every 15 minutes when Apple's developer tools are installed. It is not backed up
 anywhere else unless you add a private remote yourself. If a save fails, a red banner at the top of the app says why

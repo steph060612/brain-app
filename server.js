@@ -1,7 +1,7 @@
 // Local API server — reads and writes the brain's .md files (~/Brain, or the folder chosen at install: src/brain-dir.js).
 // Listens only on localhost. Brain content stays in the brain folder; app state (staging, packs, code maps) in ~/.brain.
 import express from 'express';
-import { readdir, readFile, writeFile, stat, access, unlink, mkdir, rm, rename } from 'fs/promises';
+import { readdir, readFile, writeFile, stat, lstat, access, unlink, mkdir, rm, rename } from 'fs/promises';
 import { resolve, join, sep, extname, basename, dirname, relative } from 'path';
 import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
@@ -17,6 +17,7 @@ import { SCHEMA_VERSION } from './src/map-schema.js';
 import { buildProblem, readBuildInfo } from './src/build-check.js';
 import { existsSync } from 'fs';
 import { BRAIN, BRAIN_LABEL } from './src/brain-dir.js';
+import { refreshAfterMove } from './src/basic-memory.js';
 import { execFileSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -550,6 +551,51 @@ app.get('/api/gitlog', async (_req, res) => {
   }
 });
 
+// ─── ARCHIVE ─────────────────────────────────────────────────────────────────
+// Archive and unarchive a project: one rename of projects/<name>/ to archive/<name>/ inside the brain, or back.
+// Nothing in the folder is read, rewritten or deleted. The destination must not exist: a name already used on
+// the other side is refused and nothing moves. (rename itself never replaces a folder that has files in it.)
+// The code folder link and the code map are keyed by the name, not by projects/ or archive/, so they follow.
+const PROJECT_SIDES = { archive: ['projects', 'archive'], unarchive: ['archive', 'projects'] };
+for (const [action, [fromDir, toDir]] of Object.entries(PROJECT_SIDES)) {
+  app.post(`/api/projects/${action}`, async (req, res) => {
+    const name = req.body?.name;
+    if (typeof name !== 'string' || !name || name.startsWith('.') || /[\/\\\0]/.test(name)) return res.status(400).json({ error: 'Invalid project name' });
+    const from = join(BRAIN, fromDir, name), to = join(BRAIN, toDir, name);
+    const where = rel => `${BRAIN_LABEL}/${rel}/`;
+    try {
+      if (!(await subdirs(join(BRAIN, fromDir))).includes(name)) return res.status(404).json({ error: `There is no folder ${fromDir}/${name}/ in the brain.` });
+      let exists = false;
+      try { await lstat(to); exists = true; } catch { }
+      if (exists) {
+        return res.status(409).json({ error: `${where(`${toDir}/${name}`)} already exists, so nothing was moved. ${action === 'archive'
+          ? `An archived project already uses the name "${name}". Rename one of the two folders in Finder, then archive again.`
+          : `An active project already uses the name "${name}". Rename one of the two folders in Finder, then unarchive again.`}` });
+      }
+      await mkdir(join(BRAIN, toDir), { recursive: true });
+      await rename(from, to);
+      // Basic Memory does not see a folder moved in one rename; when it is set up for this brain, rescan it.
+      const basicMemory = await refreshAfterMove(BRAIN).catch(e => ({ state: 'manual', error: e.message }));
+      res.json({ ok: true, name, from: `${fromDir}/${name}`, to: `${toDir}/${name}`, location: where(`${toDir}/${name}`), basicMemory });
+    } catch (e) {
+      res.status(500).json({ error: `Could not move ${fromDir}/${name}/: ${e.message}` });
+    }
+  });
+}
+
+// An inbox suggestion written for projects/<name>/ while that project was archived (or the other way round) would
+// recreate the old folder beside the moved one. Returns the refusal message, or null when the target is fine.
+async function movedProjectTarget(target) {
+  const m = /^(projects|archive)\/([^/]+)\//.exec(target || '');
+  if (!m) return null;
+  const [, side, name] = m, other = side === 'projects' ? 'archive' : 'projects';
+  const isDir = async p => { try { return (await stat(p)).isDirectory(); } catch { return false; } };
+  if (await isDir(join(BRAIN, side, name)) || !(await isDir(join(BRAIN, other, name)))) return null;
+  return side === 'projects'
+    ? `Project "${name}" is archived (its folder is archive/${name}/). Unarchive it first, or discard this suggestion.`
+    : `Project "${name}" is active again (its folder is projects/${name}/). Archive it first, or discard this suggestion.`;
+}
+
 // ─── PACK ────────────────────────────────────────────────────────────────────
 
 // Build a project's pack for other assistants by running ~/.brain/brainpack.sh (the single source of the
@@ -638,6 +684,8 @@ async function approveItem({ filename, inboxHash, targetHash }, seenTargets) {
 
   const fm = parseFM(inboxContent);
   if (!fm.target) return { status: 400, body: { error: 'No target field in inbox file' } };
+  const moved = await movedProjectTarget(fm.target);
+  if (moved) return { status: 409, body: { error: 'moved', message: moved } };
 
   const expectedHash = seenTargets?.has(fm.target) ? null : targetHash;
   const targetAbs = safe(fm.target);

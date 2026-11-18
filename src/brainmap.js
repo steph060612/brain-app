@@ -10,7 +10,7 @@ import { stat, readFile } from 'fs/promises';
 import { join } from 'path';
 import { findPath, computeReport, queryMap, callerTree, callIndex, routesFor } from './map-report.js';
 import {
-  loadProjects, projectFor, readMap, projectStatus, statusReason, runMapper, gitAvailable, tilde,
+  loadProjects, projectFor, projectState, readMap, projectStatus, statusReason, runMapper, gitAvailable, tilde,
 } from './codemap-status.js';
 import { forFolder, crossFolder, isMulti, folderNames, scopeQuery, prefixed } from './map-folders.js';
 
@@ -136,14 +136,19 @@ function parseArgs(argv) {
 }
 
 // ─── project, map, refresh ───────────────────────────────────────────────────
+// A project named with --project, archived or not; otherwise the active project whose linked folder contains this
+// folder. An archived project is inactive: it is never picked by folder, only by name.
 async function findProject(name) {
   const projects = await loadProjects();
   if (name) {
     const key = Object.keys(projects).find(k => k.toLowerCase() === name.toLowerCase()) ?? name.toLowerCase();
-    return { slug: key, folders: projects[key] ?? [] };
+    return { slug: key, folders: projects[key] ?? [], archived: (await projectState(key)) === 'archived' };
   }
   const p = await projectFor(process.cwd());
-  return p && { slug: p.slug, folders: p.folders };
+  if (p) return { slug: p.slug, folders: p.folders, archived: false };
+  const old = await projectFor(process.cwd(), { includeArchived: true });
+  if (old) die(`This folder belongs to project "${old.slug}", which is archived, so brainmap does not use it by default.\nAsk for it by name: brainmap overview --project ${old.slug}`);
+  return null;
 }
 
 async function loadProject(opts) {
@@ -171,6 +176,7 @@ Or name a project: brainmap overview --project <name>`);
       ? `Project "${p.slug}" is linked to ${p.folders.map(f => tilde(f.path)).join(' and ')} but has not been mapped yet.\nTo create the map: in the Brain app, open the project and click "Map project".`
       : `No project "${p.slug}" is linked or mapped.\nTo create one: in the Brain app, open the project, click "Link code folder", then "Map project".`);
   }
+  if (p.archived) say(`Note: project "${p.slug}" is archived (its brain folder is archive/${p.slug}/); its code map still answers.`);
   if (!p.folders.length) say(`Note: "${p.slug}" is not linked to a code folder any more; this map may be out of date.`);
   else if (gone.length) say(`Note: the linked folder${gone.length > 1 ? 's' : ''} ${gone.map(f => tilde(f.path)).join(', ')} ${gone.length > 1 ? 'were' : 'was'} not found; this map may be out of date.`);
   else if (opts.refresh) {

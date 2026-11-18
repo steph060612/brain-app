@@ -34,6 +34,7 @@ let searchQuery  = '';
 let clickHandler = null;
 let labels       = [];
 let resumeTimer  = null;
+let pools = null, container = null, surf = null; // kept so the labels can be rebuilt (setLabelItems)
 
 // ─── ROTATION CONTROL ────────────────────────────────────────────────────────
 // Rotation pauses ONLY while dragging the brain, hovering a label, or a panel
@@ -70,7 +71,8 @@ export function initLabels(items, surfPool, surfNormVecs, camera, onClickItem) {
   });
 
   // Build region pools from surfPool
-  const pools = { front_top: [], back_lower: [], middle: [] };
+  pools = { front_top: [], back_lower: [], middle: [] };
+  surf = { surfPool, surfNormVecs };
   for (let i = 0; i < surfPool.length; i++) {
     const [x, y] = surfPool[i];
     for (const [region, pool] of Object.entries(pools)) {
@@ -78,13 +80,28 @@ export function initLabels(items, surfPool, surfNormVecs, camera, onClickItem) {
     }
   }
 
+  container = document.createElement('div');
+  container.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:hidden;z-index:20;';
+  document.body.appendChild(container);
+  buildLabels(items);
+  return labels;
+}
+
+// Replaces every label with one per item (after a project is archived or unarchived, for example).
+export function setLabelItems(items) {
+  if (!container) return;
+  container.innerHTML = '';
+  labels = [];
+  labelHovered = false;
+  syncRotation();
+  buildLabels(items);
+}
+
+function buildLabels(items) {
+  const { surfPool, surfNormVecs } = surf;
   // Group items by region, assign anchors evenly
   const byRegion = { front_top: [], back_lower: [], middle: [] };
   for (const item of items) byRegion[regionOf(item.category)].push(item);
-
-  const container = document.createElement('div');
-  container.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:hidden;z-index:20;';
-  document.body.appendChild(container);
 
   for (const [region, regionItems] of Object.entries(byRegion)) {
     const pool = pools[region];
@@ -112,8 +129,6 @@ export function initLabels(items, surfPool, surfNormVecs, camera, onClickItem) {
       });
     });
   }
-
-  return labels;
 }
 
 function buildLabel(item) {
