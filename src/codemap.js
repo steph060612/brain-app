@@ -28,6 +28,7 @@ const LAYERS = [
   { id: 'writes',         label: 'Writes',         kinds: ['writes'],         color: '#FF7A59', on: false },
   { id: 'calls',          label: 'Calls',          kinds: ['calls'],          color: '#C3A6FF', on: false },
   { id: 'types',          label: 'Type imports',   kinds: ['type-import'],    color: '#8FA3C8', on: false },
+  { id: 'inherits',       label: 'Inheritance',    kinds: ['inherits'],       color: '#E0D35A', on: false },
 ];
 const LAYER_OF = Object.fromEntries(LAYERS.flatMap(l => l.kinds.map(k => [k, l.id])));
 const LAYER_BY_ID = Object.fromEntries(LAYERS.map(l => [l.id, l]));
@@ -1181,7 +1182,7 @@ function renderToolbar() {
     </div>
     ${mode === 'files' && (map.groups?.list?.length || isMulti(map)) ? `<span style="font-size:11px;color:#5a6890">Color by</span><div class="cm-seg cm-colorby" role="group" aria-label="Color by">
       <button data-color="folder" aria-pressed="${colorBy === 'folder'}">Folder</button>${map.groups?.list?.length ? `<button data-color="group" aria-pressed="${colorBy === 'group'}">Group</button>` : ''}${isMulti(map) ? `<button data-color="codefolder" aria-pressed="${colorBy === 'codefolder'}">Code folder</button>` : ''}</div>` : ''}
-    ${LAYERS.map(L => `<button class="cm-chip" data-layer="${L.id}" aria-pressed="${!!layerOn[L.id]}">
+    ${LAYERS.filter(L => L.id !== 'inherits' || edges.some(e => e.layer === 'inherits')).map(L => `<button class="cm-chip" data-layer="${L.id}" aria-pressed="${!!layerOn[L.id]}">
       <span class="cm-dot" style="background:${L.color};box-shadow:0 0 6px ${L.color}"></span>${L.label}
       <span style="color:#5a6890">${layerCount(L.id)}</span></button>`).join('')}
     <button class="cm-btn cm-fit" style="margin-left:4px">Fit</button>
@@ -1326,12 +1327,12 @@ function renderFindings() {
   const standaloneBody = `<div class="cm-note">Run by hand (for example with node), so no file imports them. That is expected.</div>${list(standalone)}`;
 
   const screens = map.navigation?.screens || [];
-  const noNav = screens.filter(s => !s.incomingNavigation && !s.incomingAsNestedParent);
+  const noNav = screens.filter(s => !s.handler && !s.incomingNavigation && !s.incomingAsNestedParent); // server routes are reached by requests
   const noNavBody = noNav.length
     ? noNav.map(s => item(s.file || '', `${s.name}${s.parent ? ` (in ${s.parent})` : ''} · ${s.file ? base(s.file) : 'no file'}`, `${s.name} → ${s.file || 'no file'}`)).join('')
     : `<div class="cm-note">${screens.length ? 'None' : 'No navigation screens or web routes found.'}</div>`;
 
-  const KIND_LABEL = { load: 'Module loads with a computed path', navigate: 'Navigation to a computed or unknown screen or route', function: 'Cloud function calls with a computed name', data: 'Firestore paths that could not be resolved' };
+  const KIND_LABEL = { load: 'Module loads with a computed path', navigate: 'Navigation to a computed or unknown screen or route', function: 'Cloud function calls with a computed name', data: 'Firestore paths that could not be resolved', class: 'Python base classes that could not be resolved', route: 'Python web routes with a computed path or handler' };
   const unresolved = map.unresolved || [];
   const kinds = [...new Set([...(map.kinds?.unresolved || []), ...unresolved.map(u => u.kind)])];
   const unresolvedBody = kinds.map(kind => {

@@ -5,7 +5,8 @@ Notes for working on the app itself. For using it, see [README.md](README.md).
 ## Layout
 
 - `server.js`: the local API and static server (Express). Reads and writes `~/Brain`; app state lives in `~/.brain`.
-- `src/`: the browser app (Vite, Three.js) and the code map: `mapper.js` (builds maps), `brainmap.js` (the command),
+- `src/`: the browser app (Vite, Three.js) and the code map: `mapper.js` (builds maps; `mapper-python.js` for Python, with the
+  grammar in `grammars/`), `brainmap.js` (the command),
   `brainmap-mcp.js` (tool server), `codemap*.js` (panel, diagram, routes), `map-schema.js` (the map format version).
 - `scripts/`: `install.sh` (installer and updater), `release.sh` (release packages), `restart.mjs` and
   `check-build.mjs` (build verification), and the scripts the installer copies into `~/.brain`.
@@ -103,13 +104,34 @@ marked same file, so chains through local helpers stay connected: `callers`, `co
 `--depth`), `impact file:function`, `path`, `query` and `report` follow them, and a same-file hop does not use up a
 level of `--depth`.
 
-**Languages.** JavaScript and TypeScript (.js .jsx .mjs .cjs .ts .tsx), parsed with Babel. Imports resolve to the JS
+**Languages.** JavaScript and TypeScript (.js .jsx .mjs .cjs .ts .tsx), parsed with Babel, and Python (.py; see
+**Python** below). Imports resolve to the JS
 and TS extensions and index files (`./x.js` may mean `x.ts`), and through the nearest tsconfig.json or jsconfig.json
 (with its `extends` chain) for `paths` aliases and `baseUrl`. `.d.ts` files are used only to resolve imports.
 Type-only imports and exports are `type-import` links: hidden in the diagram by default, left out of calls, and
 followed by `brainmap impact --types`. Vendored code is never mapped: folders named vendor, vendors or third_party,
 `.min.js`, `.bundle.js` and `.global.js` files, and files over 20,000 lines that no project file imports; the map
 lists each skipped file with the reason.
+
+**Python.** `.py` files are parsed by `src/mapper-python.js` with the tree-sitter Python grammar compiled to
+WebAssembly (`src/grammars/tree-sitter-python.wasm`, tree-sitter-python 0.25.0, MIT; run by the `web-tree-sitter`
+package). Nothing is compiled at install and no Python is run, so a Mac without Python maps the same as one with it,
+and the result does not depend on an installed Python version. If the grammar cannot load, the Python files are
+listed as skipped with that reason and the rest is mapped (a folder with only Python files gets a clear error).
+Imports resolve from the folder root (and `src/` in a src layout), then from the importing file's own folder, as for a
+script run directly (marked inferred); relative imports, aliases, `from x import *` and packages are followed, and the
+`__init__.py` files Python runs first are inferred links. Anything else is a package. Calls follow the JavaScript
+rules (imported and same-file functions, with the enclosing function) and add instantiations (`Order()`, function
+`Order`) and method calls (function `Class.method`) only where the class is certain: `self.m()` and `cls.m()` (not
+when a project subclass overrides `m`), `super().m()`, `Class.m()`, `Class().m()` and a variable assigned once from
+`Class(...)`. A receiver known only from a type annotation, a variable assigned more than once, a method that may come
+from a package base class, and an attribute set on the instance go to unresolved (kind `call`) with the reason. Each
+file lists its classes with bases and methods; a class's file has an `inherits` link to each project base class's
+file. Entry files: `if __name__ == "__main__"`, `__main__.py`, console scripts in pyproject.toml, setup.py or
+setup.cfg, and a file that creates a Flask or FastAPI app. Flask and FastAPI routes (`@app.route`, `@app.get`,
+`@bp.post`, `@router.put`, `add_url_rule`, with Blueprint, APIRouter, `register_blueprint` and `include_router`
+prefixes) are routes named by their path, with their `handler` function and `methods`. Notes are the same tags in `#`
+comments. There is no data layer for Python yet. `__pycache__`, virtual environments and tool caches are skipped.
 
 **Navigation.** React Navigation screens and web routes. React Router routes are read from `<Route path element>`
 trees (nested, index and layout routes; the page is the deepest component in the element, including

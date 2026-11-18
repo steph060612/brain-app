@@ -59,11 +59,12 @@ Your brain is saved locally with git every 15 minutes when Apple's developer too
 anywhere else unless you add a private remote yourself. If a save fails, a red banner at the top of the app says why
 and stays until a save works again.
 
-## Code map (for JavaScript and TypeScript projects)
+## Code map (for JavaScript, TypeScript and Python projects)
 
 A project in your brain can be linked to one or more code folders. **Map project** reads the code (no AI, nothing
 leaves your Mac) and builds a map of files, imports, function calls, screens and routes, Firestore collections and
-cloud functions. **View map** shows it as a diagram; the panel lists entry files and findings such as files nothing
+cloud functions. Python projects get the same map plus classes (inheritance and method calls) and Flask or FastAPI
+routes; Python itself does not need to be installed. **View map** shows it as a diagram; the panel lists entry files and findings such as files nothing
 imports.
 
 The `brainmap` command answers structure questions from that map, inside a linked folder:

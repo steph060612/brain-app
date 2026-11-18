@@ -14,7 +14,7 @@ export const MESSAGE = 'This project has a code map. Before searching the code, 
   + '(mcp__brainmap__overview first, then file, impact, callers, collection, screen or find); if they are not available, '
   + 'run `brainmap overview` in a shell. This reminder appears once per session: after it, searches run normally.';
 
-const SOURCE = /\.(js|jsx|mjs|cjs|ts|tsx)$/i;
+const SOURCE = /\.(js|jsx|mjs|cjs|ts|tsx|py)$/i;
 // Instruction and configuration files are never blocked: CLAUDE.md, AGENTS.md, README, *.md, *.json, .env*,
 // lock files, dot-rc files and *.config.* / *rc.js files.
 const PROTECTED = /(^|\/)(CLAUDE|AGENTS|README)(\.[^/]*)?$|\.(md|mdx|json|jsonc|ya?ml|toml|lock|env|txt)$|(^|\/)\.env[^/]*$|(^|\/)\.[^/]*rc(\.[^/]*)?$|\.config\.[cm]?[jt]s$|(^|\/)(babel|metro|jest|vite|webpack|eslint|prettier|tailwind|postcss|next)\.config[^/]*$/i;
@@ -33,7 +33,7 @@ export function isCodeSearch(tool, input = {}) {
     if (input.path && isProtected(input.path)) return false;
     const g = String(input.glob || ''), t = String(input.type || '');
     if (g && (isProtected(g) || /\.(md|json|ya?ml|txt)\}?$/i.test(g))) return false;
-    if (t && !/^(js|jsx|ts|tsx|javascript|typescript)$/i.test(t)) return false;
+    if (t && !/^(js|jsx|ts|tsx|javascript|typescript|py|python)$/i.test(t)) return false;
     return true;
   }
   return false;

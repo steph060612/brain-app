@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-// Standalone code mapper: builds a file-level map of a JavaScript project.
+// Standalone code mapper: builds a file-level map of a JavaScript, TypeScript or Python project.
 // Usage: node src/mapper.js <project folder> <output name>
 // Read-only on the project. Writes only ~/.brain/maps/<output name>/map.json.
 //
 // Layers: imports (files), React Navigation (navigate edges), Firebase callable
 // functions (calls-function edges) and Firestore collections (reads / writes edges).
+// Python files are read by src/mapper-python.js into the same layers, plus classes (inherits edges).
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -16,12 +17,18 @@ import { detectGroups, nameGroups, SEED as GROUP_SEED, WEIGHTS as GROUP_WEIGHTS 
 
 import { SCHEMA_VERSION } from './map-schema.js';
 import { BRAIN as BRAIN_DIR, BRAIN_LABEL } from './brain-dir.js';
+import { NOTE_RE, CITE_RE } from './map-notes.js';
+import { isPython, loadPythonParser, mapPython, PY_PARSER, PY_EXT } from './mapper-python.js';
+export { PY_EXT };
 const IMPORT_KINDS = ['import', 're-export', 'require', 'dynamic'];
 const KINDS = {
   nodes: ['file', 'collection', 'subcollection'],
   edges: [...IMPORT_KINDS, 'type-import', 'navigate', 'calls-function', 'reads', 'writes', 'calls'],
   unresolved: ['load', 'navigate', 'function', 'data', 'call'],
 };
+// What a map with Python files can also hold. A map without Python files lists only KINDS, as before.
+const PY_KINDS = { edges: ['inherits'], unresolved: ['class', 'route'] };
+const kindsFor = (hasPython) => (hasPython ? { nodes: KINDS.nodes, edges: [...KINDS.edges, ...PY_KINDS.edges], unresolved: [...KINDS.unresolved, ...PY_KINDS.unresolved] } : KINDS);
 
 export const JS_EXT = ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts'];
 export const isTypeDeclaration = (p) => /\.d\.[mc]?ts$/i.test(p);
@@ -38,7 +45,9 @@ export function vendoredReason(rel) {
 }
 const ASSET_EXT = new Set(['.png', '.webp', '.jpg', '.jpeg', '.gif', '.svg', '.mp4', '.mp3', '.wav', '.ttf', '.otf', '.woff', '.woff2', '.csv', '.json', '.css', '.scss', '.sass', '.less']);
 export const SKIP_DIRS = new Set(['node_modules', 'ios', 'android', 'build', 'dist', '.git', '.claude',
-  'cache', '.cache', '.expo', '.next', '.turbo', 'coverage', 'web-build']);
+  'cache', '.cache', '.expo', '.next', '.turbo', 'coverage', 'web-build',
+  // Python: compiled files, virtual environments, installed packages and tool caches.
+  '__pycache__', '.venv', 'venv', 'site-packages', '.tox', '.nox', '.eggs', '.mypy_cache', '.pytest_cache', '.ruff_cache']);
 // Resolution order for an extensionless relative path. Platform variants are what Metro tries.
 const RESOLVE_SUFFIXES = ['', '.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.ios.js', '.android.js', '.native.js',
   '.ios.ts', '.ios.tsx', '.native.ts', '.native.tsx', '.d.ts',
@@ -58,7 +67,7 @@ const isMember = (n) => n?.type === 'MemberExpression' || n?.type === 'OptionalM
 const propName = (m) => (isMember(m) && !m.computed && m.property.type === 'Identifier' ? m.property.name : null);
 
 export const NO_JS_EXIT = 3;
-export const NO_JS_MESSAGE = 'No JavaScript or TypeScript files found. Other languages are not supported yet.';
+export const NO_JS_MESSAGE = 'No JavaScript, TypeScript or Python files found. Other languages are not supported yet.';
 
 function git(root, args) {
   if (process.env.MAPPER_NO_GIT === '1') return null; // the caller knows git is unavailable
@@ -1076,12 +1085,7 @@ function collectParamCalls(program, A) {
 // "Why" comments: a line of a comment that starts with NOTE, WHY, HACK, FIXME, TODO, IMPORTANT or WARNING (any case),
 // or any comment citing an ADR or RFC. Attached to the innermost named function around it (null at top level),
 // with the line and the first 200 characters (following // lines that continue it are joined).
-const NOTE_TAG = /^[\s!]*(NOTE|WHY|HACK|FIXME|TODO|IMPORTANT|WARNING)\b(\s*[:\-–—]|\(|[^.:\n()]{1,40}:)?/i;
-// A tag counts when written in capitals (TODO), followed by ":" or a dash, directly by "(" (todo(locale)), or by a
-// colon within a few words ("Why this exists:"); plain words such as a JSX label {/* Warning */}, a section label
-// "Note (in details tray)" or prose "note that…" are not notes.
-const NOTE_RE = { test: (l) => { const m = NOTE_TAG.exec(l); return !!m && (m[1] === m[1].toUpperCase() || !!m[2]); }, exec: (l) => NOTE_TAG.exec(l) };
-const CITE_RE = /\b(ADR|RFC)[\s#-]?\d+/i;
+// The tags and citations a note can start with: src/map-notes.js (shared with the Python side).
 function collectNotes(ast, A) {
   const fns = [];
   for (const n of A.nodes()) if (FUNC_TYPES.has(n.type)) { const name = functionName(n, A); if (name) fns.push({ start: n.start, end: n.end, name }); }
@@ -1666,7 +1670,7 @@ export function mergeMaps(parts) {
   const assetTotals = { total: 0, byExtension: {} };
   const aliasConfigs = [], aliasUsed = {};
   const counts = {};
-  let groupOffset = 0, duration = 0;
+  let groupOffset = 0, duration = 0, python = null;
   for (const { name, map: m } of parts) {
     const P = (f) => (f == null || !multi ? f : `${name}:${f}`);
     const PE = (id) => (DATA_ID.test(id) ? id : P(id));
@@ -1724,6 +1728,12 @@ export function mergeMaps(parts) {
       if (typeof v === 'number') counts[k] = (counts[k] || 0) + v;
       else if (v && typeof v === 'object') { counts[k] ??= {}; for (const [kk, vv] of Object.entries(v)) counts[k][kk] = (counts[k][kk] || 0) + vv; }
     }
+    if (m.python) {
+      python ??= { parser: m.python.parser };
+      for (const [k, v] of Object.entries(m.python)) if (typeof v === 'number') python[k] = (python[k] || 0) + v;
+      if (multi) (python.byFolder ??= {})[name] = m.python;
+      else python.importRoots = m.python.importRoots;
+    }
     duration += m.durationMs;
     folders.push({ name, path: m.project.path, gitCommit: m.project.gitCommit, fileListSource: m.project.fileListSource, generatedAt: m.generatedAt, durationMs: m.durationMs, counts: m.counts });
   }
@@ -1766,7 +1776,7 @@ export function mergeMaps(parts) {
   const first = parts[0].map;
   return {
     schemaVersion: SCHEMA_VERSION,
-    kinds: KINDS,
+    kinds: kindsFor(!!python),
     generatedAt: multi ? new Date().toISOString() : first.generatedAt,
     durationMs: duration,
     project: multi ? { folders: parts.map((p) => p.name) } : first.project,
@@ -1781,6 +1791,7 @@ export function mergeMaps(parts) {
     notes,
     skippedFiles, keptLargeFiles: keptLarge,
     pathAliases: { configs: aliasConfigs, used: aliasUsed },
+    ...(python ? { python } : {}),
   };
 }
 
@@ -1811,7 +1822,7 @@ function parseCli(argv) {
   return { folders, outName };
 }
 
-function main() {
+async function main() {
   const { folders: specs, outName } = parseCli(process.argv.slice(2));
   if (!outName) usage();
   if (!/^[A-Za-z0-9._-]+$/.test(outName) || outName === '.' || outName === '..') usage('Output name may only use letters, digits, dot, dash and underscore.');
@@ -1834,9 +1845,9 @@ function main() {
   const parts = [];
   for (const f of folders) {
     let built;
-    try { built = buildMap(f.root); }
+    try { built = await buildMap(f.root); }
     catch (e) {
-      if (e.code === NO_JS_EXIT) { console.error(folders.length > 1 ? `${f.name} (${f.root}): ${NO_JS_MESSAGE}` : NO_JS_MESSAGE); process.exit(NO_JS_EXIT); }
+      if (e.code === NO_JS_EXIT) { console.error(folders.length > 1 ? `${f.name} (${f.root}): ${e.message}` : e.message); process.exit(NO_JS_EXIT); }
       throw e;
     }
     parts.push({ ...f, ...built });
@@ -1862,8 +1873,8 @@ function main() {
 }
 
 // Maps one folder: { map (schema without folder fields), report() } . Throws { code: NO_JS_EXIT } when the
-// folder has no JavaScript or TypeScript.
-function buildMap(root) {
+// folder has no JavaScript, TypeScript or Python.
+async function buildMap(root) {
   const t0 = process.hrtime.bigint();
   const { source: listSource, files: allFiles } = listFiles(root);
   // Sources: JS and TS, without type declarations (.d.ts, used only to resolve imports) and without vendored
@@ -1897,7 +1908,30 @@ function buildMap(root) {
     codeOf.delete(f);
     return false;
   });
-  if (!jsFiles.length) throw Object.assign(new Error(NO_JS_MESSAGE), { code: NO_JS_EXIT });
+  // Python: .py files, with the same vendored and size rules (a Python file over MAX_LINES is skipped). The parser is
+  // WebAssembly bundled with the app; if it cannot load, the Python files are listed as skipped with the reason.
+  let pyFiles = allFiles.filter(isPython).sort().filter((f) => {
+    const why = vendoredReason(f);
+    if (why) { skippedFiles.push({ file: f, reason: why }); return false; }
+    let code; try { code = fs.readFileSync(path.join(root, f), 'utf8'); } catch { return false; }
+    const n = code.length === 0 ? 0 : code.split('\n').length;
+    if (n > MAX_LINES) { skippedFiles.push({ file: f, reason: `over ${MAX_LINES.toLocaleString('en-US')} lines (${n.toLocaleString('en-US')})` }); return false; }
+    codeOf.set(f, code);
+    return true;
+  });
+  let pyParser = null, pyLoadError = null;
+  if (pyFiles.length) {
+    try { pyParser = await loadPythonParser(); }
+    catch (e) {
+      pyLoadError = `${e?.message || e}`;
+      if (jsFiles.length) console.error(`Note: the Python parser could not be loaded (${pyLoadError}); ${pyFiles.length} Python file${pyFiles.length === 1 ? '' : 's'} not mapped.`);
+      for (const f of pyFiles) { skippedFiles.push({ file: f, reason: 'the Python parser could not be loaded' }); codeOf.delete(f); }
+      pyFiles = [];
+    }
+  }
+  if (!jsFiles.length && !pyFiles.length) {
+    throw Object.assign(new Error(pyLoadError ? `This folder has Python files, but the Python parser could not be loaded (${pyLoadError}). Reinstalling the Brain app restores it.` : NO_JS_MESSAGE), { code: NO_JS_EXIT });
+  }
 
   // Root groups: the project itself, plus separate roots such as functions/ and scripts/.
   const rootGroups = [{ name: 'app', dir: '' }];
@@ -1906,16 +1940,19 @@ function buildMap(root) {
   }
   const groupOf = (rel) => rootGroups.find((g) => g.dir && (rel === g.dir || rel.startsWith(g.dir + '/')))?.name ?? 'app';
   const jsSet = new Set(jsFiles);
+  const py = pyFiles.length ? mapPython({ root, files: pyFiles, codeOf, allFiles, parser: pyParser }) : null;
   for (const g of rootGroups) {
     g.hasPackageJson = fs.existsSync(path.join(root, g.dir, 'package.json'));
     const found = detectEntries(root, g, jsSet, allFiles, groupOf);
+    // Python entry files after the JavaScript ones, each in its own root group.
+    if (py) for (const x of py.entries) if (groupOf(x.file) === g.name && !found.some((y) => y.file === x.file)) found.push(x);
     g.entries = found.map((x) => x.file);
     g.entryReasons = Object.fromEntries(found.map((x) => [x.file, x.why]));
     g.entry = g.entries[0] ?? null; // the first one, for readers of a single entry
   }
   const functionsEntry = rootGroups.find((g) => g.name === 'functions')?.entry ?? null;
 
-  const nodeSet = new Set(jsFiles);
+  const nodeSet = new Set([...jsFiles, ...pyFiles]);
   const nodes = [], edges = [], unresolved = [], missing = [], parseFailures = [];
   const webRedirects = new Map(); // redirect route path → where it sends (<Route path="/" element={<Navigate to="/orders" />} />)
   const rawScreens = [], navCallsByFile = new Map(), callablesByFile = new Map(), dataByFile = new Map();
@@ -2024,11 +2061,30 @@ function buildMap(root) {
     }
   }
 
+  // --- Python files: nodes, imports, calls, classes, routes and notes (see mapper-python.js)
+  if (py) {
+    for (const rel of pyFiles) {
+      const code = codeOf.get(rel), info = py.nodesInfo.get(rel);
+      const segs = rel.split('/');
+      nodes.push({ id: rel, kind: 'file', path: rel, topFolder: segs.length > 1 ? segs[0] : '(root)', rootGroup: groupOf(rel),
+        exports: info.exports, lines: code.length === 0 ? 0 : code.split('\n').length - (code.endsWith('\n') ? 1 : 0),
+        packageImports: info.packageImports, packages: info.packages, classes: info.classes,
+        ...(py.parseFailures.some((x) => x.file === rel) ? { parseError: true } : {}) });
+    }
+    edges.push(...py.edges);
+    unresolved.push(...py.unresolved);
+    missing.push(...py.missing);
+    parseFailures.push(...py.parseFailures);
+    notes.push(...py.notes);
+    for (const r of py.screens) rawScreens.push(r);
+  }
+
   // --- navigation: screens, nesting, navigate edges
   for (const r of nextRoutes(root, allFiles)) if (nodeSet.has(r.file)) rawScreens.push({ name: r.path, component: null, file: r.file, navigator: 'Next.js', navigatorFile: r.file, line: 1, route: true });
   const screens = rawScreens.map((s) => ({
     name: s.name, component: s.component, file: s.file, navigator: s.navigator,
     navigatorFile: s.navigatorFile, line: s.line, host: s.host, localComponent: s.localComponent, ...(s.route ? { route: true } : {}),
+    ...(s.handler ? { handler: s.handler, methods: s.methods, ...(s.unregistered ? { unregistered: true } : {}) } : {}),
   }));
   // A navigator hosted by component H in file F is nested under the screen that renders H
   // (defined locally in F), or under a screen whose component is imported from F.
@@ -2249,8 +2305,8 @@ function buildMap(root) {
   const fileNodes = nodes.filter((n) => n.kind === 'file');
   // A file used only for its types is still used: type imports count for reachability and importers.
   const importEdges = edges.filter((e) => IMPORT_KINDS.includes(e.kind) || e.kind === 'type-import');
-  const out = new Map(jsFiles.map((f) => [f, []]));
-  const importers = new Map(jsFiles.map((f) => [f, new Set()]));
+  const out = new Map([...nodeSet].map((f) => [f, []]));
+  const importers = new Map([...nodeSet].map((f) => [f, new Set()]));
   for (const e of importEdges) { out.get(e.from).push(e.to); importers.get(e.to).add(e.from); }
   const reach = (starts) => {
     const seen = new Set();
@@ -2326,7 +2382,7 @@ function buildMap(root) {
 
   const map = {
     schemaVersion: SCHEMA_VERSION,
-    kinds: KINDS,
+    kinds: kindsFor(!!py),
     generatedAt: new Date().toISOString(),
     durationMs: Math.round(elapsedMs),
     project: { path: root, gitCommit: commit, fileListSource: listSource },
@@ -2337,8 +2393,8 @@ function buildMap(root) {
       unresolved: unresolved.length, unresolvedByKind: countBy(unresolved, (u) => u.kind),
       missingRelative: missing.length, assets: assetTotals.total, parseFailures: parseFailures.length,
       screens: screens.length, navigationCalls: navStats.calls, functionCalls: fnStats.calls,
-      filesByLanguage: countBy(fileNodes, (n) => (/\.(m|c)?tsx?$/i.test(n.path) ? 'typescript' : 'javascript')), skippedFiles: skippedFiles.length,
-      notes: notes.length, edgesByConfidence: countBy(edges, (e) => e.tag), functionCallsSameFile: localCallCount, functionCallSites: callStats.calls, functionCallsResolved: callStats.resolved, functionCallsViaValue: callStats.viaValue || 0, functionCallsUnresolved: callStats.unresolved,
+      filesByLanguage: countBy(fileNodes, (n) => (isPython(n.path) ? 'python' : /\.(m|c)?tsx?$/i.test(n.path) ? 'typescript' : 'javascript')), skippedFiles: skippedFiles.length,
+      notes: notes.length, edgesByConfidence: countBy(edges, (e) => e.tag), functionCallsSameFile: localCallCount + (py?.stats.sameFile ?? 0), functionCallSites: callStats.calls + (py ? py.stats.resolved + py.stats.unresolved : 0), functionCallsResolved: callStats.resolved + (py?.stats.resolved ?? 0), functionCallsViaValue: callStats.viaValue || 0, functionCallsUnresolved: callStats.unresolved + (py?.stats.unresolved ?? 0),
       collections: collections.size, subcollections: subs.size, documentIdPathsMasked: maskedPaths.size, dataUsesWithUnknownOperation: dataOpUnknown.length,
     },
     nodes, edges, unresolved, missingRelative: missing, assetTotals, parseFailures,
@@ -2350,6 +2406,11 @@ function buildMap(root) {
     notes,
     skippedFiles, keptLargeFiles: keptLarge,
     pathAliases: { configs: resolve.aliases(), used: resolve.aliasesUsed() },
+    // Only in a map with Python files: the parser and what the Python side found.
+    ...(pyLoadError ? { python: { parser: PY_PARSER, loadError: pyLoadError } } : {}),
+    ...(py ? { python: { parser: PY_PARSER, importRoots: py.stats.roots, files: pyFiles.length, classes: py.stats.classes, inheritanceEdges: py.stats.inheritance,
+      callsBetweenFiles: py.stats.resolved, callsSameFile: py.stats.sameFile, methodCalls: py.stats.methodCalls, instantiations: py.stats.instantiations,
+      callsUnresolved: py.stats.unresolved, webRoutes: py.stats.routes } } : {}),
   };
 
   return { map, report };
@@ -2377,7 +2438,7 @@ function buildMap(root) {
     console.log(`Unmatched screen names: ${kv(um) || 'none'}`);
     console.log('Most navigated-to screens:');
     for (const s of [...screens].sort((a, b) => b.incomingNavigation - a.incomingNavigation || a.name.localeCompare(b.name)).slice(0, 10)) console.log(`  ${s.incomingNavigation}  ${s.name}`);
-    const none = screens.filter((s) => !s.incomingNavigation && !s.incomingAsNestedParent);
+    const none = screens.filter((s) => !s.handler && !s.incomingNavigation && !s.incomingAsNestedParent); // server routes are reached by requests
     console.log(`No incoming navigation found: ${none.length}: ${none.map((s) => s.name + (s.parent ? ` (in ${s.parent})` : '')).join(', ')}`);
   }
   if (fnStats.calls || functionDefs.size) {
@@ -2397,7 +2458,13 @@ function buildMap(root) {
     for (const n of nodes.filter((x) => x.kind === 'subcollection')) console.log(`  ${n.pattern}: ${n.readers} / ${n.writers} / ${n.usedWithUnknownOperation}`);
     console.log(`Data uses with unknown read/write: ${dataOpUnknown.length}; unresolved data paths: ${map.counts.unresolvedByKind.data ?? 0}; paths with a literal document ID masked as {id}: ${maskedPaths.size}`);
   }
-  console.log(`Function calls between files: ${callStats.resolved} resolved (${callStats.viaValue || 0} via a value passed on), ${callStats.unresolved} unresolved (kind call); inside the same file: ${localCallCount}`);
+  if (jsFiles.length) console.log(`Function calls between files: ${callStats.resolved} resolved (${callStats.viaValue || 0} via a value passed on), ${callStats.unresolved} unresolved (kind call); inside the same file: ${localCallCount}`);
+  if (py) {
+    const s = py.stats;
+    console.log(`Python: ${pyFiles.length} files (import roots: ${s.roots.join(', ')}); classes ${s.classes}, inherits edges ${s.inheritance}; calls between files ${s.resolved}, inside the same file ${s.sameFile} (method calls ${s.methodCalls}, instantiations ${s.instantiations}); unresolved calls ${s.unresolved}; web routes ${s.routes}`);
+    const why = countBy(py.unresolved.filter((u) => u.kind === 'call'), (u) => u.reason.replace(/^.*?\(\): /, '').replace(/ \S+\.\S+ \(overridden.*/, ' (overridden in a subclass)').replace(/base class .*/, 'base class …').replace(/ in \S+$/, ''));
+    if (Object.keys(why).length) console.log(`Python unresolved calls by reason: ${kv(why)}`);
+  }
   console.log(`Groups: ${groupList.length} (+${det.isolated.length} isolated files)`);
   for (const g of groupList) console.log(`  ${g.id}. [${g.root}] ${g.label}  (${g.size})  ${g.central.join(', ')}`);
   console.log(`Edges by confidence: ${kv(countBy(edges, (e) => e.tag))}; inferred by reason: ${kv(countBy(edges.filter((e) => e.why), (e) => e.why))}`);
@@ -2411,4 +2478,4 @@ function buildMap(root) {
 }
 
 // Run only when executed directly, so the server can import the constants above.
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) main();
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) main().catch((e) => { console.error(e?.stack || String(e)); process.exit(1); });

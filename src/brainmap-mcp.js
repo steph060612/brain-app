@@ -70,7 +70,7 @@ async function handle(msg) {
     case 'initialize':
       return reply({ protocolVersion: params?.protocolVersion || '2025-06-18', capabilities: { tools: {} },
         serverInfo: { name: 'brainmap', version: VERSION },
-        instructions: 'Code map of the JavaScript or TypeScript project in this folder (if it is linked in the Brain app; a project can link several folders that share one map). Use these tools before searching files for structure questions.' });
+        instructions: 'Code map of the JavaScript, TypeScript or Python project in this folder (if it is linked in the Brain app; a project can link several folders that share one map). Use these tools before searching files for structure questions.' });
     case 'ping': return reply({});
     case 'tools/list':
       return reply({ tools: TOOLS.map(t => ({ name: t.name, description: t.description,

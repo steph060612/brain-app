@@ -7,7 +7,7 @@ import { spawn, execFile } from 'child_process';
 import { homedir } from 'os';
 import { join, sep, dirname, extname } from 'path';
 import { fileURLToPath } from 'url';
-import { JS_EXT, SKIP_DIRS, NO_JS_EXIT, NO_JS_MESSAGE, vendoredReason, defaultFolderName, FOLDER_NAME_RE, RESERVED_FOLDER_NAMES } from './mapper.js';
+import { JS_EXT, PY_EXT, SKIP_DIRS, NO_JS_EXIT, NO_JS_MESSAGE, vendoredReason, defaultFolderName, FOLDER_NAME_RE, RESERVED_FOLDER_NAMES } from './mapper.js';
 export { defaultFolderName, FOLDER_NAME_RE, RESERVED_FOLDER_NAMES };
 
 export const HOME  = homedir();
@@ -22,7 +22,7 @@ const MAPPER = join(dirname(fileURLToPath(import.meta.url)), 'mapper.js');
 
 export const fail = (status, message) => Object.assign(new Error(message), { status });
 export const tilde = p => (p === HOME || p.startsWith(HOME + sep) ? '~' + p.slice(HOME.length) : p);
-export const isSource = rel => JS_EXT.includes(extname(rel).toLowerCase()) && !rel.split('/').some(s => SKIP_DIRS.has(s)) && !vendoredReason(rel);
+export const isSource = rel => (JS_EXT.includes(extname(rel).toLowerCase()) || PY_EXT.includes(extname(rel).toLowerCase())) && !rel.split('/').some(s => SKIP_DIRS.has(s)) && !vendoredReason(rel);
 export const mapFile = slug => join(MAPS, slug, 'map.json');
 export const realOrSelf = async p => { try { return await realpath(p); } catch { return p; } };
 export const inside = (p, dir) => p === dir || p.startsWith(dir + sep);

@@ -16,17 +16,17 @@ import { forFolder, crossFolder, isMulti, folderNames, scopeQuery, prefixed } fr
 const LIST = 10;          // default items per section; --all shows everything
 const WIDTH = 110;
 const IMPORT_KINDS = new Set(['import', 'require', 're-export', 'dynamic']);
-const HELP = `brainmap: read-only map of a JavaScript or TypeScript project linked in the Brain app.
+const HELP = `brainmap: read-only map of a JavaScript, TypeScript or Python project linked in the Brain app.
 
 Usage: brainmap <command> [argument] [--all] [--depth 2] [--types] [--folder <name>] [--project <name>] [--no-refresh]
   overview              project summary: entry files, folders, most imported files, screens, collections, functions
   files <folder>        files in a folder, with line counts and exported names
-  file <path>           exports, imports, importers, navigation, collections and functions of one file
+  file <path>           exports, imports, importers, navigation, collections, functions and (Python) classes of one file
   impact <path>         files that depend on it through imports, up to 3 steps away (--types: type imports too;
                         impact file:function: through calls)
   screen <name>         a navigation screen or web route (screen name, route path like /orders/:orderId, a concrete
                         path like /orders/123, or the page file): its file, where it navigates and is reached from
-  callers <name>        files and lines that call an exported function (or file:name)
+  callers <name>        files and lines that call an exported function (or file:name; a Python method as Class.method)
   path <A> <B>          shortest path between two files, functions, screens, routes or collections (navigation first
                         between two screens or pages; --all-shortest: up to 5)
   query "<question>"    plain-words question: matching files, functions, screens, routes, collections and their links
@@ -36,7 +36,7 @@ Usage: brainmap <command> [argument] [--all] [--depth 2] [--types] [--folder <na
   report                most-connected files, most-called functions, busiest data, bridges, rare links, next questions
   collection <name>     files that read and write a collection or subcollection (name or path, e.g. users/{uid}/orders)
   function <name>       a cloud function: where it is defined and who calls it
-  find <text>           matches in file paths, exported names, screens and collections
+  find <text>           matches in file paths, exported names, classes, screens and collections
   unused                files not reached from their folder's entry files, screens with no incoming navigation found
 
 The project is the one whose linked folder contains the current folder (any of its folders), or --project <name>.
@@ -211,7 +211,7 @@ function resolveFile(ix, q) {
     if (hits.length > 1) die(`"${q}" matches ${hits.length} files; use the full path:\n${hits.slice(0, 20).map(f => `  ${f.path}`).join('\n')}`);
   }
   const near = files.filter(f => f.path.toLowerCase().includes(low)).slice(0, 10);
-  die(`No mapped file "${q}".${near.length ? `\nSimilar:\n${near.map(f => `  ${f.path}`).join('\n')}` : ''}\nOnly JavaScript files are mapped.`);
+  die(`No mapped file "${q}".${near.length ? `\nSimilar:\n${near.map(f => `  ${f.path}`).join('\n')}` : ''}\nOnly JavaScript, TypeScript and Python files are mapped.`);
 }
 
 const linesOf = list => {
@@ -237,7 +237,7 @@ function overview(P, ix) {
   const fnNames = map.functions?.exported || [];
   say(`${plural(ix.files.length, 'file')}, ${plural(c.edges ?? map.edges.length, 'link')}, ${plural(ix.screens.filter(s => !s.route).length, 'screen')}, ${routeCount(ix) ? `${plural(routeCount(ix), 'web route')}, ` : ''}${plural(ix.collections.length, 'collection')}, ${plural(fnNames.length, 'cloud function')}`);
   const langs = map.counts?.filesByLanguage || {};
-  if (Object.keys(langs).length) say(`Languages: ${Object.entries(langs).map(([l, n]) => `${n} ${l === 'typescript' ? 'TypeScript' : 'JavaScript'}`).join(', ')}${map.skippedFiles?.length ? `; skipped ${plural(map.skippedFiles.length, 'file')} (${[...new Set(map.skippedFiles.map(x => x.reason.split(' (')[0]))].join(', ')})` : ''}`);
+  if (Object.keys(langs).length) say(`Languages: ${Object.entries(langs).map(([l, n]) => `${n} ${l === 'typescript' ? 'TypeScript' : l === 'python' ? 'Python' : 'JavaScript'}`).join(', ')}${map.skippedFiles?.length ? `; skipped ${plural(map.skippedFiles.length, 'file')} (${[...new Set(map.skippedFiles.map(x => x.reason.split(' (')[0]))].join(', ')})` : ''}`);
   const groups = map.rootGroups || [];
   const gname = g => (isMulti(map) ? `${g.codeFolder}:` : '') + (g.dir || g.name);
   const ents = g => g.entries || (g.entry ? [g.entry] : []);
@@ -260,7 +260,7 @@ function overview(P, ix) {
     fnNames.map(n => (called[n]?.callers?.length ? `${n} ←${called[n].callers.length}` : n)), Infinity);
   const apps = groups.filter(g => ents(g).length && g.name === 'app');
   const standalone = groups.filter(g => !ents(g).length).reduce((s, g) => s + (g.fileCount || 0), 0);
-  const noNav = ix.screens.filter(s => !s.incomingNavigation && !s.incomingAsNestedParent).length;
+  const noNav = ix.screens.filter(s => !s.handler && !s.incomingNavigation && !s.incomingAsNestedParent).length;
   say(`Not imported from ${apps.length ? (apps.length > 1 ? 'the app entry files' : apps[0].entries.length > 2 ? `${apps[0].entries.length} entry files` : apps[0].entries.join(' or ')) : 'the entry file'}: ${apps.length ? apps.reduce((s, a) => s + (a.notImportedFromOwnEntry || 0), 0) : '?'} app files${standalone ? ` (+${standalone} standalone scripts)` : ''} · screens with no incoming navigation: ${noNav} · unresolved: ${(map.unresolved || []).length}`);
   say('More: brainmap file <path> | impact <path> | screen <name> | collection <name> | function <name> | files <folder> | find <text> | unused');
 }
@@ -287,6 +287,12 @@ function fileCmd(P, ix, q) {
   const nn = notesOf(P, f.path).length, grp = P.map.groups?.list.find(g => g.id === f.group);
   say(`${f.path}  ${f.lines} lines  folder ${folderOf(f)}${f.rootGroup !== 'app' ? ` (own root: ${f.rootGroup})` : ''}${grp ? `  group ${grp.id}. ${grp.label}` : ''}${nn ? `  ${plural(nn, 'note')} (brainmap notes ${f.path})` : ''}${f.parseError ? '  (could not be parsed)' : ''}`);
   wrapList(`Exports (${(f.exports || []).length}): `, f.exports || [], 20);
+  for (const c of f.classes || []) {
+    const bases = c.bases.map(b => (b.file ? `${b.name} (${b.file})` : b.package ? `${b.name} (package ${b.package})` : b.builtin ? b.name : `${b.name} (not resolved)`));
+    const subs = ix.files.flatMap(g => (g.classes || []).filter(x => x.bases.some(b => b.file === f.path && b.name === c.name)).map(x => `${x.name}${g.path === f.path ? '' : ` (${g.path})`}`));
+    say(`Class ${c.name} (line ${c.line})${bases.length ? ` from ${bases.join(', ')}` : ''}${subs.length ? `; subclasses: ${subs.join(', ')}` : ''}`);
+    if (c.methods.length) wrapList('  methods: ', c.methods, 30, '    ');
+  }
   const imp = out.filter(e => IMPORT_KINDS.has(e.kind)), impBy = inn.filter(e => IMPORT_KINDS.has(e.kind));
   const impTo = groupBy(imp, e => e.to), impFrom = groupBy(impBy, e => e.from);
   say(`Imports ${plural(impTo.size, 'file')}${imp.length !== impTo.size ? ` (${imp.length} statements)` : ''}${impTo.size ? ':' : ''}`);
@@ -398,7 +404,8 @@ function screenCmd(P, ix, q) {
   const names = new Set(hits.map(s => s.name));
   for (const s of hits) {
     say(s.route
-      ? `Route ${s.name}: ${s.file || 'no page file found'}  (${s.navigator === 'Next.js' ? 'Next.js file route' : `declared in ${s.navigatorFile}:${s.line}`})`
+      ? (s.handler ? `Route ${(s.methods || []).join('/')} ${s.name}: ${s.navigator} handler ${s.handler} in ${s.file}  (declared in ${s.navigatorFile}:${s.line}${s.unregistered ? '; its router is not registered on an app found in the code' : ''})`
+        : `Route ${s.name}: ${s.file || 'no page file found'}  (${s.navigator === 'Next.js' ? 'Next.js file route' : `declared in ${s.navigatorFile}:${s.line}`})`)
       : `Screen ${s.name}: ${s.file || 'no file found'}  (${s.navigator || 'navigator'}${s.parent ? ` in ${s.parent}` : ''}, declared in ${s.navigatorFile}:${s.line})`);
   }
   const files = new Set(hits.map(s => s.file).filter(Boolean));
@@ -683,18 +690,22 @@ function callersCmd(P, ix, q) {
   let file = null, name = q;
   const colon = q.lastIndexOf(':');
   if (colon > 0) { file = resolveFile(ix, q.slice(0, colon)).path; name = q.slice(colon + 1); }
-  const all = P.map.edges.filter(e => e.kind === 'calls' && (e.function === name || e.local === name || e.export === name) && (!file || e.to === file));
-  const byTarget = groupBy(all, e => e.to);
-  const passed = (P.map.unresolved || []).filter(u => u.kind === 'call' && u.name === name && (!file || u.target === file));
+  const all = P.map.edges.filter(e => e.kind === 'calls' && (e.function === name || e.local === name || e.export === name || e.method === name) && (!file || e.to === file));
+  // A Python method asked for by its own name (_send_json) is shown under its full name (Handler._send_json).
+  const fullName = e => (e.method === name && e.function !== name ? e.function : name);
+  const byTarget = groupBy(all, e => `${e.to}\0${fullName(e)}`);
+  const passed = (P.map.unresolved || []).filter(u => u.kind === 'call' && u.reason === 'function used as a value' && u.name === name && (!file || u.target === file));
+  const unsure = (P.map.unresolved || []).filter(u => u.kind === 'call' && u.reason !== 'function used as a value' && u.name && (u.name === name || u.name.endsWith(`.${name}`)) && (!file || u.target === file));
   if (!byTarget.size) {
     const defined = ix.files.filter(f => (f.exports || []).includes(name) && (!file || f.path === file)).map(f => f.path);
     say(defined.length
       ? `${name} (exported by ${defined.join(', ')}): no calls found, in other files or its own.`
       : `No function "${name}"${file ? ` in ${file}` : ''} is called anywhere in the map.${file ? '' : ' Try brainmap find, or file:name for a function that is not exported.'}`);
   }
-  if (byTarget.size > 1) say(`"${name}" matches ${byTarget.size} functions: ${[...byTarget.keys()].map(t => `${t}:${name}`).join(', ')}`);
-  for (const [target, es] of byTarget) {
+  if (byTarget.size > 1) say(`"${name}" matches ${byTarget.size} functions: ${[...byTarget.keys()].map(k => k.replace('\0', ':')).join(', ')}`);
+  for (const [key, es] of byTarget) {
     if (byTarget.size > 1) say('');
+    const [target, name] = key.split('\0');
     const nodes = tree(P, target, name, DEPTH);
     const other = es.filter(e => !e.sameFile), same = es.length - other.length;
     const nn = notesOf(P, target, name).length;
@@ -707,6 +718,10 @@ function callersCmd(P, ix, q) {
   if (passed.length) {
     say(`Also passed on as a value, so its calls cannot be followed (${passed.length}):`);
     items(passed.map(u => `${u.file}:${u.line}`));
+  }
+  if (unsure.length) {
+    say(`Possible calls the map could not confirm (${unsure.length}, unresolved):`);
+    items(unsure.map(u => `${u.file}:${u.line}  ${u.reason}`));
   }
 }
 
@@ -816,11 +831,13 @@ function findCmd(P, ix, q) {
   const paths = ix.files.filter(f => f.path.toLowerCase().includes(low));
   const exp = ix.files.flatMap(f => (f.exports || []).filter(x => x.toLowerCase().includes(low)).map(x => `${x}  ${f.path}`));
   const scr = ix.screens.filter(s => s.name.toLowerCase().includes(low));
+  const cls = ix.files.flatMap(f => (f.classes || []).flatMap(c => [c.name, ...c.methods.map(m => `${c.name}.${m}`)].filter(x => x.toLowerCase().includes(low)).map(x => `${x}  ${f.path}`)));
   const cols = [...ix.collections.filter(c => c.name.toLowerCase().includes(low)).map(c => c.name),
     ...ix.subs.filter(n => n.pattern.toLowerCase().includes(low)).map(n => n.pattern)];
-  say(`"${q}": ${plural(paths.length, 'path')}, ${plural(exp.length, 'export')}, ${plural(scr.length, 'screen')}, ${plural(cols.length, 'collection or subcollection', 'collections or subcollections')}`);
+  say(`"${q}": ${plural(paths.length, 'path')}, ${plural(exp.length, 'export')}, ${cls.length ? `${plural(cls.length, 'class or method', 'classes or methods')}, ` : ''}${plural(scr.length, 'screen')}, ${plural(cols.length, 'collection or subcollection', 'collections or subcollections')}`);
   if (paths.length) { say('Paths:'); items(paths.map(f => f.path)); }
   if (exp.length) { say('Exports:'); items(exp); }
+  if (cls.length) { say('Classes and methods:'); items(cls); }
   if (scr.length) { say('Screens:'); items(scr.map(s => `${s.name}  ${s.file || ''}`)); }
   if (cols.length) wrapList('Collections: ', cols);
 }
@@ -839,7 +856,7 @@ function unusedCmd(P, ix) {
     items(list.map(f => `${f.path}${f.importedBy ? `  (imported by ${f.importedBy} unreached file${f.importedBy === 1 ? '' : 's'})` : ''}`), 25);
   }
   for (const g of groups.filter(g => !ents(g).length)) say(`${g.codeFolder && P.only ? `${g.codeFolder}:` : ''}${g.dir || g.name}/: ${plural(g.fileCount, 'file')} with no entry file (standalone scripts, run by hand); not listed`);
-  const noNav = ix.screens.filter(s => !s.incomingNavigation && !s.incomingAsNestedParent);
+  const noNav = ix.screens.filter(s => !s.handler && !s.incomingNavigation && !s.incomingAsNestedParent); // server routes are reached by requests
   say(`Screens with no incoming navigation found: ${noNav.length}`);
   items(noNav.map(s => `${s.name}${s.parent ? ` (in ${s.parent})` : ''}  ${s.file || 'no file'}`), 20);
   say('"Not found" means the map saw no link; code can still be used in ways the map does not see (computed names, other languages).');

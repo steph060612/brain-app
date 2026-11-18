@@ -65,7 +65,7 @@ Use **Copy project only** when the chat already has your pack and you only need 
 - Your brain is yours: it is not shared with anyone and has no online backup unless you add a private GitHub repository yourself.
 
 ## Code map, for coding with Codex
-If you write JavaScript or TypeScript, the Brain app can map a project so Codex answers structure questions (who calls this, what breaks if I change that) from the map instead of searching every file.
+If you write JavaScript, TypeScript or Python, the Brain app can map a project so Codex answers structure questions (who calls this, what breaks if I change that) from the map instead of searching every file.
 1. Open the project in the app (it needs a project in your brain first), click **Link code folder**, type the folder's path (for example `~/Projects/my-app`) and click **Link**, then **Map project**. **View map** shows it as a diagram.
 2. Click **Enable for assistants**. It shows the exact text first, then adds a short marked block to the folder's `AGENTS.md`, which Codex reads. Without Claude Code on your Mac it writes only `AGENTS.md` (never `CLAUDE.md`), and the block tells Codex to run `brainmap overview`, `brainmap query "..."` and the other commands in a shell. Nothing is committed; **Remove** takes the block out again.
 3. In a new Terminal window, `brainmap help` lists the commands. Run them inside the code folder.

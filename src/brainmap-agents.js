@@ -22,12 +22,12 @@ export const block = (created, env = CLAUDE_ENV) => (env.claude ? `${start(creat
 ## Code map: use brainmap first
 - For questions about how this code fits together (who calls, uses or depends on what, where something happens), use the brainmap tools (mcp__brainmap__*) or the \`brainmap\` command before searching the repository.
 - Start with \`report\` or \`overview\`; for a question in words, use \`query\`.
-- The tool list or \`brainmap help\` shows the rest. The map covers JavaScript and TypeScript, is read-only and refreshes itself.
+- The tool list or \`brainmap help\` shows the rest. The map covers JavaScript, TypeScript and Python, is read-only and refreshes itself.
 ${END}` : `${start(created)}
 ## Code map: use brainmap first
 - For questions about how this code fits together (who calls, uses or depends on what, where something happens), run \`${env.brainmapCommand} overview\` in a shell before searching the repository.
 - Then the matching command: \`${env.brainmapCommand} query "<question in words>"\`, \`${env.brainmapCommand} impact <file>\`, \`${env.brainmapCommand} callers <function>\`, \`${env.brainmapCommand} collection <name>\`, \`${env.brainmapCommand} report\`.
-- \`${env.brainmapCommand} help\` lists every command. The map covers JavaScript and TypeScript, is read-only and refreshes itself.
+- \`${env.brainmapCommand} help\` lists every command. The map covers JavaScript, TypeScript and Python, is read-only and refreshes itself.
 ${END}`);
 
 const BLOCK_RE = /\n*<!-- brainmap:start[^\n]*-->[\s\S]*?<!-- brainmap:end -->[ \t]*\n?/g;
