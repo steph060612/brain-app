@@ -77,6 +77,39 @@ function items(list, limit = LIST) {
   for (const x of shown) say(`  ${x}`);
   if (shown.length < list.length) say(`  ${more(list.length - shown.length)}`);
 }
+// A list in a one-line message: all of it, or its first `limit` names with how many there are, so a cut list never
+// reads as complete. --all lists every name.
+function cutList(label, names, limit) {
+  if (ALL || names.length <= limit) return `${label}: ${names.join(', ')}`;
+  return `${label} (${limit} of ${names.length}, use --all to list every name): ${names.slice(0, limit).join(', ')}`;
+}
+// Names like the query: those containing the whole query; else those containing its words (users/{uid}/workoutLogs
+// → workoutLogs; placeholders such as {uid} are not words), best matches first; else close misspellings of a path
+// segment (workoutLgos → workoutLogs). Returns names in that order.
+function osa(a, b) { // edit distance where swapping two neighbors counts as one edit
+  const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+  for (let j = 1; j <= b.length; j++) d[0][j] = j;
+  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) {
+    d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+  }
+  return d[a.length][b.length];
+}
+function similar(names, q) {
+  const low = String(q).toLowerCase();
+  const whole = names.filter(n => n.toLowerCase().includes(low));
+  if (whole.length) return whole;
+  const words = [...new Set(low.replace(/\{[^}]*\}/g, ' ').split(/[^a-z0-9_]+/).filter(w => w.length >= 3))];
+  // Each word scores its length when a name contains it, one less when it is a close misspelling of a segment.
+  const wordScore = (w, n, segs) => (n.includes(w) ? w.length : segs.some(seg => osa(w, seg) <= Math.max(1, Math.floor(w.length / 5))) ? w.length - 1 : 0);
+  const scored = names.map(n => {
+    const ln = n.toLowerCase(), segs = ln.split(/[^a-z0-9_]+/).filter(Boolean);
+    return { n, score: words.reduce((t, w) => t + wordScore(w, ln, segs), 0) };
+  }).filter(x => x.score);
+  if (!scored.length) return [];
+  const best = Math.max(...scored.map(x => x.score));
+  return scored.filter(x => x.score * 2 >= best).sort((a, b) => b.score - a.score).map(x => x.n);
+}
 function flush() { process.stdout.write(lines.join('\n') + '\n'); }
 // Ends with a message, keeping any note already printed (such as "Map refreshed").
 function die(msg, code = 1) { process.stdout.write([...lines, msg].join('\n') + '\n'); process.exit(code); }
@@ -213,10 +246,11 @@ function resolveFile(ix, q) {
   for (const t of tries) {
     const hits = files.filter(t);
     if (hits.length === 1) return hits[0];
-    if (hits.length > 1) die(`"${q}" matches ${hits.length} files; use the full path:\n${hits.slice(0, 20).map(f => `  ${f.path}`).join('\n')}`);
+    if (hits.length > 1) die(`"${q}" matches ${hits.length} files; use the full path:\n${(ALL ? hits : hits.slice(0, 20)).map(f => `  ${f.path}`).join('\n')}${!ALL && hits.length > 20 ? `\n  (+${hits.length - 20} more, use --all)` : ''}`);
   }
-  const near = files.filter(f => f.path.toLowerCase().includes(low)).slice(0, 10);
-  die(`No mapped file "${q}".${near.length ? `\nSimilar:\n${near.map(f => `  ${f.path}`).join('\n')}` : ''}\nOnly JavaScript, TypeScript and Python files are mapped.`);
+  const near = similar(files.map(f => f.path), low);
+  const shownNear = ALL ? near : near.slice(0, 10);
+  die(`No mapped file "${q}".${near.length ? `\nSimilar${near.length > shownNear.length ? ` (${shownNear.length} of ${near.length}, use --all to list every name)` : ''}:\n${shownNear.map(p => `  ${p}`).join('\n')}` : ''}\nOnly JavaScript, TypeScript and Python files are mapped.`);
 }
 
 const linesOf = list => {
@@ -391,15 +425,15 @@ function findScreens(ix, q) {
   if (q.startsWith('/')) {
     // A route path, or a concrete path such as /orders/123 (matched to /orders/:orderId).
     const hits = routesFor(ix.screens, q);
-    if (!hits.length) die(`No route matches "${q}". Routes: ${ix.screens.filter(s => s.route).map(s => s.name).slice(0, 30).join(', ') || 'none in this map'}`);
+    if (!hits.length) { const routes = ix.screens.filter(s => s.route).map(s => s.name); die(`No route matches "${q}". ${routes.length ? cutList('Routes', routes, 30) : 'Routes: none in this map'}`); }
     return hits;
   }
   const page = s => s.file?.split('/').pop().replace(/\.[^.]+$/, '').toLowerCase();
   let hits = ix.screens.filter(s => s.name.toLowerCase() === q.toLowerCase() || s.file?.toLowerCase() === q.toLowerCase().replace(/^\.\//, ''));
   if (!hits.length) hits = ix.screens.filter(s => s.name.toLowerCase() === low || s.component?.toLowerCase() === q.toLowerCase() || s.file?.toLowerCase().endsWith(`/${q.toLowerCase()}`) || (s.route && page(s) === q.toLowerCase()));
   if (!hits.length) {
-    const near = [...new Set(ix.screens.filter(s => s.name.toLowerCase().includes(low)).map(s => s.name))];
-    die(`No screen "${q}".${near.length ? ` Similar: ${near.slice(0, 15).join(', ')}` : ` Screens: ${[...new Set(ix.screens.map(s => s.name))].slice(0, 30).join(', ')}…`}`);
+    const all = [...new Set(ix.screens.map(s => s.name))], near = similar(all, low);
+    die(`No screen "${q}". ${near.length ? cutList('Similar', near, 15) : all.length ? cutList('Screens', all, 30) : 'This map has no screens or routes.'}`);
   }
   return hits;
 }
@@ -422,7 +456,7 @@ function screenCmd(P, ix, q) {
   items([...fromBy].sort().map(([p, es]) => {
     const methods = [...new Set(es.map(e => e.method).filter(Boolean))];
     const owner = ix.screens.filter(x => x.file === p).map(x => x.name);
-    return `${p}${owner.length ? ` [${owner.slice(0, 3).join(', ')}]` : ''}${methods.length ? ` ${methods.join('/')}` : ''}${linesOf(es)}`;
+    return `${p}${owner.length ? ` [${owner.slice(0, 3).join(', ')}${owner.length > 3 ? `, +${owner.length - 3}` : ''}]` : ''}${methods.length ? ` ${methods.join('/')}` : ''}${linesOf(es)}`;
   }), 15);
   if (!from.length) say('  none found (it may be the first screen, reached through a navigator, or by a computed name)');
   const to = groupBy([...files].flatMap(fp => (ix.out.get(fp) || []).filter(e => e.kind === 'navigate')), e => `${e.screen} → ${e.to}`);
@@ -778,8 +812,8 @@ function collectionCmd(P, ix, q) {
   const hits = collectionTargets(ix, q);
   if (!hits.length) {
     const names = [...new Set([...ix.collections.map(c => c.name), ...ix.subs.map(n => n.pattern)])];
-    const near = names.filter(n => n.toLowerCase().includes(q.toLowerCase()));
-    die(`No collection or subcollection "${q}".${near.length ? ` Similar: ${near.slice(0, 15).join(', ')}` : ` Known: ${names.slice(0, 40).join(', ')}`}`);
+    const near = similar(names, q);
+    die(`No collection or subcollection "${q}". ${near.length ? cutList('Similar', near, 15) : cutList('Known', names, 40)}`);
   }
   const label = n => (n.kind === 'subcollection' ? n.pattern : n.name);
   if (hits.length > 1) say(`"${q}" matches ${hits.length} patterns: ${hits.map(label).join(', ')}`);
