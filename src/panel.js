@@ -155,6 +155,7 @@ export function initPanel() {
   }));
   projectPack('Copy full pack', 'new chat about this project', 'full');
   projectPack('Copy project only', 'chat that already has my rules', 'project-only');
+  projectPack('Copy directions', 'assistant that can read my files', 'directions');
   header.appendChild(packRow);
 
   // Code folder link and Map project (projects and archive only)

@@ -560,13 +560,14 @@ const PACKS_DIR = resolve(homedir(), '.brain', 'packs');
 app.post('/api/pack', async (req, res) => {
   const { mode = 'full' } = req.body || {};
   const project = String(req.body?.project || '');
-  if (!['full', 'project-only', 'general', 'setup'].includes(mode)) return res.status(400).json({ error: 'Invalid pack mode' });
+  if (!['full', 'project-only', 'directions', 'general', 'setup'].includes(mode)) return res.status(400).json({ error: 'Invalid pack mode' });
   const noProject = mode === 'general' || mode === 'setup';
   if (!noProject && !/^[a-z0-9][a-z0-9-]*$/.test(project)) return res.status(400).json({ error: 'Invalid project name' });
-  const args = mode === 'general' ? ['--general'] : mode === 'setup' ? ['--setup'] : mode === 'project-only' ? ['--project-only', project] : [project];
+  const args = mode === 'general' ? ['--general'] : mode === 'setup' ? ['--setup'] : mode === 'project-only' ? ['--project-only', project] : mode === 'directions' ? ['--directions', project] : [project];
   // LaunchAgents start without a locale; pbcopy then re-encodes non-ASCII text, so force UTF-8.
   const env = { ...process.env, LANG: 'en_US.UTF-8', LC_ALL: 'en_US.UTF-8' };
-  execFile(BRAINPACK, args, { timeout: 15000, env }, async (err, stdout, stderr) => {
+  // A project with a code folder refreshes its code map first when the code changed (the mapper stops at 60 s).
+  execFile(BRAINPACK, args, { timeout: 90000, env }, async (err, stdout, stderr) => {
     if (err) return res.status(500).json({ error: (stdout || stderr || err.message).trim().split('\n')[0] });
     const m = stdout.match(/^Saved to: (.+)$/m);
     const packPath = m && resolve(m[1].trim());

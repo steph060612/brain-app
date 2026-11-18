@@ -48,7 +48,12 @@ free port). Keep it in the Dock from Safari with File > Add to Dock.
 - **Copy setup interview** (shown while your brain is empty): paste into a new chat; the assistant interviews you and
   gives back one block to paste into **Inbox > Paste proposals**.
 - **Copy full pack / Copy project only / Copy general pack**: your context for a new chat, with the rules the
-  assistant should follow.
+  assistant should follow. When the project is linked to a code folder, the full and project-only packs end with a
+  **Code** section: the folder's `AGENTS.md` and the code map's overview, report and groups, dated as a snapshot of
+  the code (report and groups are shortened, and say so, when they would make the pack too long).
+- **Copy directions**: for an assistant that can read your files (Claude Code, Codex, Gemini's command-line tool).
+  Instead of content, a few lines saying where the brain is, which project files to read in what order, where the
+  code is and which `brainmap` commands to run first, so it reads only what a question needs.
 - **Copy close-session prompt**: at the end of a chat, ask the assistant for proposed changes; paste its answer into
   **Inbox > Paste proposals** and approve or discard each one. Nothing is written without your approval.
 - **Import** and **Distill**: turn exported chats (Claude, ChatGPT, Gemini) into suggestions, using an assistant
@@ -63,7 +68,8 @@ and stays until a save works again.
 
 A project in your brain can be linked to one or more code folders. **Map project** reads the code (no AI, nothing
 leaves your Mac) and builds a map of files, imports, function calls, screens and routes, Firestore collections and
-cloud functions. Python projects get the same map plus classes (inheritance and method calls) and Flask or FastAPI
+cloud functions. The project's packs carry it too: a Code section in the content packs, and the `brainmap` commands
+in **Copy directions**. Python projects get the same map plus classes (inheritance and method calls) and Flask or FastAPI
 routes; Python itself does not need to be installed. **View map** shows it as a diagram; the panel lists entry files and findings such as files nothing
 imports.
 

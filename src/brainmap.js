@@ -4,16 +4,17 @@
 // folder (the same check as the Brain app's "Map is current"). A project can link several code folders mapped
 // into one map: paths then start with the folder's short name (web:src/x.js), --folder limits the output to
 // one folder, and report, groups, query and unused run per folder. Prints paths, names and numbers only, never
-// file contents.
+// file contents (except `brainmap pack code`, which includes each linked folder's AGENTS.md for a Brain pack).
 // No network, no model calls.
-import { stat } from 'fs/promises';
+import { stat, readFile } from 'fs/promises';
+import { join } from 'path';
 import { findPath, computeReport, queryMap, callerTree, callIndex, routesFor } from './map-report.js';
 import {
   loadProjects, projectFor, readMap, projectStatus, statusReason, runMapper, gitAvailable, tilde,
 } from './codemap-status.js';
 import { forFolder, crossFolder, isMulti, folderNames, scopeQuery, prefixed } from './map-folders.js';
 
-const LIST = 10;          // default items per section; --all shows everything
+let LIST = 10;            // default items per section; --all shows everything (5 in a shortened pack)
 const WIDTH = 110;
 const IMPORT_KINDS = new Set(['import', 'require', 're-export', 'dynamic']);
 const HELP = `brainmap: read-only map of a JavaScript, TypeScript or Python project linked in the Brain app.
@@ -50,12 +51,16 @@ Several code folders: a project can link several folders (an app and a website o
 // ─── output ──────────────────────────────────────────────────────────────────
 const lines = [];
 let ALL = false, DEPTH = 1, ALL_SHORTEST = false, TYPES = false;
+// PACK: text for a pasted pack (no command suggestions, no "use --all"); SHORT: a shortened pack's smaller lists.
+let PACK = false, SHORT = false;
+const more = n => `(+${n} more${PACK ? '' : ', use --all'})`;
+const lim = (full, short) => (SHORT ? short : full);
 const say = (s = '') => { for (const l of String(s).split('\n')) lines.push(l); };
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 // A comma-separated list wrapped to WIDTH, continuation lines indented.
 function wrapList(head, items, limit = 30, indent = '  ') {
   if (!items.length) return say(`${head}none`);
-  if (!ALL && items.length > limit) items = [...items.slice(0, limit), `(+${items.length - limit} more, use --all)`];
+  if (!ALL && items.length > limit) items = [...items.slice(0, limit), more(items.length - limit)];
   let cur = head;
   const out = [];
   items.forEach((it, i) => {
@@ -70,7 +75,7 @@ function wrapList(head, items, limit = 30, indent = '  ') {
 function items(list, limit = LIST) {
   const shown = ALL ? list : list.slice(0, limit);
   for (const x of shown) say(`  ${x}`);
-  if (shown.length < list.length) say(`  (+${list.length - shown.length} more, use --all)`);
+  if (shown.length < list.length) say(`  ${more(list.length - shown.length)}`);
 }
 function flush() { process.stdout.write(lines.join('\n') + '\n'); }
 // Ends with a message, keeping any note already printed (such as "Map refreshed").
@@ -262,7 +267,7 @@ function overview(P, ix) {
   const standalone = groups.filter(g => !ents(g).length).reduce((s, g) => s + (g.fileCount || 0), 0);
   const noNav = ix.screens.filter(s => !s.handler && !s.incomingNavigation && !s.incomingAsNestedParent).length;
   say(`Not imported from ${apps.length ? (apps.length > 1 ? 'the app entry files' : apps[0].entries.length > 2 ? `${apps[0].entries.length} entry files` : apps[0].entries.join(' or ')) : 'the entry file'}: ${apps.length ? apps.reduce((s, a) => s + (a.notImportedFromOwnEntry || 0), 0) : '?'} app files${standalone ? ` (+${standalone} standalone scripts)` : ''} · screens with no incoming navigation: ${noNav} · unresolved: ${(map.unresolved || []).length}`);
-  say('More: brainmap file <path> | impact <path> | screen <name> | collection <name> | function <name> | files <folder> | find <text> | unused');
+  if (!PACK) say('More: brainmap file <path> | impact <path> | screen <name> | collection <name> | function <name> | files <folder> | find <text> | unused');
 }
 
 function filesCmd(P, ix, q) {
@@ -510,12 +515,12 @@ function groupsCmd(P) {
   const G = P.map.groups;
   if (!G?.list?.length) die('This map has no groups.');
   say(`${plural(G.list.length, 'group')} of related files (${G.algorithm.split(' (')[0]}, seed ${G.seed})${G.isolated.length ? `, plus ${plural(G.isolated.length, 'isolated file')}` : ''}:`);
-  items(G.list.map(g => `${groupName(g)}  [${g.root}]  (${plural(g.size, 'file')})  central: ${g.central.join(', ')}`), 30);
+  items(G.list.map(g => `${groupName(g)}  [${g.root}]  (${plural(g.size, 'file')})  central: ${g.central.join(', ')}`), lim(30, 10));
   const byId = new Map(G.list.map(g => [g.id, g]));
   say('Strongest links between groups:');
-  items(G.links.map(l => `${byId.get(l.a).label}  ↔  ${byId.get(l.b).label}  (weight ${l.weight})`), 8);
-  if (G.isolated.length) { say('Isolated (linked to nothing):'); wrapList('  ', G.isolated, 12); }
-  say('Next: brainmap group <number or label>');
+  items(G.links.map(l => `${byId.get(l.a).label}  ↔  ${byId.get(l.b).label}  (weight ${l.weight})`), lim(8, 5));
+  if (G.isolated.length) { say('Isolated (linked to nothing):'); wrapList('  ', G.isolated, lim(12, 6)); }
+  if (!PACK) say('Next: brainmap group <number or label>');
 }
 
 function groupCmd(P, ix, q) {
@@ -571,6 +576,7 @@ function reportCmd(P) {
   const c = r.confidence;
   say(`Links by confidence: ${c.byTag.extracted} extracted, ${c.byTag.inferred} inferred${Object.keys(c.byWhy).length ? ` (${Object.entries(c.byWhy).sort((a, b) => b[1] - a[1]).map(([w, n]) => `${n} ${w}`).join(', ')})` : ''}`);
   if (Object.keys(r.noteTags).length) say(`Notes: ${Object.entries(r.noteTags).sort((a, b) => b[1] - a[1]).map(([t, n]) => `${n} ${t}`).join(', ')} (brainmap notes --all)`);
+  if (PACK) return; // a pack has the groups in their own section, and no commands to run
   if (P.map.groups?.list?.length) {
     say(`Groups (related files; brainmap groups):`);
     items(P.map.groups.list.map(g => `${groupName(g)}  (${g.size})  central: ${g.central[0]}`), 12);
@@ -593,11 +599,11 @@ function crossFolderCmd(P, ix) {
       say(`    ${f.folder}: ${list('read by', f.readers)}; ${list('written by', f.writers)}${f.unknown ? `; ${f.unknown} unknown` : ''}`);
     }
   }
-  if (shown.length < r.data.length) say(`  (+${r.data.length - shown.length} more, use --all)`);
+  if (shown.length < r.data.length) say(`  ${more(r.data.length - shown.length)}`);
   for (const [k, cols] of Object.entries(r.only)) wrapList(`Collections only ${k} touches (${cols.length}): `, cols, 15);
   say(`Cloud function calls into another folder (${r.calls.length}):`);
   items(r.calls.length ? r.calls.map(c => `${c.from}:${c.line} → ${c.function}  (defined in ${c.to})`) : ['none']);
-  say('Next: brainmap collection <name> (readers and writers by folder) | brainmap path <file in one folder> <file in the other>');
+  if (!PACK) say('Next: brainmap collection <name> (readers and writers by folder) | brainmap path <file in one folder> <file in the other>');
 }
 
 // ─── function calls ──────────────────────────────────────────────────────────
@@ -746,7 +752,7 @@ function groupedByFolder(ix, rows, limit = 15) {
     say(`  ${k} (${list.length})`);
     for (const r of list) { if (!ALL && shown >= limit) break; say(`    ${r.text}`); shown++; }
   }
-  if (shown < rows.length) say(`  (+${rows.length - shown} more, use --all)`);
+  if (shown < rows.length) say(`  ${more(rows.length - shown)}`);
 }
 
 // A path the user typed, as the mapper keys it: users/{uid}/orders/{id} -> users/{}/orders.
@@ -867,19 +873,9 @@ function unusedCmd(P, ix) {
 const PER_FOLDER = new Set(['report', 'groups', 'query', 'unused']);
 const COMMANDS = { notes: notesCmd, groups: groupsCmd, group: groupCmd, query: queryCmd, path: pathCmd, report: reportCmd, callers: callersCmd, overview, files: filesCmd, file: fileCmd, impact: impactCmd, screen: screenCmd, collection: collectionCmd, function: functionCmd, find: findCmd, unused: unusedCmd };
 
-async function main() {
-  const opts = parseArgs(process.argv.slice(2));
-  const [cmd = 'help', ...rest] = opts.pos;
-  if (cmd === 'help') die(HELP, 0);
+// Runs one command; the per-folder ones once per code folder when the project links several.
+function runCmd(cmd, P, arg) {
   const run = COMMANDS[cmd];
-  if (!run) die(`Unknown command "${cmd}".\n\n${HELP}`);
-  ALL = opts.all;
-  if (![1, 2].includes(opts.depth)) die('--depth takes 1 or 2.');
-  DEPTH = opts.depth;
-  ALL_SHORTEST = opts.allShortest;
-  TYPES = !!opts.types;
-  const P = await loadProject(opts);
-  const arg = cmd === 'path' ? rest : rest.join(' ');  // query takes the words, quoted or not
   if (PER_FOLDER.has(cmd) && isMulti(P.map)) {
     // Computed for each code folder on its own; groups never span folders.
     for (const name of folderNames(P.map)) {
@@ -892,6 +888,93 @@ async function main() {
     CIDX = null;
     if (cmd === 'report') crossFolderCmd(P, index(P.map));
   } else run(P, index(P.map), arg);
+}
+
+// ─── packs ───────────────────────────────────────────────────────────────────
+// `brainmap pack code --project <name>` and `brainmap pack directions --project <name>`: the parts of a Brain pack
+// that come from the code map, printed for scripts/brainpack.sh. Prints nothing when the project links no code
+// folder, so the pack is then exactly as before.
+// code: the Code section of the full and project-only packs (pasted into a chat): each folder's AGENTS.md without
+//   the brainmap block (it tells an assistant to run commands a chat cannot run), then overview, report and groups.
+//   Over PACK_MAX_LINES for those three, report and groups list 5 items instead of 10 and the pack says so.
+// directions: the code lines of the directions pack, for an assistant that can read files and run brainmap.
+const PACK_MAX_LINES = 200;
+const BLOCK_RE = /\n*<!-- brainmap:start[^\n]*-->[\s\S]*?<!-- brainmap:end -->[ \t]*\n?/g;
+const folderList = folders => folders.map(f => `folder ${f.name} at ${tilde(f.path)}`).join(', ');
+async function packCmd(opts, kind) {
+  if (!['code', 'directions'].includes(kind)) die('Usage: brainmap pack code|directions --project <name>');
+  if (!opts.project) die('brainmap pack needs --project <name>.');
+  const p = await findProject(opts.project);
+  if (!p?.folders.length) return; // no code folder: nothing, so the pack is unchanged
+  const agents = [];
+  for (const f of p.folders) {
+    let text = null;
+    try { text = await readFile(join(f.path, 'AGENTS.md'), 'utf8'); } catch { }
+    agents.push({ f, text });
+  }
+  let mapped = true;
+  try { mapped = !!(await readMap(p.slug)); } catch (e) { mapped = !!e.outdated; }
+  if (kind === 'directions') {
+    const { assistantEnv } = await import('./assistant-env.js');
+    const bm = (await assistantEnv()).brainmapCommand;
+    // An AGENTS.md with only the brainmap block says what the next line says; only one with more is worth reading.
+    const withAgents = agents.filter(a => a.text?.replace(BLOCK_RE, '\n').trim()).map(a => tilde(join(a.f.path, 'AGENTS.md')));
+    say(`Code: ${folderList(p.folders)}.${withAgents.length ? ` Read ${withAgents.join(' and ')} before changing code there.` : ''}`);
+    say(mapped
+      ? `Code map: before searching the code, run \`${bm} overview --project ${p.slug}\` (or \`report\`), then the command the question needs: \`query "<question in words>"\`, \`file <path>\`, \`callers <function>\`, \`impact <path>\`. \`${bm} help\` lists them all. The map refreshes itself when the code changed.`
+      : 'Code map: not made yet (Map project in the Brain app makes it); until then, search the code directly.');
+    return flush();
+  }
+  if (!mapped) {
+    say('=== CODE ===');
+    say(`This project is linked to ${folderList(p.folders)}, but no code map has been made yet.`);
+    return flush();
+  }
+  const P = await loadProject({ ...opts, folder: null });
+  const notes = lines.splice(0).filter(l => l.startsWith('Note:'));
+  PACK = true;
+  const part = (title, cmd) => { say(`=== CODE MAP: ${title} ===`); runCmd(cmd, P, ''); while (lines.length && !lines[lines.length - 1].trim()) lines.pop(); say(''); };
+  const build = short => {
+    lines.length = 0;
+    SHORT = false; LIST = 10; part('overview', 'overview');
+    SHORT = short; LIST = short ? 5 : 10; part('report', 'report'); part('groups', 'groups');
+    return lines.splice(0);
+  };
+  let body = build(false);
+  const shortened = body.length > PACK_MAX_LINES;
+  if (shortened) body = build(true);
+  const m = P.map, commits = isMulti(m) ? m.folders.map(f => f.gitCommit && `${f.name} ${f.gitCommit.slice(0, 7)}`).filter(Boolean) : [m.project?.gitCommit?.slice(0, 7)].filter(Boolean);
+  say('=== CODE ===');
+  say(`Code map of ${folderList(p.folders)}, made ${when(m.generatedAt)}${commits.length ? ` (commit ${commits.join(', ')})` : ''} by the Brain app, which reads the code without AI. It is a snapshot of the code at that time: the code may have changed since. Lists show their first items; "(+N more)" marks a cut.`);
+  if (shortened) say(`Shortened for this pack: the report and groups list 5 items each instead of 10.`);
+  for (const n of notes) say(n);
+  say('');
+  for (const a of agents) {
+    const text = a.text?.replace(BLOCK_RE, '\n').trim();
+    if (!text) continue;
+    say(`=== FILE: ${tilde(join(a.f.path, 'AGENTS.md'))} ===`);
+    say(text);
+    say('');
+  }
+  lines.push(...body);
+  flush();
+}
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  const [cmd = 'help', ...rest] = opts.pos;
+  if (cmd === 'help') die(HELP, 0);
+  if (cmd === 'pack') return packCmd(opts, rest[0]);
+  const run = COMMANDS[cmd];
+  if (!run) die(`Unknown command "${cmd}".\n\n${HELP}`);
+  ALL = opts.all;
+  if (![1, 2].includes(opts.depth)) die('--depth takes 1 or 2.');
+  DEPTH = opts.depth;
+  ALL_SHORTEST = opts.allShortest;
+  TYPES = !!opts.types;
+  const P = await loadProject(opts);
+  const arg = cmd === 'path' ? rest : rest.join(' ');  // query takes the words, quoted or not
+  runCmd(cmd, P, arg);
   flush();
 }
 

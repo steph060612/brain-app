@@ -3,7 +3,12 @@
 #   brainpack.sh <project>                 full pack: rules, profile, preferences, project files (new chat about a project)
 #   brainpack.sh --project-only <project>  project files only (chat that already has the rules)
 #   brainpack.sh --general                 rules, profile, preferences only (new chat, no project yet)
+#   brainpack.sh --directions <project>    directions, not content, for an assistant that can read this Mac's files
 #   brainpack.sh                           list projects
+# A project linked to a code folder in the Brain app gets a Code section in the full and project-only packs (its
+# AGENTS.md and the code map's overview, report and groups), and the code folder and brainmap commands in the
+# directions pack. The text comes from `brainmap pack code|directions`; without a linked folder nothing is added.
+# BRAINPACK_NO_CLIPBOARD=1 saves the pack without copying it (used for checks).
 
 # Settings: ~/.brain/config sets BRAIN_NAME (the owner's first name) and optionally BRAIN_DIR.
 [ -f "$HOME/.brain/config" ] && . "$HOME/.brain/config"
@@ -11,6 +16,7 @@ BRAIN_NAME="${BRAIN_NAME:-the owner}"
 BRAIN_DIR="${BRAIN_DIR:-$HOME/Brain}"
 PACKS_DIR="$HOME/.brain/packs"
 DATE="/bin/date"
+BRAINMAP="$HOME/.brain/brainmap.sh"
 TODAY=$("$DATE" "+%Y-%m-%d")
 
 strip_permalink() {
@@ -41,6 +47,7 @@ case "$1" in
     --project-only) MODE="project-only"; shift ;;
     --general)      MODE="general"; shift ;;
     --setup)        MODE="setup"; shift ;;
+    --directions)   MODE="directions"; shift ;;
 esac
 shopt -s nullglob
 
@@ -94,7 +101,41 @@ fi
 
 PACK=""
 
+# The code map's part of a pack: empty when the project links no code folder or brainmap is not installed.
+code_part() {
+    [ -x "$BRAINMAP" ] || return 0
+    "$BRAINMAP" pack "$1" --project "$PROJECT_NAME" 2>/dev/null
+}
+tilde() { case "$1" in "$HOME"/*) echo "~${1#$HOME}" ;; "$HOME") echo "~" ;; *) echo "$1" ;; esac; }
+
 case "$MODE" in
+    directions)
+        B="$(tilde "$BRAIN_DIR")" P="$B/$PROJECT_REL"
+        PACK+="DIRECTIONS for project $PROJECT_NAME, from ${BRAIN_NAME}'s knowledge base ($TODAY). You can read files on this Mac, so this says where things are instead of copying them. Read only what the question needs, not everything."$'\n\n'
+        PACK+="Brain: $B. Its rules are in $B/README.md; how $BRAIN_NAME wants you to work is in $B/preferences.md; who they are is in $B/profile.md."$'\n'
+        PACK+="This project, in this order (stop when you have enough):"$'\n'
+        N=1
+        for f in state.md decisions.md context.md; do
+            [ -f "$PROJECT_DIR/$f" ] || continue
+            case "$f" in
+                state.md)     WHAT="status, next step, open risks" ;;
+                decisions.md) WHAT="decisions already made, and why" ;;
+                context.md)   WHAT="background" ;;
+            esac
+            PACK+="$N. $P/$f: $WHAT"$'\n'
+            N=$((N + 1))
+        done
+        CODE="$(code_part directions)"
+        [ -n "$CODE" ] && PACK+="$CODE"$'\n'
+        PACK+=$'\n'"Rules: never edit files in $B; when $BRAIN_NAME says 'close session', propose changes in the UPDATE PROTOCOL format from $B/README.md instead. Before helping with a plan, check it against the project files above and say first if it conflicts."$'\n'
+        /bin/mkdir -p "$PACKS_DIR"
+        PACK_FILE="$PACKS_DIR/${PROJECT_NAME}-directions-${TODAY}.md"
+        printf '%s' "$PACK" > "$PACK_FILE"
+        [ "$BRAINPACK_NO_CLIPBOARD" = 1 ] || printf '%s' "$PACK" | /usr/bin/pbcopy
+        echo "Saved to: $PACK_FILE"
+        echo "Size: ${#PACK} characters"
+        exit 0
+        ;;
     full)
         PACK+="FULL PACK for a NEW chat. This is ${BRAIN_NAME}'s personal context, exported from their knowledge base on $TODAY. Follow the rules in README.md, the working preferences in preferences.md, and the WORKING RULES at the end. The project below is $PROJECT_NAME. If an earlier version of this context is already in this chat, this one replaces it."
         ;;
@@ -127,6 +168,8 @@ if [ "$MODE" != "general" ]; then
     for f in state.md decisions.md context.md; do
         append_file "$PROJECT_DIR/$f" "$PROJECT_REL/$f"
     done
+    CODE="$(code_part code)"
+    [ -n "$CODE" ] && PACK+="$CODE"$'\n\n'
 else
     PACK+="=== EXISTING PROJECTS ==="$'\n'
     for d in "$BRAIN_DIR/projects"/*/; do
@@ -162,7 +205,7 @@ case "$MODE" in
 esac
 printf '%s' "$PACK" > "$PACK_FILE"
 
-printf '%s' "$PACK" | /usr/bin/pbcopy
+[ "$BRAINPACK_NO_CLIPBOARD" = 1 ] || printf '%s' "$PACK" | /usr/bin/pbcopy
 
 CHAR_COUNT=${#PACK}
 echo "Saved to: $PACK_FILE"

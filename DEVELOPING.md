@@ -83,6 +83,14 @@ place on the next write) and **Map project**: the server runs `node src/mapper.j
 `src/map-schema.js`). The mapper also runs on its own: `node src/mapper.js <project folder> <output name>`, or
 `node src/mapper.js --folder app=~/Projects/shop-app --folder web=~/Projects/shop-web <output name>` for several folders.
 
+**Packs and the code map.** `scripts/brainpack.sh` (installed as `~/.brain/brainpack.sh`, run by `/api/pack`) asks
+`brainmap pack code --project <slug>` for the Code section of the full and project-only packs, and `brainmap pack
+directions --project <slug>` for the code lines of the directions pack (`--directions`). Both print nothing when the
+project links no code folder, so its packs stay exactly as they were. The Code section refreshes the map first when
+the code changed, includes each folder's `AGENTS.md` without the brainmap block, then overview, report and groups
+without command suggestions; above 200 lines for those three, report and groups list 5 items instead of 10 and the
+pack says it was shortened. `BRAINPACK_NO_CLIPBOARD=1` saves a pack without copying it.
+
 **Data layer.** Literal document IDs in Firestore paths (generated-looking values, UUIDs, email addresses, long
 numbers) are replaced by `{id}` before anything is stored, so they never appear in the map, the diagram or brainmap;
 short fixed document names such as `settings/general` are kept. Firestore use is read in every root (app, functions/,
