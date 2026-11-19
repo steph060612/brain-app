@@ -6,8 +6,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/steph060612/brain-app/main/get.sh | bash -s -- --brain ~/Notes/brain
 set -euo pipefail
 
-VERSION="v0.3.0"
-SHA256="a9fe1128d6dfc6ff3ce78d979a8cb280d87916b7483c2ba3f72192e08a38b8c1"
+VERSION="v0.4.0"
+SHA256="5eebf01d33c490bdb6c1f33291879b1636bcb6ec94b6c3bb23da3bfaaee24eeb"
 URL="https://github.com/steph060612/brain-app/releases/download/$VERSION/brain-app-$VERSION.tar.gz"
 
 [ "$(uname)" = "Darwin" ] || { echo "Stopped: the Brain runs on macOS only." >&2; exit 1; }
