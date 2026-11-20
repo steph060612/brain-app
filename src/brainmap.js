@@ -11,7 +11,9 @@ import { join } from 'path';
 import { findPath, computeReport, queryMap, callerTree, callIndex, routesFor } from './map-report.js';
 import {
   loadProjects, projectFor, projectState, readMap, projectStatus, statusReason, runMapper, gitAvailable, tilde,
+  permissionError,
 } from './codemap-status.js';
+import { CONFIG_DENIED } from './brain-dir.js';
 import { forFolder, crossFolder, isMulti, folderNames, scopeQuery, prefixed } from './map-folders.js';
 
 let LIST = 10;            // default items per section; --all shows everything (5 in a shortened pack)
@@ -163,6 +165,7 @@ Or name a project: brainmap overview --project <name>`);
   const allThere = p.folders.length > 0 && !gone.length;
   let m;
   try { m = await readMap(p.slug); } catch (e) {
+    if (e.permission) die(e.message);
     // A map in an older format is replaced right away when the folders are available.
     if (!e.outdated || !allThere) die(`${e.message}\nIn the Brain app, open the project and click "Re-map".`);
     const t0 = Date.now();
@@ -953,7 +956,7 @@ async function packCmd(opts, kind) {
     agents.push({ f, text });
   }
   let mapped = true;
-  try { mapped = !!(await readMap(p.slug)); } catch (e) { mapped = !!e.outdated; }
+  try { mapped = !!(await readMap(p.slug)); } catch (e) { if (e.permission) throw e; mapped = !!e.outdated; }
   if (kind === 'directions') {
     const { assistantEnv } = await import('./assistant-env.js');
     const bm = (await assistantEnv()).brainmapCommand;
@@ -961,7 +964,7 @@ async function packCmd(opts, kind) {
     const withAgents = agents.filter(a => a.text?.replace(BLOCK_RE, '\n').trim()).map(a => tilde(join(a.f.path, 'AGENTS.md')));
     say(`Code: ${folderList(p.folders)}.${withAgents.length ? ` Read ${withAgents.join(' and ')} before changing code there.` : ''}`);
     say(mapped
-      ? `Code map: \`${bm}\` is an ordinary shell command. Run it with your command tool, from the code folder or with \`--project ${p.slug}\`; there is nothing to register or set up. Never conclude it is unavailable without running \`${bm} help\` first. Start every code question with \`${bm} overview --project ${p.slug}\` or \`${bm} query "<question in words>" --project ${p.slug}\`, and run \`${bm} callers <function>\` before searching the code by text for who uses a function. Read source files only for details the map does not give. An optional tool server exists for Claude Code only; the command does not need it. The map refreshes itself when the code changed.`
+      ? `Code map: \`${bm}\` is an ordinary shell command. Run it with your command tool, from the code folder or with \`--project ${p.slug}\`; there is nothing to register or set up. Never conclude it is unavailable without running \`${bm} help\` first. It reads ~/.brain and, only when a refresh is needed, writes ~/.brain/maps/${p.slug}/; if your command sandbox blocks it, ask the user to allow read access to ~/.brain or to approve running it outside the sandbox. Start every code question with \`${bm} overview --project ${p.slug}\` or \`${bm} query "<question in words>" --project ${p.slug}\`, and run \`${bm} callers <function>\` before searching the code by text for who uses a function. Read source files only for details the map does not give. An optional tool server exists for Claude Code only; the command does not need it. The map refreshes itself when the code changed.`
       : 'Code map: not made yet (Map project in the Brain app makes it); until then, search the code directly.');
     return flush();
   }
@@ -1025,6 +1028,8 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const [cmd = 'help', ...rest] = opts.pos;
   if (cmd === 'help') die(HELP, 0);
+  // ~/.brain/config exists but a command sandbox keeps it from being read: say so instead of guessing ~/Brain.
+  if (CONFIG_DENIED) throw permissionError(CONFIG_DENIED.path, CONFIG_DENIED);
   if (cmd === 'pack') return packCmd(opts, rest[0]);
   await misplacedProject(cmd, rest, opts);
   const run = COMMANDS[cmd];
@@ -1040,4 +1045,4 @@ async function main() {
   flush();
 }
 
-main().catch(e => die(`brainmap: ${e.message}`));
+main().catch(e => die(e.permission ? e.message : `brainmap: ${e.message}`));

@@ -22,6 +22,12 @@ export const MAP_TIMEOUT_MS = 60_000;
 const MAPPER = join(dirname(fileURLToPath(import.meta.url)), 'mapper.js');
 
 export const fail = (status, message) => Object.assign(new Error(message), { status });
+// A file in ~/.brain that exists but cannot be read (EPERM, EACCES): usually a command sandbox around an assistant's
+// shell. Reported as such, never as a missing or empty file, so no one concludes the project is not linked or mapped.
+export const isDenied = e => e?.code === 'EPERM' || e?.code === 'EACCES';
+export const permissionError = (path, e) => Object.assign(
+  fail(403, `brainmap could not read ${tilde(path)} (${e.code === 'EACCES' ? 'Permission denied' : 'Operation not permitted'}). A command sandbox is blocking it: allow read access to ~/.brain, or run brainmap outside the sandbox.`),
+  { permission: true });
 export const tilde = p => (p === HOME || p.startsWith(HOME + sep) ? '~' + p.slice(HOME.length) : p);
 export const isSource = rel => (JS_EXT.includes(extname(rel).toLowerCase()) || PY_EXT.includes(extname(rel).toLowerCase())) && !rel.split('/').some(s => SKIP_DIRS.has(s)) && !vendoredReason(rel);
 export const mapFile = slug => join(MAPS, slug, 'map.json');
@@ -31,8 +37,10 @@ export const inside = (p, dir) => p === dir || p.startsWith(dir + sep);
 // The links file as stored: slug → [{ name, path }] (one entry per linked code folder). The older format,
 // slug → "/path", is still read (as one folder named after its directory) and upgraded on the next write.
 export async function loadLinks() {
+  let text;
+  try { text = await readFile(LINKS, 'utf8'); } catch (e) { if (isDenied(e)) throw permissionError(LINKS, e); return {}; }
   try {
-    const d = JSON.parse(await readFile(LINKS, 'utf8'));
+    const d = JSON.parse(text);
     return d && typeof d === 'object' && !Array.isArray(d) ? d : {};
   } catch { return {}; }
 }
@@ -74,7 +82,7 @@ export async function projectFor(cwd, { includeArchived = false } = {}) {
 // { text, map } for a saved map of the supported schema, null when there is none.
 export async function readMap(slug) {
   let text;
-  try { text = await readFile(mapFile(slug), 'utf8'); } catch { return null; }
+  try { text = await readFile(mapFile(slug), 'utf8'); } catch (e) { if (isDenied(e)) throw permissionError(mapFile(slug), e); return null; }
   let map;
   try { map = JSON.parse(text); } catch { throw fail(422, 'The saved map could not be read. Re-map the project.'); }
   if (map?.schemaVersion !== SCHEMA_VERSION) {

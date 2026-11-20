@@ -25,6 +25,7 @@ export const block = (created, env = CLAUDE_ENV) => {
 ## Code map: use brainmap first
 - \`${bm}\` is an ordinary shell command. Run it with your command tool, from this folder or with \`--project <name>\`. There is nothing to register or set up.
 - Never conclude it is unavailable without running \`${bm} help\` first.
+- It reads ~/.brain and, only when a refresh is needed, writes ~/.brain/maps/<project>/. If your command sandbox blocks it, ask the user to allow read access to ~/.brain or to approve running it outside the sandbox.
 - Start every code question with \`${bm} overview\` or \`${bm} query "<question in words>"\`. Before searching the code by text for who uses a function, run \`${bm} callers <function>\`. Read source files only for details the map does not give.
 ${env.claude ? '- Claude Code can also have the same queries as optional tools (mcp__brainmap__*). The command does not need them.\n' : ''}- The map covers JavaScript, TypeScript and Python, is read-only and refreshes itself.
 ${END}`;
