@@ -131,7 +131,14 @@ function renderAdd(first = false) {
   const box = el.querySelector('.cm-add');
   if (!box) return;
   if (!linking) {
-    box.innerHTML = `<button class="cm-link" style="${LINK}${first ? '' : ' font-size:11px'}">${first ? 'Link code folder' : '+ Add folder'}</button>`;
+    // Found by "Find my projects": one click links it, nothing to type.
+    const found = first && info?.found;
+    box.innerHTML = found
+      ? `<div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+          <button class="cm-found" style="${BTN}" title="${esc(found.path)}">Link code folder ${esc(found.display)}</button>
+          <button class="cm-link" style="${LINK} font-size:11px; color:#8090b0">Another folder</button></div>`
+      : `<button class="cm-link" style="${LINK}${first ? '' : ' font-size:11px'}">${first ? 'Link code folder' : '+ Add folder'}</button>`;
+    box.querySelector('.cm-found')?.addEventListener('click', () => link(found.path, ''));
     box.querySelector('.cm-link').addEventListener('click', () => { linking = true; renderAdd(first); loadSuggestions(); });
     return;
   }

@@ -54,6 +54,21 @@ free port). Keep it in the Dock from Safari with File > Add to Dock.
 - **Copy directions**: for an assistant that can read your files (Claude Code, Codex, Gemini's command-line tool).
   Instead of content, a few lines saying where the brain is, which project files to read in what order, where the
   code is and which `brainmap` commands to run first, so it reads only what a question needs.
+- **Find my projects** (top bar while your brain has no projects; in the List view at any time): looks for code
+  projects in your home folder, four levels deep, and shows a checklist. A project is a folder with `.git` or a
+  project file (`package.json`, `pyproject.toml`, `requirements.txt`, `Package.swift`, `Cargo.toml`, `go.mod`,
+  `index.html`). It skips hidden folders, `Library`, `node_modules` and other dependency or build folders, `~/.brain`
+  and your brain. Desktop, Documents, Downloads, iCloud Drive and cloud storage folders are never opened: the app runs
+  in the background and macOS does not let it read them, so the checklist says so and offers **Add a folder** to type
+  another path. "Yours" means commits by your git name or email; a repository with no commits by you is listed as
+  probably cloned (collapsed, not ticked). Each row shows the path, last commit, your commits and the main languages
+  by file count; projects with a commit by you in the last 90 days are ticked. Until you click **Continue**, only
+  folder names and git history are read, no project file. Continue drafts a `state.md` and `context.md` for each
+  ticked project from its README's first lines, its manifest (name, description, dependencies) and its last ten
+  commit subjects, marked as drafted from those files, and puts them in the **Inbox**, one batch per project. Nothing
+  enters your brain until you approve it there. After approval, the project's page offers **Link code folder** with
+  the folder already filled in. No AI is involved. Claude Code's own record of the folders it was used in
+  (`~/.claude/projects`) is not used: its folder names are an undocumented, lossy encoding of the path.
 - **Connect Claude Code** (top bar, shown when Claude Code is on this Mac): makes every Claude Code session know your
   brain. It shows the exact text and file paths first and writes nothing until you click **Connect**. It adds a short
   marked block to `~/.claude/CLAUDE.md` (where the brain is, what to read first, never edit it, how to answer "close

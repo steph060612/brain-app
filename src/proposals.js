@@ -200,7 +200,7 @@ export function batchLines({ id, source, at }, order) {
 export function toInboxFile(p, today, batch, order) {
   const fm = [`title: ${p.action} ${p.file}`, `updated: ${today}`, `target: ${p.file}`, `action: ${p.action}`];
   if (p.section) fm.push(`section: ${oneLine(p.section)}`);
-  fm.push('source: pasted proposal', ...batchLines(batch, order));
+  fm.push(`source: ${oneLine(batch.origin || 'pasted proposal')}`, ...batchLines(batch, order));
   let body;
   if (p.action === 'replace-line')      body = `=== OLD ===\n${p.old}\n=== NEW ===\n${p.new}`;
   else if (p.action === 'frontmatter')  body = p.fields.map(([k, v]) => `${k}: ${v}`).join('\n');

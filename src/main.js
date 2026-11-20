@@ -33,7 +33,7 @@ async function boot() {
 
   // A project archived or unarchived (or any other change to the set of items): fresh labels and list.
   window.addEventListener('brain-items-changed', async () => {
-    try { const fresh = await fetchItems(); setLabelItems(fresh); setListItems(fresh); } catch { /* keep what's shown */ }
+    try { const fresh = await fetchItems(); setLabelItems(fresh); setListItems(fresh); showSetupIfEmpty(fresh); } catch { /* keep what's shown */ }
   });
 }
 

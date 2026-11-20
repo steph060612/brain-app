@@ -14,6 +14,7 @@ import { parseConversations as parseGeminiConversations, getConvDir as getGemini
 import { parseProposals, toInboxFile, batchLines, readInboxBody, applyProposal, ACTIONS } from './src/proposals.js';
 import { registerCodeMapRoutes } from './src/codemap-routes.js';
 import { connectStatus, connectClaude, disconnectClaude } from './src/claude-connect.js';
+import { scanProjects, draftProject } from './src/find-projects.js';
 import { SCHEMA_VERSION } from './src/map-schema.js';
 import { buildProblem, readBuildInfo } from './src/build-check.js';
 import { existsSync } from 'fs';
@@ -792,10 +793,20 @@ app.post('/api/inbox/paste', async (req, res) => {
     const { text } = req.body || {};
     if (typeof text !== 'string' || !text.trim()) return res.status(400).json({ error: 'Nothing pasted' });
 
+    const { created, errors, batch, remainder, noBlocks } = await textToInbox(text, 'Pasted', 'paste');
+    res.json({ created, errors, batch, remainder, noBlocks });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
+
+// UPDATE PROTOCOL text → Inbox suggestions (one inbox file per FILE block, one batch), through the same checks as a
+// paste. Used by Paste proposals and by "Find my projects". Nothing outside inbox/ is written.
+async function textToInbox(text, source, prefix, origin) {
     const { proposals, errors, remainder, noBlocks } = parseProposals(text, { isAllowedTarget });
     const today = localToday();
     const created = [];
-    const batch = { id: `paste-${makeRunId()}`, source: 'Pasted', at: new Date().toISOString() };
+    const batch = { id: `${prefix}-${makeRunId()}`, source, at: new Date().toISOString(), origin };
     await mkdir(join(BRAIN, 'inbox'), { recursive: true });
 
     for (const p of proposals) {
@@ -806,7 +817,7 @@ app.post('/api/inbox/paste', async (req, res) => {
       if (!exists && !['create', 'append'].includes(p.action)) { fail(`${p.action}: target does not exist`); continue; }
 
       const content = toInboxFile(p, today, batch, created.length);
-      const slug = `paste-${p.file.replace(/\.md$/, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}-${p.action}`.slice(0, 80);
+      const slug = `${prefix}-${p.file.replace(/\.md$/, '').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}-${p.action}`.slice(0, 80);
       const reason = checkSuggestion(`${slug}.md`, content);
       if (reason) { fail(reason); continue; }
 
@@ -819,10 +830,43 @@ app.post('/api/inbox/paste', async (req, res) => {
     }
 
     errors.sort((a, b) => (a.line || 0) - (b.line || 0));
-    res.json({ created, errors, batch: created.length ? batch.id : null, remainder, noBlocks });
-  } catch (e) {
-    res.status(e.status || 500).json({ error: e.message });
-  }
+    return { created, errors, batch: created.length ? batch.id : null, remainder, noBlocks };
+}
+
+// ── FIND MY PROJECTS ──────────────────────────────────────────────────────────
+// Scan: names and git facts only (src/find-projects.js). Propose: for the ticked folders, drafts from the README,
+// manifest and last commit subjects go to the Inbox, one batch per project; the folder path is remembered in
+// ~/.brain/found-projects.json so the approved project's page offers "Link code folder" with it filled in.
+const FOUND_FILE = resolve(homedir(), '.brain', 'found-projects.json');
+let lastScan = new Set();
+app.post('/api/find-projects/scan', async (req, res) => {
+  try {
+    const extra = Array.isArray(req.body?.extra) ? req.body.extra.filter(x => typeof x === 'string').slice(0, 20) : [];
+    const r = await scanProjects({ brain: BRAIN, extra });
+    lastScan = new Set(r.rows.map(x => x.path));
+    res.json(r);
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+app.post('/api/find-projects/propose', async (req, res) => {
+  try {
+    const paths = Array.isArray(req.body?.paths) ? req.body.paths.filter(p => typeof p === 'string') : [];
+    if (!paths.length) return res.status(400).json({ error: 'Tick at least one project.' });
+    const unknown = paths.filter(p => !lastScan.has(p));
+    if (unknown.length) return res.status(400).json({ error: `Not in the last scan: ${unknown.join(', ')}. Scan again.` });
+    let found = {};
+    try { found = JSON.parse(await readFile(FOUND_FILE, 'utf8')); } catch { }
+    const today = localToday(), out = [];
+    for (const p of paths) {
+      const d = await draftProject(p, today);
+      const r = await textToInbox(d.text, `Find my projects: ${d.row.name}`, 'found', 'drafted by Find my projects from the project folder');
+      if (r.created.length) found[d.slug] = p;
+      out.push({ name: d.row.name, slug: d.slug, path: p, created: r.created, errors: r.errors });
+    }
+    await mkdir(dirname(FOUND_FILE), { recursive: true });
+    await writeFile(FOUND_FILE + '.tmp', JSON.stringify(found, null, 2) + '\n', 'utf8');
+    await rename(FOUND_FILE + '.tmp', FOUND_FILE);
+    res.json({ projects: out });
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 
 // Convert free text with an assistant: a normal distill run (no tools, full brain in the prompt, same

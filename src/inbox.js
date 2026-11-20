@@ -286,6 +286,7 @@ async function approveAllInBatch(batch, btn) {
   setStatus(`Approving ${items.length}…`, '#8090b0');
   try {
     const { approved, failed } = await approveBatch(items);
+    if (approved?.length) window.dispatchEvent(new CustomEvent('brain-items-changed'));
     batchErrors.delete(batch.id);
     if (failed) {
       const item = items.find(i => i.filename === failed.filename);
@@ -414,6 +415,7 @@ function buildReadArea(card, item) {
         const done = { 'replace-line': 'line replaced in', 'replace-section': 'section replaced in',
           frontmatter: 'frontmatter updated in', create: 'created' }[data.action] || 'appended to';
         setStatus(`Approved — ${done} ${item.target}.`, '#6FE3D0');
+        if (data.action === 'create') window.dispatchEvent(new CustomEvent('brain-items-changed')); // a new item, maybe a new project
       } else if (status === 409) {
         setStatus(data.message || 'Conflict — refreshing.', '#e08040');
         await openInboxPanel();

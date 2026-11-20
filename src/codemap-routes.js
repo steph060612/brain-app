@@ -5,7 +5,7 @@
 // CLAUDE.md / AGENTS.md and the strict-mode hook in .claude/settings.local.json, each after the person confirms
 // it (brainmap-agents.js, brainmap-strict.js). Git is only read, with
 // --no-optional-locks so that `git status` never refreshes the folder's index; nothing is committed.
-import { writeFile, rename, mkdir, stat, realpath, readdir } from 'fs/promises';
+import { writeFile, readFile, rename, mkdir, stat, realpath, readdir } from 'fs/promises';
 import { join, resolve, sep, isAbsolute } from 'path';
 import {
   HOME, DOT, LINKS, BRAIN, fail, tilde, realOrSelf, inside, loadLinks, foldersOf, readMap, projectStatus, runMapper,
@@ -150,8 +150,16 @@ export function registerCodeMapRoutes(app, { gitAvailable }) {
       }
       let map = null, mapError = null, mapOutdated = false;
       try { const m = await readMap(slug); map = m && mapSummary(m.map); } catch (e) { mapError = e.message; mapOutdated = !!e.outdated; }
+      // "Find my projects" remembered where this project's code is: offered as a one-click link while unlinked.
+      let found = null;
+      if (!folders.length) {
+        try {
+          const p = JSON.parse(await readFile(join(DOT, 'found-projects.json'), 'utf8'))[slug];
+          if (typeof p === 'string' && (await stat(p)).isDirectory()) found = { path: p, display: tilde(p) };
+        } catch { }
+      }
       res.json({ slug, folders, folder: folders[0]?.path ?? null, display: folders[0]?.display ?? null,
-        folderExists: folders.length > 0 && folders.every(f => f.exists), map, mapError, mapOutdated, running: running.has(slug) });
+        folderExists: folders.length > 0 && folders.every(f => f.exists), map, mapError, mapOutdated, running: running.has(slug), found });
     } catch (e) { send(res, e); }
   });
 

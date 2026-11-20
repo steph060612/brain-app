@@ -1,4 +1,5 @@
 // List view: every Brain item by group, newest first. An opaque layer over the brain, which keeps running behind it.
+import { findProjectsButton } from './find-projects-ui.js';
 import { fetchItems, moveProject } from './api.js';
 import { STYLE } from './labels.js';
 
@@ -92,6 +93,11 @@ function render() {
   listEl.innerHTML = '';
   const wrap = document.createElement('div');
   wrap.style.cssText = 'width:max(280px, min(640px, calc(100vw - var(--panel-w, 380px) - 48px)));'; // rows stay clear of the open panel
+
+  const tools = document.createElement('div');
+  tools.style.cssText = 'display:flex; justify-content:flex-end;';
+  tools.appendChild(findProjectsButton());
+  wrap.appendChild(tools);
 
   const matches = items.filter(i => !query || i.name.toLowerCase().includes(query));
   for (const { title, categories, collapsible } of GROUPS) {

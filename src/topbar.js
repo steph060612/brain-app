@@ -4,6 +4,7 @@ import { setSearchQuery } from './labels.js';
 import { setListQuery } from './list.js';
 import { packButton, textCopyButton } from './pack.js';
 import { initClaudeConnect } from './claude-connect-ui.js';
+import { findProjectsButton } from './find-projects-ui.js';
 
 const CLOSE_SESSION_PROMPT = 'Close session: output proposed changes for my brain in the UPDATE PROTOCOL format from README.md (### FILE, ### ACTION, content; OLD and NEW lines for replace-line), all inside one code block. Include only facts I stated or confirmed in this chat. Nothing is saved until I approve.';
 
@@ -30,6 +31,11 @@ export function initTopbar() {
   setupBtn.id = 'setup-btn';
   setupBtn.style.display = 'none';
   gitTime?.parentNode.insertBefore(setupBtn, gitTime);
+  // While the brain has no projects: "Find my projects", prominent (later it lives in the List view).
+  const findBtn = findProjectsButton({ prominent: true });
+  findBtn.id = 'find-btn';
+  findBtn.style.display = 'none';
+  gitTime?.parentNode.insertBefore(findBtn, setupBtn);
   gitTime?.parentNode.insertBefore(textCopyButton({
     label: 'Copy close-session prompt',
     text: CLOSE_SESSION_PROMPT,
@@ -78,6 +84,6 @@ function showBackupProblem(problem) {
 
 // The setup interview is offered only while the brain has no projects yet.
 export function showSetupIfEmpty(items) {
-  const btn = document.getElementById('setup-btn');
-  if (btn) btn.style.display = items.some(i => i.category === 'projects') ? 'none' : '';
+  const none = !items.some(i => i.category === 'projects');
+  for (const id of ['setup-btn', 'find-btn']) { const btn = document.getElementById(id); if (btn) btn.style.display = none ? '' : 'none'; }
 }
