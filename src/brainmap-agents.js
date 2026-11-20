@@ -14,21 +14,21 @@ export const FILES = ['CLAUDE.md', 'AGENTS.md'];
 // when the app made it and nothing else was added since. A file that existed before is never deleted.
 export const start = created => `<!-- brainmap:start created-file=${created ? 'yes' : 'no'} (added by the Brain app, "Enable for assistants"; remove it there or delete this block) -->`;
 export const END = '<!-- brainmap:end -->';
-// env (src/assistant-env.js) says whether Claude Code is installed and how `brainmap` is run. With Claude Code the
-// block names its tools first (it has them as mcp__brainmap__*); without it (Codex and others) it names only the
-// command, as a full path when `brainmap` does not run by name. No env means Claude Code is present.
+// env (src/assistant-env.js) says whether Claude Code is installed and how `brainmap` is run (a full path when it
+// does not run by name). The block always leads with the shell command, which every assistant with a shell can run;
+// with Claude Code it adds that the mcp__brainmap__* tools are an optional extra, so no assistant concludes the map
+// depends on them. No env means Claude Code is present.
 const CLAUDE_ENV = { claude: true, brainmapCommand: 'brainmap' };
-export const block = (created, env = CLAUDE_ENV) => (env.claude ? `${start(created)}
+export const block = (created, env = CLAUDE_ENV) => {
+  const bm = env.brainmapCommand;
+  return `${start(created)}
 ## Code map: use brainmap first
-- For questions about how this code fits together (who calls, uses or depends on what, where something happens), use the brainmap tools (mcp__brainmap__*) or the \`brainmap\` command before searching the repository.
-- Start with \`report\` or \`overview\`; for a question in words, use \`query\`.
-- The tool list or \`brainmap help\` shows the rest. The map covers JavaScript, TypeScript and Python, is read-only and refreshes itself.
-${END}` : `${start(created)}
-## Code map: use brainmap first
-- For questions about how this code fits together (who calls, uses or depends on what, where something happens), run \`${env.brainmapCommand} overview\` in a shell before searching the repository.
-- Then the matching command: \`${env.brainmapCommand} query "<question in words>"\`, \`${env.brainmapCommand} impact <file>\`, \`${env.brainmapCommand} callers <function>\`, \`${env.brainmapCommand} collection <name>\`, \`${env.brainmapCommand} report\`.
-- \`${env.brainmapCommand} help\` lists every command. The map covers JavaScript, TypeScript and Python, is read-only and refreshes itself.
-${END}`);
+- \`${bm}\` is an ordinary shell command. Run it with your command tool, from this folder or with \`--project <name>\`. There is nothing to register or set up.
+- Never conclude it is unavailable without running \`${bm} help\` first.
+- Start every code question with \`${bm} overview\` or \`${bm} query "<question in words>"\`. Before searching the code by text for who uses a function, run \`${bm} callers <function>\`. Read source files only for details the map does not give.
+${env.claude ? '- Claude Code can also have the same queries as optional tools (mcp__brainmap__*). The command does not need them.\n' : ''}- The map covers JavaScript, TypeScript and Python, is read-only and refreshes itself.
+${END}`;
+};
 
 const BLOCK_RE = /\n*<!-- brainmap:start[^\n]*-->[\s\S]*?<!-- brainmap:end -->[ \t]*\n?/g;
 const ONE_BLOCK_RE = /<!-- brainmap:start[^\n]*-->[\s\S]*?<!-- brainmap:end -->/;

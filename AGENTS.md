@@ -1,6 +1,8 @@
 <!-- brainmap:start created-file=yes (added by the Brain app, "Enable for assistants"; remove it there or delete this block) -->
 ## Code map: use brainmap first
-- For questions about how this code fits together (who calls, uses or depends on what, where something happens), use the brainmap tools (mcp__brainmap__*) or the `brainmap` command before searching the repository.
-- Start with `report` or `overview`; for a question in words, use `query`.
-- The tool list or `brainmap help` shows the rest. The map covers JavaScript, TypeScript and Python, is read-only and refreshes itself.
+- `brainmap` is an ordinary shell command. Run it with your command tool, from this folder or with `--project <name>`. There is nothing to register or set up.
+- Never conclude it is unavailable without running `brainmap help` first.
+- Start every code question with `brainmap overview` or `brainmap query "<question in words>"`. Before searching the code by text for who uses a function, run `brainmap callers <function>`. Read source files only for details the map does not give.
+- Claude Code can also have the same queries as optional tools (mcp__brainmap__*). The command does not need them.
+- The map covers JavaScript, TypeScript and Python, is read-only and refreshes itself.
 <!-- brainmap:end -->

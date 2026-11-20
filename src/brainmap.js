@@ -961,7 +961,7 @@ async function packCmd(opts, kind) {
     const withAgents = agents.filter(a => a.text?.replace(BLOCK_RE, '\n').trim()).map(a => tilde(join(a.f.path, 'AGENTS.md')));
     say(`Code: ${folderList(p.folders)}.${withAgents.length ? ` Read ${withAgents.join(' and ')} before changing code there.` : ''}`);
     say(mapped
-      ? `Code map: before searching the code, run \`${bm} overview --project ${p.slug}\` (or \`report\`), then the command the question needs: \`query "<question in words>"\`, \`file <path>\`, \`callers <function>\`, \`impact <path>\`. \`${bm} help\` lists them all. The map refreshes itself when the code changed.`
+      ? `Code map: \`${bm}\` is an ordinary shell command. Run it with your command tool, from the code folder or with \`--project ${p.slug}\`; there is nothing to register or set up. Never conclude it is unavailable without running \`${bm} help\` first. Start every code question with \`${bm} overview --project ${p.slug}\` or \`${bm} query "<question in words>" --project ${p.slug}\`, and run \`${bm} callers <function>\` before searching the code by text for who uses a function. Read source files only for details the map does not give. An optional tool server exists for Claude Code only; the command does not need it. The map refreshes itself when the code changed.`
       : 'Code map: not made yet (Map project in the Brain app makes it); until then, search the code directly.');
     return flush();
   }
