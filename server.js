@@ -13,6 +13,7 @@ import { parseConversations as parseChatgptConversations, getConvDir as getChatg
 import { parseConversations as parseGeminiConversations, getConvDir as getGeminiConvDir } from './src/gemini-parser.js';
 import { parseProposals, toInboxFile, batchLines, readInboxBody, applyProposal, ACTIONS } from './src/proposals.js';
 import { registerCodeMapRoutes } from './src/codemap-routes.js';
+import { connectStatus, connectClaude, disconnectClaude } from './src/claude-connect.js';
 import { SCHEMA_VERSION } from './src/map-schema.js';
 import { buildProblem, readBuildInfo } from './src/build-check.js';
 import { existsSync } from 'fs';
@@ -1636,6 +1637,20 @@ app.get('/api/import/gemini-index', async (_req, res) => {
 // ── CODE MAPS ─────────────────────────────────────────────────────────────────
 // Link a project to a code folder and map it; see src/codemap-routes.js.
 registerCodeMapRoutes(app, { gitAvailable });
+
+// ── CONNECT CLAUDE CODE ───────────────────────────────────────────────────────
+// A marked block in ~/.claude/CLAUDE.md and the brainmap tool server at user scope; see src/claude-connect.js.
+// GET is the preview; POST and DELETE apply it, each refused when ~/.claude/CLAUDE.md changed since the preview.
+app.get('/api/claude-connect', async (req, res) => {
+  try { res.json(await connectStatus({ fresh: req.query.fresh === '1' })); }
+  catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+for (const [method, act] of [['post', connectClaude], ['delete', disconnectClaude]]) {
+  app[method]('/api/claude-connect', async (req, res) => {
+    try { res.json(await act(req.body?.expect)); }
+    catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+  });
+}
 
 // ── STATIC ────────────────────────────────────────────────────────────────────
 

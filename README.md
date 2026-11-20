@@ -54,6 +54,16 @@ free port). Keep it in the Dock from Safari with File > Add to Dock.
 - **Copy directions**: for an assistant that can read your files (Claude Code, Codex, Gemini's command-line tool).
   Instead of content, a few lines saying where the brain is, which project files to read in what order, where the
   code is and which `brainmap` commands to run first, so it reads only what a question needs.
+- **Connect Claude Code** (top bar, shown when Claude Code is on this Mac): makes every Claude Code session know your
+  brain. It shows the exact text and file paths first and writes nothing until you click **Connect**. It adds a short
+  marked block to `~/.claude/CLAUDE.md` (where the brain is, what to read first, never edit it, how to answer "close
+  session"), creating the file if needed and changing nothing outside the block. Before the first change to a file
+  with your own content, it saves a copy as `~/.claude/CLAUDE.md.before-brain-<date>`. It also registers the brainmap
+  tool server with Claude Code at user scope (`claude mcp add --scope user brainmap`), or says plainly that the
+  `claude` command was not found. Clicking again updates the block in place. When everything is current the top bar
+  shows **Claude Code connected**; open it for **Remove**, which takes out only the block (the file returns to what
+  it was, or is deleted if the app created it) and the registration. **Update Claude Code connection** means the block
+  or the registration is missing or outdated.
 - **Copy close-session prompt**: at the end of a chat, ask the assistant for proposed changes; paste its answer into
   **Inbox > Paste proposals** and approve or discard each one. Nothing is written without your approval.
 - **Import** and **Distill**: turn exported chats (Claude, ChatGPT, Gemini) into suggestions, using an assistant

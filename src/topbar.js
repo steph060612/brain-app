@@ -3,6 +3,7 @@ import { fetchGitLog } from './api.js';
 import { setSearchQuery } from './labels.js';
 import { setListQuery } from './list.js';
 import { packButton, textCopyButton } from './pack.js';
+import { initClaudeConnect } from './claude-connect-ui.js';
 
 const CLOSE_SESSION_PROMPT = 'Close session: output proposed changes for my brain in the UPDATE PROTOCOL format from README.md (### FILE, ### ACTION, content; OLD and NEW lines for replace-line), all inside one code block. Include only facts I stated or confirmed in this chat. Nothing is saved until I approve.';
 
@@ -33,6 +34,7 @@ export function initTopbar() {
     label: 'Copy close-session prompt',
     text: CLOSE_SESSION_PROMPT,
   }), gitTime);
+  initClaudeConnect(gitTime);
 
   // Last commit time, and a failing automatic save as a banner under the bar. Refreshed when the window comes back
   // into view and every 5 minutes, so a backup that starts failing while the app is open still shows up.
