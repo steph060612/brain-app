@@ -34,7 +34,7 @@ export function blockBody(brain = BRAIN_LABEL) {
   return `## My brain
 - My personal knowledge base (the brain) is at ${brain}. It is the source of truth for my projects.
 - Read ${brain}/README.md first, then profile.md and preferences.md, then only the files the task needs.
-- Never edit files in the brain. When I say "close session", propose changes in the UPDATE PROTOCOL format from ${brain}/README.md instead.`;
+- Never edit files in the brain. The only exception is ${brain}/inbox/: writing files there is allowed (the setup interview uses it). Never modify any other file. When I say "close session", propose changes in the UPDATE PROTOCOL format from ${brain}/README.md instead.`;
 }
 const block = (created, nl, brain) => `${start(created, nl)}\n${blockBody(brain)}\n${END}`;
 const hash = text => (text === null ? 'none' : createHash('sha1').update(text).digest('hex'));

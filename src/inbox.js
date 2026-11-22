@@ -185,6 +185,10 @@ function updateCount(n) {
   countBadge.style.display = n > 0 ? '' : 'none';
 }
 
+export function refreshInboxCount() {
+  loadInbox().then(items => updateCount(items.length)).catch(() => {});
+}
+
 // ─── OPEN / CLOSE ────────────────────────────────────────────────────────────
 export async function openInboxPanel() {
   panelEl.style.transform = 'translateX(0)';

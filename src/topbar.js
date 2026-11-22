@@ -5,6 +5,7 @@ import { setListQuery } from './list.js';
 import { packButton, textCopyButton } from './pack.js';
 import { initClaudeConnect } from './claude-connect-ui.js';
 import { findProjectsButton } from './find-projects-ui.js';
+import { initInterviewButton } from './interview-ui.js';
 
 const CLOSE_SESSION_PROMPT = 'Close session: output proposed changes for my brain in the UPDATE PROTOCOL format from README.md (### FILE, ### ACTION, content; OLD and NEW lines for replace-line), all inside one code block. Include only facts I stated or confirmed in this chat. Nothing is saved until I approve.';
 
@@ -36,6 +37,8 @@ export function initTopbar() {
   findBtn.id = 'find-btn';
   findBtn.style.display = 'none';
   gitTime?.parentNode.insertBefore(findBtn, setupBtn);
+  // "Start interview": shown when profile.md has only a name and preferences.md is empty.
+  initInterviewButton(findBtn);
   gitTime?.parentNode.insertBefore(textCopyButton({
     label: 'Copy close-session prompt',
     text: CLOSE_SESSION_PROMPT,

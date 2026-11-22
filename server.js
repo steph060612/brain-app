@@ -14,6 +14,8 @@ import { parseConversations as parseGeminiConversations, getConvDir as getGemini
 import { parseProposals, toInboxFile, batchLines, readInboxBody, applyProposal, ACTIONS } from './src/proposals.js';
 import { registerCodeMapRoutes } from './src/codemap-routes.js';
 import { connectStatus, connectClaude, disconnectClaude } from './src/claude-connect.js';
+import { assistantEnv } from './src/assistant-env.js';
+import { interviewScript } from './src/interview-script.js';
 import { scanProjects, draftProject } from './src/find-projects.js';
 import { SCHEMA_VERSION } from './src/map-schema.js';
 import { buildProblem, readBuildInfo } from './src/build-check.js';
@@ -1681,6 +1683,63 @@ app.get('/api/import/gemini-index', async (_req, res) => {
 // ── CODE MAPS ─────────────────────────────────────────────────────────────────
 // Link a project to a code folder and map it; see src/codemap-routes.js.
 registerCodeMapRoutes(app, { gitAvailable });
+
+// ── INTERVIEW ─────────────────────────────────────────────────────────────────
+// "Start interview" button support. Eligible: profile.md has at most a name line; preferences.md body is empty.
+// GET  /api/interview-status   — read-only eligibility check; no file writes.
+// POST /api/interview/prepare  — builds interview-prompt.txt and interview.sh; returns { command }.
+// The inbox-only rule is enforced by Claude Code's permission flags; see src/interview-script.js.
+const INTERVIEW_SCRIPT   = resolve(homedir(), '.brain', 'interview.sh');
+const INTERVIEW_PROMPT   = resolve(homedir(), '.brain', 'interview-prompt.txt');
+const INTERVIEW_TEMPLATE = join(__dirname, 'templates', 'brain', 'interview.md');
+const HOME        = homedir();
+const tildeHome   = p => (p === HOME || p.startsWith(HOME + sep) ? '~' + p.slice(HOME.length) : p);
+
+async function interviewEligibility() {
+  let profileText = '', prefsText = '';
+  try { profileText = await readFile(join(BRAIN, 'profile.md'), 'utf8'); } catch { /* absent */ }
+  try { prefsText   = await readFile(join(BRAIN, 'preferences.md'), 'utf8'); } catch { /* absent */ }
+  const stripFM     = s => s.replace(/^---[\s\S]*?---\s*\n?/, '').trim();
+  const profileLines = stripFM(profileText).split('\n').filter(l => l.trim());
+  const hasOnlyName  = profileLines.length === 0
+    || (profileLines.length === 1 && /^-\s*[Nn]ame:\s*\S/.test(profileLines[0]));
+  const eligible     = hasOnlyName && !stripFM(prefsText);
+  const projectNames = await subdirs(join(BRAIN, 'projects'));
+  return { eligible, projectNames };
+}
+
+app.get('/api/interview-status', async (_req, res) => {
+  try { res.json(await interviewEligibility()); }
+  catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+
+app.post('/api/interview/prepare', async (_req, res) => {
+  try {
+    const { eligible, projectNames } = await interviewEligibility();
+    if (!eligible) return res.status(409).json({ error: 'Brain is not empty enough to start the interview.' });
+
+    let templateText = '';
+    try { templateText = await readFile(INTERVIEW_TEMPLATE, 'utf8'); } catch (e) {
+      return res.status(500).json({ error: `Interview template not found: ${e.message}` });
+    }
+    const projectNote = projectNames.length
+      ? `\nExisting projects in this brain (list these in Q2): ${projectNames.join(', ')}.`
+      : '\nThere are no projects in this brain yet. For Q2, ask if there are projects to add.';
+    const fullPrompt = templateText.trimEnd() + '\n' + projectNote + '\n';
+
+    const { claudePath } = await assistantEnv({ fresh: false });
+
+    await mkdir(join(HOME, '.brain'), { recursive: true });
+    await mkdir(join(BRAIN, 'inbox'), { recursive: true });
+    await writeFile(INTERVIEW_PROMPT, fullPrompt, 'utf8');
+    const script = interviewScript({ brain: BRAIN, claude: claudePath || 'claude', prompt: INTERVIEW_PROMPT, label: tildeHome(BRAIN) });
+    await writeFile(INTERVIEW_SCRIPT, script, { mode: 0o755 });
+
+    res.json({ command: `bash ${tildeHome(INTERVIEW_SCRIPT)}` });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
+});
 
 // ── CONNECT CLAUDE CODE ───────────────────────────────────────────────────────
 // A marked block in ~/.claude/CLAUDE.md and the brainmap tool server at user scope; see src/claude-connect.js.
