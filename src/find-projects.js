@@ -289,3 +289,17 @@ export async function draftProject(dir, today) {
     text: `### FILE: projects/${s}/state.md\n### ACTION: create\n${safe(state)}\n\n### FILE: projects/${s}/context.md\n### ACTION: create\n${safe(context)}\n`,
   };
 }
+
+// "New project" (shown when the scan found nothing): the two drafts for a project the person names, from the name
+// and the one line they typed. No folder is read.
+export function draftNewProject(name, line, today) {
+  const n = oneLine(name).slice(0, 80), l = oneLine(line);
+  const s = slugFor(n);
+  const label = `Written by the Brain app from what you typed in "New project" on ${today}. Check it before approving.`;
+  const state = [`---`, `title: ${n} state`, `updated: ${today}`, `---`, ``, `# ${n}`, ``, `> ${label}`, ``, `## Status`,
+    `- Next step: not known yet. Facts you approve later appear under Added headings below.`].join('\n');
+  const context = [`---`, `title: ${n} context`, `updated: ${today}`, `---`, ``, `# ${n}: background`, ``, `> ${label}`, ``, `- ${l}`].join('\n');
+  const safe = t => t.replace(/^(\s*#{0,6}\s*\**)(FILE|ACTION)(\**\s*:)/gim, '$1$2 $3');
+  return { name: n, slug: s,
+    text: `### FILE: projects/${s}/state.md\n### ACTION: create\n${safe(state)}\n\n### FILE: projects/${s}/context.md\n### ACTION: create\n${safe(context)}\n` };
+}

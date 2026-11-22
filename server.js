@@ -17,7 +17,7 @@ import { connectStatus, connectClaude, disconnectClaude } from './src/claude-con
 import { assistantEnv } from './src/assistant-env.js';
 import { interviewScript } from './src/interview-script.js';
 import { localDate, localStamp } from './src/local-date.js';
-import { scanProjects, draftProject } from './src/find-projects.js';
+import { scanProjects, draftProject, draftNewProject } from './src/find-projects.js';
 import { SCHEMA_VERSION } from './src/map-schema.js';
 import { buildProblem, readBuildInfo } from './src/build-check.js';
 import { existsSync } from 'fs';
@@ -861,6 +861,18 @@ app.post('/api/find-projects/propose', async (req, res) => {
     await writeFile(FOUND_FILE + '.tmp', JSON.stringify(found, null, 2) + '\n', 'utf8');
     await rename(FOUND_FILE + '.tmp', FOUND_FILE);
     res.json({ projects: out });
+  } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+
+// "New project": a name and one line typed by the person → state.md and context.md drafts in the Inbox, one batch.
+app.post('/api/find-projects/new', async (req, res) => {
+  try {
+    const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+    const line = typeof req.body?.line === 'string' ? req.body.line.trim() : '';
+    if (!name || !line) return res.status(400).json({ error: 'Give the project a name and one line about it.' });
+    const d = draftNewProject(name, line, localToday());
+    const r = await textToInbox(d.text, `New project: ${d.name}`, 'new', 'typed in New project');
+    res.json({ projects: [{ name: d.name, slug: d.slug, created: r.created, errors: r.errors }] });
   } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 

@@ -77,10 +77,12 @@ function render(box) {
   box.innerHTML = `
     <div style="font-size:15px; font-weight:700; color:#fff">Find my projects</div>
     <div style="${MUTED} margin-top:4px">Found ${scan.rows.length} folder${scan.rows.length === 1 ? '' : 's'} with git or a project file, in ${(scan.ms / 1000).toFixed(1)} s. Only folder names and git history were read; no project file was opened.
-      ${scan.noIdentity ? 'Your git name and email are not set, so it cannot tell which commits are yours or your projects from cloned ones. The five most recently committed projects are ticked.'
+      ${!scan.rows.length ? '' : scan.noIdentity ? 'Your git name and email are not set, so it cannot tell which commits are yours or your projects from cloned ones. The five most recently committed projects are ticked.'
         : `${id.emails?.length || id.names?.length ? `"Yours" means commits by ${esc([...(id.names || []), ...(id.emails || [])].join(' / '))}.` : ''} The ones with a commit by you in the last 90 days are ticked.`}</div>
     <div style="margin-top:10px; padding:8px 10px; border:1px solid rgba(224,160,64,0.3); border-radius:6px; font-size:12px">
-      Not searched: ${esc(scan.protectedSkipped.join(', '))}. The Brain app runs in the background, and macOS does not let background apps open Desktop, Documents, Downloads, iCloud Drive or cloud storage folders. A project kept there cannot be mapped or read by the app; move it to a folder such as ~/Projects. To search another folder, type its path:
+      Not searched: ${esc(scan.protectedSkipped.map(p => p.replace(/ \(.*\)$/, '')).join(', '))}. To search another folder, type its path.
+      <details class="fp-why" style="display:inline"><summary style="display:inline; cursor:pointer; color:#9FD8FF">Why?</summary>
+        <div style="margin-top:4px; ${MUTED}">The Brain app runs in the background, and macOS does not let background apps open Desktop, Documents, Downloads, iCloud Drive or cloud storage folders (those last two are inside ~/Library). A project kept there cannot be mapped or read by the app; move it to a folder such as ~/Projects.</div></details>
       <div style="display:flex; gap:6px; margin-top:6px; flex-wrap:wrap"><input class="fp-path" type="text" placeholder="~/Code" spellcheck="false" style="flex:1 1 220px; min-width:0; ${INPUT}"><button class="fp-add" style="${BTN2}">Add a folder</button></div>
       ${(scan.added || []).map(a => `<div style="margin-top:4px; ${a.error ? 'color:#e08040' : MUTED}">${esc(a.path)}: ${esc(a.error || `${a.found} project${a.found === 1 ? '' : 's'} found`)}</div>`).join('')}
     </div>
@@ -88,16 +90,52 @@ function render(box) {
     ${section(['yours-active', 'yours-old', 'no-git', 'no-commits', 'unknown-author', 'git-unavailable'])}
     ${clones ? `<button class="fp-clones" style="background:none; border:none; padding:0; margin-top:12px; font-size:11px; color:#8090b0; text-transform:uppercase; letter-spacing:0.04em; cursor:pointer; font-family:inherit">${showClones ? '▾' : '▸'} ${esc(KIND.clone)} (${clones})</button>${showClones ? groups.clone.map(row).join('') : ''}` : ''}
     ${section(['in-brain'])}
-    ${scan.rows.length ? '' : `<div style="margin-top:12px; ${MUTED}">No projects found outside the folders above.</div>`}
-    <div style="margin-top:14px; ${MUTED}">Continue drafts a state.md and context.md for each ticked project, from its README's first lines, its manifest (name, description, dependencies) and its last ten commit subjects, and puts them in the Inbox. Nothing is added to your brain until you approve it there.</div>
-    <div style="display:flex; gap:8px; margin-top:10px; align-items:center"><button class="fp-go" style="${BTN}">Continue with ${ticked.size} project${ticked.size === 1 ? '' : 's'}</button><button class="fp-cancel" style="${BTN2}">Cancel</button><span class="fp-msg" style="${MUTED}"></span></div>`;
-  for (const c of box.querySelectorAll('input[type=checkbox]')) c.addEventListener('change', () => { c.checked ? ticked.add(c.dataset.path) : ticked.delete(c.dataset.path); box.querySelector('.fp-go').textContent = `Continue with ${ticked.size} project${ticked.size === 1 ? '' : 's'}`; });
+    ${scan.rows.length ? '' : `<div style="margin-top:12px">No code projects found. If yours are elsewhere, add their folder above; or start one by name.</div>
+      <div style="margin-top:8px"><button class="fp-new" style="${BTN}">New project</button></div>
+      <div class="fp-new-form" style="display:none; margin-top:8px; gap:6px; flex-direction:column; max-width:460px">
+        <input class="fp-new-name" type="text" placeholder="Project name" maxlength="80" style="${INPUT}">
+        <input class="fp-new-line" type="text" placeholder="One line: what it is" maxlength="300" style="${INPUT}">
+        <div style="display:flex; gap:8px; align-items:center"><button class="fp-new-go" style="${BTN}">Create drafts in the Inbox</button><span class="fp-new-msg" style="${MUTED}"></span></div>
+      </div>`}
+    <div style="margin-top:14px; ${MUTED}${scan.rows.length ? '' : '; display:none'}">Continue drafts a state.md and context.md for each ticked project, from its README's first lines, its manifest (name, description, dependencies) and its last ten commit subjects, and puts them in the Inbox. Nothing is added to your brain until you approve it there.</div>
+    <div style="display:flex; gap:8px; margin-top:10px; align-items:center"><button class="fp-go" style="${BTN}">Continue</button><button class="fp-cancel" style="${BTN2}">Cancel</button><span class="fp-msg" style="${MUTED}"></span></div>`;
+  updateGo(box);
+  for (const c of box.querySelectorAll('input[type=checkbox]')) c.addEventListener('change', () => { c.checked ? ticked.add(c.dataset.path) : ticked.delete(c.dataset.path); updateGo(box); });
+  box.querySelector('.fp-new')?.addEventListener('click', () => {
+    const f = box.querySelector('.fp-new-form'); f.style.display = 'flex'; box.querySelector('.fp-new').style.display = 'none'; f.querySelector('.fp-new-name').focus();
+  });
+  box.querySelector('.fp-new-go')?.addEventListener('click', () => createNew(box));
   box.querySelector('.fp-clones')?.addEventListener('click', () => { showClones = !showClones; render(box); });
   box.querySelector('.fp-cancel').addEventListener('click', close);
   const add = () => { const v = box.querySelector('.fp-path').value.trim(); if (v) { extra = [...new Set([...extra, v])]; runScan(box); } };
   box.querySelector('.fp-add').addEventListener('click', add);
   box.querySelector('.fp-path').addEventListener('keydown', e => { if (e.key === 'Enter') add(); });
   box.querySelector('.fp-go').addEventListener('click', () => propose(box));
+}
+
+// "Continue with N projects", disabled while nothing is ticked.
+function updateGo(box) {
+  const go = box.querySelector('.fp-go');
+  go.textContent = `Continue with ${ticked.size} project${ticked.size === 1 ? '' : 's'}`;
+  go.title = ticked.size ? '' : 'Tick at least one project first.';
+  go.disabled = !ticked.size;
+  go.style.opacity = ticked.size ? '' : '0.45';
+  go.style.cursor = ticked.size ? 'pointer' : 'not-allowed';
+}
+
+async function createNew(box) {
+  const name = box.querySelector('.fp-new-name').value.trim(), line = box.querySelector('.fp-new-line').value.trim();
+  const msg = box.querySelector('.fp-new-msg');
+  if (!name || !line) { msg.textContent = 'Give it a name and one line.'; return; }
+  const go = box.querySelector('.fp-new-go');
+  go.disabled = true; msg.textContent = 'Drafting…';
+  try {
+    const r = await fetch('/api/find-projects/new', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, line }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+    if (!d.projects[0].created.length) throw new Error(d.projects[0].errors.map(e => e.reason).join('; ') || 'No drafts were made.');
+    done(box, d);
+  } catch (e) { go.disabled = false; msg.textContent = e.message; }
 }
 
 async function propose(box) {
@@ -108,16 +146,20 @@ async function propose(box) {
     const r = await fetch('/api/find-projects/propose', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths: [...ticked] }) });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+    done(box, d);
+  } catch (e) {
+    go.disabled = false; updateGo(box);
+    box.querySelector('.fp-msg').textContent = e.message;
+  }
+}
+
+function done(box, d) {
     const ok = d.projects.filter(p => p.created.length), bad = d.projects.filter(p => p.errors.length);
     box.innerHTML = `<div style="font-size:15px; font-weight:700; color:#fff">Drafts are in the Inbox</div>
       <div style="margin-top:6px">${ok.length} project${ok.length === 1 ? '' : 's'}: ${esc(ok.map(p => p.name).join(', ') || 'none')}. Each has a state.md and a context.md draft to read, edit and approve or discard. Nothing was added to your brain yet.</div>
       ${bad.length ? `<div style="margin-top:6px; color:#e08040">${bad.map(p => `${esc(p.name)}: ${esc(p.errors.map(e => e.reason).join('; '))}`).join('<br>')}</div>` : ''}
-      <div style="margin-top:6px; ${MUTED}">After you approve a project, its page offers "Link code folder" with its folder already filled in.</div>
+      ${d.projects.some(p => p.path) ? `<div style="margin-top:6px; ${MUTED}">After you approve a project, its page offers "Link code folder" with its folder already filled in.</div>` : ''}
       <div style="display:flex; gap:8px; margin-top:12px"><button class="fp-inbox" style="${BTN}">Open Inbox</button><button class="fp-cancel" style="${BTN2}">Close</button></div>`;
     box.querySelector('.fp-inbox').addEventListener('click', () => { close(); openInboxPanel(); });
     box.querySelector('.fp-cancel').addEventListener('click', close);
-  } catch (e) {
-    go.disabled = false; go.textContent = `Continue with ${ticked.size} project${ticked.size === 1 ? '' : 's'}`;
-    box.querySelector('.fp-msg').textContent = e.message;
-  }
 }
