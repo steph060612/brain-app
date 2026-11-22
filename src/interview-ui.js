@@ -1,11 +1,12 @@
-// "Start interview" button: shown when brain is new (profile.md has at most a name, preferences.md empty).
+// "Start interview": offered while the brain is new (profile.md has at most a name, preferences.md empty).
 // Copies one Terminal command that starts Claude Code in the brain folder with the interview prompt.
 // Polls the inbox after the command is copied so the badge updates as proposals arrive.
+// Whether it is offered is reported to the top bar as a 'brain-setup' event ({ interview: true|false }); the top bar
+// decides where the button shows (src/topbar.js).
 import { refreshInboxCount } from './inbox.js';
 
 const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
-let slot = null;
 let pollTimer = null;
 
 async function fetchStatus() {
@@ -21,45 +22,29 @@ async function prepareInterview() {
   return data; // { command }
 }
 
-export function initInterviewButton(beforeEl) {
-  slot = document.createElement('span');
-  slot.id = 'interview-btn-slot';
-  slot.style.display = 'none';
-  beforeEl?.parentNode.insertBefore(slot, beforeEl);
+export function initInterview() {
   checkEligibility();
   window.addEventListener('brain-items-changed', checkEligibility);
 }
 
-async function checkEligibility() {
+export async function checkEligibility() {
   try {
     const { eligible } = await fetchStatus();
-    if (eligible) {
-      slot.style.display = '';
-      if (!slot.querySelector('button')) renderButton();
-    } else {
-      slot.style.display = 'none';
-      slot.innerHTML = '';
-    }
-  } catch { /* non-fatal: button stays hidden */ }
+    window.dispatchEvent(new CustomEvent('brain-setup', { detail: { interview: !!eligible } }));
+  } catch { /* non-fatal: the offer stays as it was */ }
 }
 
-function renderButton() {
-  slot.innerHTML = '';
+// A Start interview button; style is the caller's.
+export function interviewButton(style) {
   const btn = document.createElement('button');
-  btn.style.cssText = `
-    padding:5px 14px; background:rgba(60,108,255,0.22); border:1px solid rgba(60,108,255,0.5);
-    color:#9FD8FF; border-radius:4px; font-size:12px; cursor:pointer; font-family:inherit;
-    white-space:nowrap; font-weight:600;
-  `;
+  btn.style.cssText = style;
   btn.textContent = 'Start interview';
   btn.title = 'Starts a guided interview in Terminal — Claude Code asks 5 questions and writes proposals to your Inbox.';
-  btn.addEventListener('click', onClickInterview);
-  slot.appendChild(btn);
+  btn.addEventListener('click', () => onClickInterview(btn));
+  return btn;
 }
 
-async function onClickInterview() {
-  const btn = slot?.querySelector('button');
-  if (!btn) return;
+async function onClickInterview(btn) {
   btn.disabled = true;
   btn.textContent = 'Preparing…';
   try {

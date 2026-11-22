@@ -43,8 +43,7 @@ export async function initImport() {
   btn.addEventListener('mouseout',  () => btn.style.borderColor = 'rgba(100,120,200,0.22)');
   btn.addEventListener('click', openModal);
 
-  const gitTime = document.getElementById('git-time');
-  if (gitTime) gitTime.parentNode.insertBefore(btn, gitTime);
+  document.getElementById('more-items')?.appendChild(btn); // the top bar's More menu
 
   try {
     const [agentRes, statusRes] = await Promise.all([

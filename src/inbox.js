@@ -167,10 +167,8 @@ export function initInbox() {
   btn.appendChild(countBadge);
   btn.addEventListener('click', openInboxPanel);
 
-  const gitTime = document.getElementById('git-time');
-  if (gitTime) {
-    gitTime.parentNode.insertBefore(btn, gitTime);
-  }
+  const setupSlot = document.getElementById('topbar-setup');
+  setupSlot?.parentNode.insertBefore(btn, setupSlot);
 
   // Load initial count without opening panel
   loadInbox().then(items => {

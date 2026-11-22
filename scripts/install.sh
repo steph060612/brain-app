@@ -396,7 +396,7 @@ if [ "$ADOPT" != yes ]; then
   if [ -n "$(in_shell claude)" ]; then
     echo "Next: in the Brain app, click Connect Claude Code, then Find my projects, then Start interview."
   else
-    echo "First step: click 'Copy setup interview' and paste it into a new chat with your assistant."
+    echo "First step: in the Brain app, click More, then Copy setup interview, and paste it into a new chat with your assistant."
   fi
 fi
 echo "Backups: your brain ($(tilde "$BRAIN_DIR")) is saved on this Mac every 15 minutes. It is sent nowhere."

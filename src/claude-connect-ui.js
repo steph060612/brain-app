@@ -1,7 +1,8 @@
 // "Connect Claude Code" in the top bar (server side: src/claude-connect.js). Shown only when Claude Code is found:
 // "Connect Claude Code" when nothing is connected, "Update Claude Code connection" when the block or the tool
-// server registration is missing or outdated, and a small "Claude Code connected" link when everything is current
-// (it opens the same panel, with Remove). Every change is previewed with the exact text and paths first.
+// server registration is missing or outdated; when everything is current the bar shows nothing and the More menu's
+// "Claude Code connection" opens the same panel, with Remove. Every change is previewed with the exact text and
+// paths first. The state goes to the top bar as a 'brain-setup' event ({ connect: 'connect'|'update'|'current'|'none' }).
 const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const BTN = `padding:4px 10px; background:rgba(60,108,255,0.18); border:1px solid rgba(60,108,255,0.4); color:#9FD8FF;
   border-radius:4px; font-size:12px; cursor:pointer; font-family:inherit; white-space:nowrap;`;
@@ -22,12 +23,13 @@ async function call(method, body) {
   return data;
 }
 
-export function initClaudeConnect(beforeEl) {
+// Returns the slot that holds the Connect / Update button; the top bar places and shows it.
+export function initClaudeConnect() {
   slot = document.createElement('span');
   slot.id = 'claude-connect';
   slot.style.display = 'none';
-  beforeEl?.parentNode.insertBefore(slot, beforeEl);
   refresh();
+  return slot;
 }
 
 async function refresh() {
@@ -35,14 +37,23 @@ async function refresh() {
   renderButton();
 }
 
+const connectState = () => (!status?.claude ? 'none' : status.upToDate ? 'current' : status.connected ? 'update' : 'connect');
+
 function renderButton() {
   if (!slot) return;
-  if (!status?.claude) { slot.style.display = 'none'; slot.innerHTML = ''; return; }
-  slot.style.display = '';
-  slot.innerHTML = status.upToDate
-    ? `<button style="background:none; border:none; padding:0; ${MUTED} cursor:pointer; font-family:inherit; white-space:nowrap" title="Every Claude Code session knows your brain. Click to see or remove the connection.">Claude Code connected</button>`
-    : `<button style="${BTN}${status.connected ? ' color:#e0a040; border-color:rgba(224,160,64,0.45);' : ''}" title="Tells every Claude Code session where your brain is, and registers the code map tools. Shows the exact changes first.">${status.connected ? 'Update Claude Code connection' : 'Connect Claude Code'}</button>`;
-  slot.querySelector('button').addEventListener('click', () => openPanel(status.upToDate ? 'view' : 'connect'));
+  const state = connectState();
+  slot.dataset.state = state;
+  if (state === 'none' || state === 'current') slot.innerHTML = '';
+  else {
+    slot.innerHTML = `<button style="${BTN}${state === 'update' ? ' color:#e0a040; border-color:rgba(224,160,64,0.45);' : ''}" title="Tells every Claude Code session where your brain is, and registers the code map tools. Shows the exact changes first.">${state === 'update' ? 'Update Claude Code connection' : 'Connect Claude Code'}</button>`;
+    slot.querySelector('button').addEventListener('click', () => openPanel('connect'));
+  }
+  window.dispatchEvent(new CustomEvent('brain-setup', { detail: { connect: state } }));
+}
+
+// The More menu's "Claude Code connection": the connect panel while something is to do, else the current state.
+export function openConnection() {
+  if (status?.claude) openPanel(status.upToDate ? 'view' : 'connect');
 }
 
 const FILE_TEXT = {
