@@ -235,6 +235,23 @@ export function bumpUpdated(content, today) {
 
 const headingText = h => h.replace(/^#+[ \t]*/, '').trim().toLowerCase();
 
+// Approved facts added to an existing file. A file with headings (state.md, context.md) gets them under a new
+// "## Added <date> (approved from the Inbox)" heading at the end, never under whatever list happens to come last;
+// a second approval the same day goes under the same heading when it is still the last one. A flat bullet file
+// (profile.md, preferences.md) gets the bullets at the end. Content that starts with its own heading is a section of
+// its own and is added at the end as it is.
+export const addedHeading = today => `## Added ${today} (approved from the Inbox)`;
+const HEADING = /^#{1,6}[ \t]+\S/;
+export function appendFacts(current, content, today) {
+  const base = bumpUpdated(current, today).trimEnd();
+  const facts = content.replace(/^\s*\n/, '').trimEnd();
+  const body = base.replace(FM_BLOCK, '');
+  const headings = body.split('\n').filter(l => HEADING.test(l));
+  if (!headings.length || HEADING.test(facts.trimStart().split('\n')[0])) return base + '\n' + facts + '\n';
+  if (headings.at(-1).trim() === addedHeading(today)) return base + '\n' + facts + '\n';
+  return base + '\n\n' + addedHeading(today) + '\n\n' + facts + '\n';
+}
+
 // Apply one action to the target's current content (null if the file does not exist).
 // Returns { content } or { error }. Never adds, edits or removes a permalink line.
 export function applyProposal(action, data, current, { today, titleFor }) {
@@ -249,7 +266,7 @@ export function applyProposal(action, data, current, { today, titleFor }) {
 
   if (action === 'append') {
     if (!exists) return { content: `---\ntitle: ${titleFor()}\nupdated: ${today}\n---\n\n${data.content.trim()}\n` };
-    return { content: bumpUpdated(current, today).trimEnd() + '\n' + data.content.trimEnd() + '\n' };
+    return { content: appendFacts(current, data.content, today) };
   }
 
   if (!exists) return { error: `${action} refused: target does not exist` };

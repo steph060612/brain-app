@@ -262,7 +262,7 @@ export async function draftProject(dir, today) {
     `---`, `title: ${row.name} state`, `updated: ${today}`, `---`, ``, `# ${row.name}`, ``, `> ${label}`, ``,
     `## Status`,
     row.isRepo && row.lastCommit ? `- Last commit: ${day(row.lastCommit)}. ${row.own} of ${row.commits} commits are yours${row.lastOwnCommit ? `; your last on ${day(row.lastOwnCommit)}` : ''}.` : `- Not a git repository; no commit history.`,
-    `- Next step: not in these files. Add it.`,
+    `- Next step: not known yet. Facts you approve later appear under Added headings below.`,
     ...(subjects.length ? [``, `## Recent commits (last ten subjects, newest first)`, ...subjects.map(x => `- ${x}`)] : []),
   ].join('\n');
   const context = [

@@ -11,7 +11,7 @@ import { homedir } from 'os';
 import { parseConversations, parseMemories, getConvDir, getMemDir, CHARS_PER_CALL } from './src/claude-parser.js';
 import { parseConversations as parseChatgptConversations, getConvDir as getChatgptConvDir } from './src/chatgpt-parser.js';
 import { parseConversations as parseGeminiConversations, getConvDir as getGeminiConvDir } from './src/gemini-parser.js';
-import { parseProposals, toInboxFile, batchLines, readInboxBody, applyProposal, ACTIONS } from './src/proposals.js';
+import { parseProposals, toInboxFile, batchLines, readInboxBody, applyProposal, appendFacts, ACTIONS } from './src/proposals.js';
 import { registerCodeMapRoutes } from './src/codemap-routes.js';
 import { connectStatus, connectClaude, disconnectClaude } from './src/claude-connect.js';
 import { assistantEnv } from './src/assistant-env.js';
@@ -716,11 +716,7 @@ async function approveAppend({ fm, inboxAbs, targetAbs, body, targetHash, today 
     if (targetHash && md5(targetContent) !== targetHash) {
       return { status: 409, body: { error: 'conflict', message: 'Target file changed since it was opened.' } };
     }
-    let updated = targetContent.replace(/^(updated:[ \t]*).*$/m, `$1${today}`);
-    if (updated === targetContent) {
-      updated = targetContent.replace(/^(---[ \t]*\r?\n)/, `$1updated: ${today}\n`);
-    }
-    newTargetContent = guardPermalink(targetContent, updated.trimEnd() + '\n' + body);
+    newTargetContent = guardPermalink(targetContent, appendFacts(targetContent, body, today));
   } else {
     const titleStem = basename(fm.target, '.md').replace(/-/g, ' ');
     newTargetContent = `---\ntitle: ${titleStem}\nupdated: ${today}\n---\n\n${body}`;
