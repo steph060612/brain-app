@@ -281,6 +281,10 @@ async function reloadList() {
   renderList();
 }
 
+// An approve or discard changed the brain or the Inbox: whatever depends on them checks again now, not after a reload
+// (Start interview hides once profile.md or preferences.md has more than a name).
+const inboxActed = () => window.dispatchEvent(new CustomEvent('brain-inbox-changed'));
+
 async function approveAllInBatch(batch, btn) {
   const items = batchItems(batch.id);
   btn.disabled = true;
@@ -288,7 +292,7 @@ async function approveAllInBatch(batch, btn) {
   setStatus(`Approving ${items.length}…`, '#8090b0');
   try {
     const { approved, failed } = await approveBatch(items);
-    if (approved?.length) window.dispatchEvent(new CustomEvent('brain-items-changed'));
+    if (approved?.length) { window.dispatchEvent(new CustomEvent('brain-items-changed')); inboxActed(); }
     batchErrors.delete(batch.id);
     if (failed) {
       const item = items.find(i => i.filename === failed.filename);
@@ -324,6 +328,7 @@ async function discardAllInBatch(batch, btn) {
   } catch (e) {
     setStatus(`Discarded ${discarded} of ${items.length}, then stopped: ${e.message}.`, '#c0503a');
   }
+  if (discarded) inboxActed();
   await reloadList().catch(() => {});
 }
 
@@ -418,6 +423,7 @@ function buildReadArea(card, item) {
           frontmatter: 'frontmatter updated in', create: 'created' }[data.action] || 'appended to';
         setStatus(`Approved — ${done} ${item.target}.`, '#6FE3D0');
         if (data.action === 'create') window.dispatchEvent(new CustomEvent('brain-items-changed')); // a new item, maybe a new project
+        inboxActed();
       } else if (status === 409) {
         setStatus(data.message || 'Conflict — refreshing.', '#e08040');
         await openInboxPanel();
@@ -453,6 +459,7 @@ function buildReadArea(card, item) {
         card.remove();
         afterCardRemoved();
         setStatus('Discarded.', '#8090b0');
+        inboxActed();
       } else {
         setStatus('Discard failed.', '#c0503a');
         discardBtn.disabled = false;

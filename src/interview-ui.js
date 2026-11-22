@@ -25,6 +25,7 @@ async function prepareInterview() {
 export function initInterview() {
   checkEligibility();
   window.addEventListener('brain-items-changed', checkEligibility);
+  window.addEventListener('brain-inbox-changed', checkEligibility); // an Inbox card approved or discarded
 }
 
 export async function checkEligibility() {
