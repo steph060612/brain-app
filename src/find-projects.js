@@ -26,6 +26,7 @@ const SKIP_HOME = new Set(['Library', 'Applications', 'Music', 'Movies', 'Pictur
 const SKIP_ANY = new Set(['node_modules', 'bower_components', 'vendor', 'Pods', 'Carthage', 'venv', 'env', 'site-packages',
   '__pycache__', 'build', 'dist', 'target', 'DerivedData', 'Library']);
 const RECENT_DAYS = 90;
+export const RECENT_UNKNOWN = 5; // ticked by default when the git identity is not set
 const BLOCKED = 'macOS does not let the Brain app read this folder (it runs in the background). Move the project out of Desktop, Documents, Downloads or iCloud Drive, for example to ~/Projects, then add that folder.';
 const LANG = {
   js: 'JavaScript', jsx: 'JavaScript', mjs: 'JavaScript', cjs: 'JavaScript', ts: 'TypeScript', tsx: 'TypeScript',
@@ -188,11 +189,15 @@ export async function scanProjects({ brain, extra = [] } = {}) {
   const rows = await pool(unique, 8, d => describe(d, ctx));
   const order = { 'yours-active': 0, 'yours-old': 1, 'no-git': 2, 'no-commits': 3, 'unknown-author': 4, 'git-unavailable': 5, clone: 6, 'in-brain': 7 };
   rows.sort((a, b) => order[a.kind] - order[b.kind] || String(b.lastOwnCommit || b.lastCommit || '').localeCompare(String(a.lastOwnCommit || a.lastCommit || '')) || a.name.localeCompare(b.name));
+  // Without a git name and email nothing is "yours", so the five most recently committed projects are ticked instead.
+  const noIdentity = ctx.git && !ctx.ids.emails.length && !ctx.ids.names.length;
+  if (noIdentity) rows.filter(x => x.kind === 'unknown-author' && x.lastCommit)
+    .sort((a, b) => b.lastCommit.localeCompare(a.lastCommit)).slice(0, RECENT_UNKNOWN).forEach(x => { x.ticked = true; });
   let home = [];
   try { home = await readdir(HOME); } catch { }
   return {
     ms: Date.now() - t0,
-    identity: ctx.ids, git: ctx.git,
+    identity: ctx.ids, git: ctx.git, noIdentity,
     protectedSkipped: [...PROTECTED.filter(n => home.includes(n)).map(n => `~/${n}`), '~/Library (iCloud Drive and cloud storage folders are inside it)'],
     otherSkipped: found.skipped,
     added,
@@ -262,7 +267,9 @@ export async function draftProject(dir, today) {
   const state = [
     `---`, `title: ${row.name} state`, `updated: ${today}`, `---`, ``, `# ${row.name}`, ``, `> ${label}`, ``,
     `## Status`,
-    row.isRepo && row.lastCommit ? `- Last commit: ${day(row.lastCommit)}. ${row.own} of ${row.commits} commits are yours${row.lastOwnCommit ? `; your last on ${day(row.lastOwnCommit)}` : ''}.` : `- Not a git repository; no commit history.`,
+    row.isRepo && row.lastCommit ? `- Last commit: ${day(row.lastCommit)}. ${row.kind === 'unknown-author'
+      ? `${row.commits} commit${row.commits === 1 ? '' : 's'}; your git name and email are not set, so which of them are yours cannot be told.`
+      : `${row.own} of ${row.commits} commits are yours${row.lastOwnCommit ? `; your last on ${day(row.lastOwnCommit)}` : ''}.`}` : `- Not a git repository; no commit history.`,
     `- Next step: not known yet. Facts you approve later appear under Added headings below.`,
     ...(subjects.length ? [``, `## Recent commits (last ten subjects, newest first)`, ...subjects.map(x => `- ${x}`)] : []),
   ].join('\n');

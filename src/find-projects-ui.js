@@ -58,7 +58,8 @@ async function runScan(box) {
 function row(x) {
   const disabled = x.kind === 'in-brain';
   const langs = x.languages.map(l => `${l.name} ${l.files}`).join(', ');
-  const commits = x.isRepo ? (x.commits ? `${x.own} of ${x.commits} commits yours` : 'no commits') : 'no git';
+  const commits = !x.isRepo ? 'no git' : !x.commits ? 'no commits'
+    : x.kind === 'unknown-author' ? `${x.commits} commit${x.commits === 1 ? '' : 's'}, whose cannot be told` : `${x.own} of ${x.commits} commits yours`;
   return `<label style="display:grid; grid-template-columns:20px 1fr; gap:6px; padding:6px 4px; border-top:1px solid rgba(100,120,200,0.1); ${disabled ? 'opacity:0.5' : 'cursor:pointer'}">
     <input type="checkbox" data-path="${esc(x.path)}" ${ticked.has(x.path) ? 'checked' : ''} ${disabled ? 'disabled' : ''} style="margin-top:3px">
     <span><b style="color:#fff">${esc(x.name)}</b> <span style="${MUTED}">${esc(x.display)}</span><br>
@@ -76,8 +77,8 @@ function render(box) {
   box.innerHTML = `
     <div style="font-size:15px; font-weight:700; color:#fff">Find my projects</div>
     <div style="${MUTED} margin-top:4px">Found ${scan.rows.length} folder${scan.rows.length === 1 ? '' : 's'} with git or a project file, in ${(scan.ms / 1000).toFixed(1)} s. Only folder names and git history were read; no project file was opened.
-      ${id.emails?.length || id.names?.length ? `"Yours" means commits by ${esc([...(id.names || []), ...(id.emails || [])].join(' / '))}.` : 'Your git name and email are not set, so it cannot tell your projects from cloned ones.'}
-      The ones with a commit by you in the last 90 days are ticked.</div>
+      ${scan.noIdentity ? 'Your git name and email are not set, so it cannot tell which commits are yours or your projects from cloned ones. The five most recently committed projects are ticked.'
+        : `${id.emails?.length || id.names?.length ? `"Yours" means commits by ${esc([...(id.names || []), ...(id.emails || [])].join(' / '))}.` : ''} The ones with a commit by you in the last 90 days are ticked.`}</div>
     <div style="margin-top:10px; padding:8px 10px; border:1px solid rgba(224,160,64,0.3); border-radius:6px; font-size:12px">
       Not searched: ${esc(scan.protectedSkipped.join(', '))}. The Brain app runs in the background, and macOS does not let background apps open Desktop, Documents, Downloads, iCloud Drive or cloud storage folders. A project kept there cannot be mapped or read by the app; move it to a folder such as ~/Projects. To search another folder, type its path:
       <div style="display:flex; gap:6px; margin-top:6px; flex-wrap:wrap"><input class="fp-path" type="text" placeholder="~/Code" spellcheck="false" style="flex:1 1 220px; min-width:0; ${INPUT}"><button class="fp-add" style="${BTN2}">Add a folder</button></div>
