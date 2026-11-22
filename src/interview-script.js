@@ -13,9 +13,11 @@
 // The script stops before launching when Claude Code is older than MIN_CLAUDE, the first version that
 // accepts all of these flags (2.0.42 rejects --permission-mode dontAsk).
 // The brain path is resolved with pwd -P so the absolute rule matches symlinked folders too.
-// "$@" passes extra arguments through (the test uses it for -p).
+// The first message, "Begin the interview.", is passed as the prompt argument so Claude Code starts asking right
+// away instead of waiting silently for the person to type. "$@" passes extra arguments through after it.
 
 export const MIN_CLAUDE = '2.0.43';
+export const OPENING = 'Begin the interview.';
 
 const shellq = s => "'" + String(s).replace(/'/g, "'\\''") + "'";
 
@@ -50,6 +52,6 @@ export function interviewScript({ brain, claude, prompt, label = brain }) {
     '  --strict-mcp-config \\',
     '  --add-dir "$BRAIN" \\',
     '  --append-system-prompt-file "$PROMPT" \\',
-    '  "$@"',
+    `  ${shellq(OPENING)} "$@"`,
   ].join('\n') + '\n';
 }

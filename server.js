@@ -1701,7 +1701,8 @@ async function interviewEligibility() {
     || (profileLines.length === 1 && /^-\s*[Nn]ame:\s*\S/.test(profileLines[0]));
   const eligible     = hasOnlyName && !stripFM(prefsText);
   const projectNames = await subdirs(join(BRAIN, 'projects'));
-  return { eligible, projectNames };
+  const name         = (stripFM(profileText).match(/^-\s*[Nn]ame:[ \t]*(.+)$/m)?.[1] || '').trim();
+  return { eligible, projectNames, name };
 }
 
 app.get('/api/interview-status', async (_req, res) => {
@@ -1711,7 +1712,7 @@ app.get('/api/interview-status', async (_req, res) => {
 
 app.post('/api/interview/prepare', async (_req, res) => {
   try {
-    const { eligible, projectNames } = await interviewEligibility();
+    const { eligible, projectNames, name } = await interviewEligibility();
     if (!eligible) return res.status(409).json({ error: 'Brain is not empty enough to start the interview.' });
 
     let templateText = '';
@@ -1721,7 +1722,11 @@ app.post('/api/interview/prepare', async (_req, res) => {
     const projectNote = projectNames.length
       ? `\nExisting projects in this brain (list these in Q2): ${projectNames.join(', ')}.`
       : '\nThere are no projects in this brain yet. For Q2, ask if there are projects to add.';
-    const fullPrompt = templateText.trimEnd() + '\n' + projectNote + '\n';
+    // Titles name the person as profile.md does, never by the Mac's account name or a folder name.
+    const nameNote = name
+      ? `\nThe person's name, from profile.md: ${name}. Use this name in proposal titles and text (for example "Who ${name} is"). Never use the computer's account name, the home folder name or a name from a file path.`
+      : '\nprofile.md has no name yet. Ask for it first and use it in proposal titles. Never use the computer\'s account name, the home folder name or a name from a file path.';
+    const fullPrompt = templateText.trimEnd() + '\n' + projectNote + nameNote + '\n';
 
     const { claudePath } = await assistantEnv({ fresh: false });
 
