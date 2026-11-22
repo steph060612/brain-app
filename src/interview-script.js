@@ -3,14 +3,19 @@
 // Inbox-only rule, enforced by Claude Code's own permission system (never by file permissions:
 // a chmod left behind by a crash would make the brain read-only and break saving and approvals).
 //   --permission-mode dontAsk   denies every tool call that is not pre-approved, without asking.
-//   --allowedTools              pre-approves Read, Glob, Grep, and file writes only under <brain>/inbox/.
-//                               Claude Code matches file-write paths only against Edit(path) rules (a
-//                               Write(path) rule is ignored), and Edit(path) covers the Write tool.
+//   --allowedTools              pre-approves reading only inside the brain, and file writes only under
+//                               <brain>/inbox/. Claude Code matches file paths only against Read(path) and
+//                               Edit(path) rules: Read(path) covers Read, Glob and Grep, Edit(path) covers
+//                               Write (a Write(path) or Glob(path) rule is ignored).
 //   --disallowedTools           hard-blocks the Edit tool itself, NotebookEdit and Bash. (MultiEdit is
 //                               no longer a tool in Claude Code 2.1.)
 //   --strict-mcp-config         loads no MCP servers, so no MCP tool can write to the brain.
+// The script stops before launching when Claude Code is older than MIN_CLAUDE, the first version that
+// accepts all of these flags (2.0.42 rejects --permission-mode dontAsk).
 // The brain path is resolved with pwd -P so the absolute rule matches symlinked folders too.
 // "$@" passes extra arguments through (the test uses it for -p).
+
+export const MIN_CLAUDE = '2.0.43';
 
 const shellq = s => "'" + String(s).replace(/'/g, "'\\''") + "'";
 
@@ -26,6 +31,13 @@ export function interviewScript({ brain, claude, prompt, label = brain }) {
     `BRAIN=${shellq(brain)}`,
     `CLAUDE=${shellq(claude)}`,
     `PROMPT=${shellq(prompt)}`,
+    `MIN=${MIN_CLAUDE}`,
+    '',
+    'HAVE="$("$CLAUDE" --version 2>/dev/null | sed -n \'s/^\\([0-9][0-9]*\\.[0-9][0-9]*\\.[0-9][0-9]*\\).*/\\1/p\' | head -1)"',
+    'if [ -z "$HAVE" ] || [ "$(printf \'%s\\n%s\\n\' "$MIN" "$HAVE" | sort -V | head -1)" != "$MIN" ]; then',
+    '  echo "This interview needs Claude Code $MIN or newer (found: ${HAVE:-none}), so please update Claude Code and run it again." >&2',
+    '  exit 1',
+    'fi',
     '',
     'BRAIN="$(cd "$BRAIN" && pwd -P)"',
     'mkdir -p "$BRAIN/inbox"',
@@ -33,7 +45,7 @@ export function interviewScript({ brain, claude, prompt, label = brain }) {
     '',
     'exec "$CLAUDE" \\',
     '  --permission-mode dontAsk \\',
-    '  --allowedTools Read Glob Grep "Edit(/$BRAIN/inbox/**)" \\',
+    '  --allowedTools "Read(/$BRAIN/**)" "Edit(/$BRAIN/inbox/**)" \\',
     '  --disallowedTools Edit NotebookEdit Bash \\',
     '  --strict-mcp-config \\',
     '  --add-dir "$BRAIN" \\',
