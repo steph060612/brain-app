@@ -78,7 +78,8 @@ function createBackdrop() {
 }
 
 // ─── OPEN / CLOSE ─────────────────────────────────────────────────────────────
-async function openModal() {
+// Also opened from the Set up your brain chooser (src/setup-ui.js).
+export async function openModal() {
   stopPolls();
   backdropEl.style.display = 'flex';
   await refreshRuns();

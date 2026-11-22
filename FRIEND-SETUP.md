@@ -45,7 +45,7 @@ If the update warns that your brain is in Documents, Desktop or Downloads, it is
 4. Paste the install line again. The red banner in the app goes away after the next save, within 15 minutes.
 
 ## First session: fill your brain
-1. In the app, click **Copy setup interview** (top bar; it shows only while you have no projects).
+1. In the app, click **Set up your brain** (top bar while your brain is new; always under More), then **Copy setup interview**.
 2. Paste it into a new ChatGPT chat. It asks you about 15 short questions: who you are, how you want it to work with you, your projects.
 3. At the end it gives you one code block. Copy it, open **Inbox > Paste proposals** in the app, paste, and approve what is right. Discard anything you did not say.
 

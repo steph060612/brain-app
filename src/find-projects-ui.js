@@ -1,6 +1,7 @@
 // "Find my projects" (server side: src/find-projects.js). A checklist of the code projects found in the home folder,
 // from names and git facts only; ticked ones become Inbox proposals (state.md and context.md drafts), one batch per
-// project. Opened from the top bar while the brain has no projects, and from the List view at any time.
+// project. Opened from the More menu while the brain has no projects, from the Set up your brain chooser, and from
+// the List view at any time.
 import { openInboxPanel } from './inbox.js';
 
 const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -29,16 +30,35 @@ const KIND = {
   'git-unavailable': 'Git repository (git is not installed, so no history)', clone: 'No commits by you: probably cloned', 'in-brain': 'Already in your brain',
 };
 
-export async function openFindProjects() {
+function openOverlay(width) {
   overlay?.remove();
   overlay = document.createElement('div');
   overlay.style.cssText = 'position:fixed; inset:0; z-index:200; background:rgba(5,7,15,0.6); display:flex; align-items:flex-start; justify-content:center; padding:60px 16px 16px; overflow:auto;';
   overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
   const box = document.createElement('div');
-  box.style.cssText = 'width:min(760px,100%); background:#12162a; border:1px solid rgba(100,120,200,0.3); border-radius:8px; padding:16px 18px; font-size:12.5px; color:#c8d0e8; line-height:1.5;';
+  box.style.cssText = `width:min(${width}px,100%); font-family:system-ui,-apple-system,sans-serif; background:#12162a; border:1px solid rgba(100,120,200,0.3); border-radius:8px; padding:16px 18px; font-size:12.5px; color:#c8d0e8; line-height:1.5;`;
   overlay.appendChild(box);
   document.body.appendChild(overlay);
-  await runScan(box);
+  return box;
+}
+
+export async function openFindProjects() {
+  await runScan(openOverlay(760));
+}
+
+// New project on its own (the Set up your brain chooser): the same form and drafts as Find my projects' New project.
+export function openNewProject() {
+  const box = openOverlay(560);
+  box.innerHTML = `<div style="font-size:15px; font-weight:700; color:#fff">New project</div>
+    <div style="${MUTED} margin-top:4px">Give it a name and one line on what it is. A state.md and a context.md draft go to the Inbox; nothing is added to your brain until you approve them there.</div>
+    <div class="fp-new-form" style="display:flex; margin-top:10px; gap:6px; flex-direction:column">
+      <input class="fp-new-name" type="text" placeholder="Project name" maxlength="80" style="${INPUT}">
+      <input class="fp-new-line" type="text" placeholder="One line: what it is" maxlength="300" style="${INPUT}">
+      <div style="display:flex; gap:8px; align-items:center"><button class="fp-new-go" style="${BTN}">Create drafts in the Inbox</button><button class="fp-cancel" style="${BTN2}">Cancel</button><span class="fp-new-msg" style="${MUTED}"></span></div>
+    </div>`;
+  box.querySelector('.fp-new-go').addEventListener('click', () => createNew(box));
+  box.querySelector('.fp-cancel').addEventListener('click', close);
+  box.querySelector('.fp-new-name').focus();
 }
 function close() { overlay?.remove(); overlay = null; }
 

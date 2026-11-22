@@ -1,9 +1,10 @@
-// Top bar: Search, List, Inbox, the setup step that applies now, and a More menu with everything else.
-// Setup buttons, in order: Connect Claude Code, Find my projects (while the brain has no projects), Start interview
-// (while profile.md has only a name). Only the first that applies is in the bar, plus "Update Claude Code connection"
-// when an existing connection is outdated, so never more than two. The others that apply are in the More menu, with
-// Copy setup interview, the Claude Code connection, Copy general pack, Copy close-session prompt, Distill and Import
-// (src/distill.js and src/import.js add theirs to #more-items), and the last commit time.
+// Top bar: Search, List, Inbox, exactly one setup button, and a More menu with everything else.
+// The setup button: "Connect Claude Code" (or "Update Claude Code connection") while that step is open; otherwise
+// "Set up your brain" while the brain has no projects or profile.md and preferences.md are still empty (rechecked
+// after every Inbox approve or discard); otherwise none. "Set up your brain" (src/setup-ui.js) is always in More too,
+// with Find my projects (while the brain has no projects), Start interview (while the brain is new and Claude Code is
+// found), Copy setup interview, the Claude Code connection, Copy general pack, Copy close-session prompt, Distill and
+// Import (src/distill.js and src/import.js add theirs to #more-items), and the last commit time.
 import { fetchGitLog } from './api.js';
 import { setSearchQuery } from './labels.js';
 import { setListQuery } from './list.js';
@@ -11,12 +12,14 @@ import { packButton, textCopyButton } from './pack.js';
 import { initClaudeConnect, openConnection } from './claude-connect-ui.js';
 import { findProjectsButton } from './find-projects-ui.js';
 import { initInterview, interviewButton } from './interview-ui.js';
+import { setupBrainButton } from './setup-ui.js';
 
 const CLOSE_SESSION_PROMPT = 'Close session: output proposed changes for my brain in the UPDATE PROTOCOL format from README.md (### FILE, ### ACTION, content; OLD and NEW lines for replace-line), all inside one code block. Include only facts I stated or confirmed in this chat. Nothing is saved until I approve.';
 const SETUP_BTN = `padding:5px 14px; background:rgba(60,108,255,0.22); border:1px solid rgba(60,108,255,0.5); color:#9FD8FF;
   border-radius:4px; font-size:12px; cursor:pointer; font-family:inherit; white-space:nowrap; font-weight:600;`;
 
-const setup = { connect: 'none', noProjects: false, interview: false };
+const setup = { connect: 'none', noProjects: false, interview: false, profileEmpty: false, claude: false };
+const chooserState = () => ({ claude: setup.claude, profileEmpty: setup.profileEmpty });
 let bar = {}, menu = {};
 
 export function initTopbar() {
@@ -30,9 +33,8 @@ export function initTopbar() {
 
   // Setup slot in the bar (Inbox is added before it by src/inbox.js, List after the search box by src/list.js).
   const slot = document.getElementById('topbar-setup');
-  bar = { connect: initClaudeConnect(), find: findProjectsButton({ prominent: true }), interview: interviewButton(SETUP_BTN) };
-  bar.find.id = 'find-btn';
-  bar.interview.id = 'interview-btn';
+  bar = { connect: initClaudeConnect(), setup: setupBrainButton(SETUP_BTN, chooserState) };
+  bar.setup.id = 'setup-brain-btn';
   for (const el of Object.values(bar)) { el.style.display = 'none'; slot.appendChild(el); }
 
   // More menu: in <body>, because the bar's backdrop blur would clip a dropdown inside it.
@@ -57,7 +59,7 @@ export function initTopbar() {
   connection.textContent = 'Claude Code connection';
   connection.title = 'See, update or remove the Claude Code connection.';
   connection.addEventListener('click', openConnection);
-  menu = { find: findProjectsButton(), interview: interviewButton(''), setupCopy, connection };
+  menu = { setupBrain: setupBrainButton('', chooserState), find: findProjectsButton(), interview: interviewButton(''), setupCopy, connection };
   for (const el of Object.values(menu)) { el.style.display = 'none'; setupBox.appendChild(el); }
   setupCopy.dataset.keepOpen = '1';
 
@@ -87,12 +89,13 @@ export function initTopbar() {
 // Which setup buttons are in the bar and which in the More menu.
 function renderSetup() {
   if (!bar.connect) return;
-  const applies = { connect: setup.connect === 'connect', find: setup.noProjects, interview: setup.interview };
-  const first = ['connect', 'find', 'interview'].find(k => applies[k]);
-  const inBar = { connect: first === 'connect' || setup.connect === 'update', find: first === 'find', interview: first === 'interview' };
-  for (const k of ['connect', 'find', 'interview']) bar[k].style.display = inBar[k] ? '' : 'none';
-  menu.find.style.display = applies.find && !inBar.find ? '' : 'none';
-  menu.interview.style.display = applies.interview && !inBar.interview ? '' : 'none';
+  const connectOpen = setup.connect === 'connect' || setup.connect === 'update';
+  const notSetUp = setup.noProjects || setup.profileEmpty;
+  bar.connect.style.display = connectOpen ? '' : 'none';
+  bar.setup.style.display = !connectOpen && notSetUp ? '' : 'none';
+  menu.setupBrain.style.display = '';
+  menu.find.style.display = setup.noProjects ? '' : 'none';
+  menu.interview.style.display = setup.interview ? '' : 'none';
   menu.setupCopy.style.display = setup.noProjects ? '' : 'none';
   menu.connection.style.display = setup.connect === 'current' ? '' : 'none';
 }

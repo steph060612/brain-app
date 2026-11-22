@@ -394,9 +394,9 @@ echo "Done. The Brain app is open in Safari at $URL. Keep it in the Dock: File >
 # claude (src/assistant-env.js asks the same shell).
 if [ "$ADOPT" != yes ]; then
   if [ -n "$(in_shell claude)" ]; then
-    echo "Next: in the Brain app, click Connect Claude Code, then Find my projects, then Start interview."
+    echo "Next: in the Brain app, click Connect Claude Code, then Set up your brain."
   else
-    echo "First step: in the Brain app, click More, then Copy setup interview, and paste it into a new chat with your assistant."
+    echo "First step: in the Brain app, click Set up your brain."
   fi
 fi
 echo "Backups: your brain ($(tilde "$BRAIN_DIR")) is saved on this Mac every 15 minutes. It is sent nowhere."

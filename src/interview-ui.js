@@ -31,9 +31,10 @@ export function initInterview() {
 
 export async function checkEligibility() {
   try {
-    // Start interview launches Claude Code: never offered when Claude Code is not found.
+    // Start interview launches Claude Code: never offered when Claude Code is not found. profileEmpty (profile.md
+    // and preferences.md still empty) also keeps "Set up your brain" in the bar; claude picks the chooser's interview.
     const { eligible, claude } = await fetchStatus();
-    window.dispatchEvent(new CustomEvent('brain-setup', { detail: { interview: !!eligible && !!claude } }));
+    window.dispatchEvent(new CustomEvent('brain-setup', { detail: { interview: !!eligible && !!claude, profileEmpty: !!eligible, claude: !!claude } }));
   } catch { /* non-fatal: the offer stays as it was */ }
 }
 
