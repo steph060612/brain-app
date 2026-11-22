@@ -16,6 +16,7 @@ import { registerCodeMapRoutes } from './src/codemap-routes.js';
 import { connectStatus, connectClaude, disconnectClaude } from './src/claude-connect.js';
 import { assistantEnv } from './src/assistant-env.js';
 import { interviewScript } from './src/interview-script.js';
+import { localDate, localStamp } from './src/local-date.js';
 import { scanProjects, draftProject } from './src/find-projects.js';
 import { SCHEMA_VERSION } from './src/map-schema.js';
 import { buildProblem, readBuildInfo } from './src/build-check.js';
@@ -47,11 +48,7 @@ function err403(m) { const e = new Error(m); e.status = 403; return e; }
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 const md5 = s => createHash('md5').update(s).digest('hex');
 
-// YYYY-MM-DD in local time (toISOString() is UTC and gives tomorrow's date in the evening).
-function localDate(d) {
-  const p = n => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-}
+// YYYY-MM-DD in local time (src/local-date.js; toISOString() is UTC and gives tomorrow's date in the evening).
 
 const localToday = () => localDate(new Date());
 
@@ -266,7 +263,7 @@ const fmtDropped = dropped => dropped.map(d => `${d.file} (${d.reason})`).join('
 async function appendDistillLog(line) {
   try {
     await mkdir(resolve(homedir(), '.brain'), { recursive: true });
-    const ts = new Date().toISOString().slice(0, 19).replace('T', ' ');
+    const ts = localStamp();
     await writeFile(DISTILL_LOG, `${ts} | ${line}\n`, { flag: 'a' });
   } catch { /* non-fatal */ }
 }

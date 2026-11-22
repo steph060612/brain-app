@@ -15,6 +15,7 @@ import { readdir, readFile, stat, realpath } from 'fs/promises';
 import { execFile } from 'child_process';
 import { homedir } from 'os';
 import { join, basename, extname } from 'path';
+import { localDate } from './local-date.js';
 
 const HOME = homedir();
 export const MARKERS = ['package.json', 'pyproject.toml', 'requirements.txt', 'Package.swift', 'Cargo.toml', 'go.mod', 'index.html'];
@@ -243,7 +244,7 @@ async function readme(dir) {
   return text === null ? null : { file: f, lines: firstLines(text, 12) };
 }
 
-const day = iso => (iso ? iso.slice(0, 10) : null);
+const day = iso => (iso ? localDate(iso) : null); // the local day, not the UTC one
 const quote = lines => lines.map(l => `> ${l.replace(/^#+\s*/, '')}`).join('\n');
 const oneLine = s => String(s || '').replace(/\s+/g, ' ').trim().slice(0, 300);
 
