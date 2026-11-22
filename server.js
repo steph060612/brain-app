@@ -1714,8 +1714,12 @@ async function interviewEligibility() {
   return { eligible, projectNames, name };
 }
 
+// Start interview runs Claude Code, so it is offered only when Claude Code is found (the same check as Connect
+// Claude Code). Without it the setup interview is Copy setup interview, under More.
+const hasClaude = async () => { const env = await assistantEnv({ fresh: false }); return env.claude || !!env.claudePath; };
+
 app.get('/api/interview-status', async (_req, res) => {
-  try { res.json(await interviewEligibility()); }
+  try { res.json({ ...(await interviewEligibility()), claude: await hasClaude() }); }
   catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 
@@ -1723,6 +1727,7 @@ app.post('/api/interview/prepare', async (_req, res) => {
   try {
     const { eligible, projectNames, name } = await interviewEligibility();
     if (!eligible) return res.status(409).json({ error: 'Brain is not empty enough to start the interview.' });
+    if (!(await hasClaude())) return res.status(409).json({ error: 'Claude Code was not found. Use More, then Copy setup interview, with your assistant instead.' });
 
     let templateText = '';
     try { templateText = await readFile(INTERVIEW_TEMPLATE, 'utf8'); } catch (e) {
@@ -1733,8 +1738,8 @@ app.post('/api/interview/prepare', async (_req, res) => {
       : '\nThere are no projects in this brain yet. For Q2, ask if there are projects to add.';
     // Titles name the person as profile.md does, never by the Mac's account name or a folder name.
     const nameNote = name
-      ? `\nThe person's name, from profile.md: ${name}. Use this name in proposal titles and text (for example "Who ${name} is"). Never use the computer's account name, the home folder name or a name from a file path.`
-      : '\nprofile.md has no name yet. Ask for it first and use it in proposal titles. Never use the computer\'s account name, the home folder name or a name from a file path.';
+      ? `\nThe person's name, from profile.md: ${name}. Use this name in proposal text. The profile.md proposal's title is exactly "Profile". Never use the computer's account name, the home folder name or a name from a file path.`
+      : '\nprofile.md has no name yet. Ask for it first and use it in proposal text. The profile.md proposal\'s title is exactly "Profile". Never use the computer\'s account name, the home folder name or a name from a file path.';
     const fullPrompt = templateText.trimEnd() + '\n' + projectNote + nameNote + '\n';
 
     const { claudePath } = await assistantEnv({ fresh: false });

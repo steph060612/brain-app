@@ -34,7 +34,7 @@ Write one .md file per target. Each file must have this exact frontmatter:
 
 ```
 ---
-title: [short descriptive title using the name given below, e.g. "Who Ann is"]
+title: [exactly "Profile" for profile.md; otherwise a short descriptive title, e.g. "Preferences"]
 updated: [today's date, YYYY-MM-DD]
 target: [relative path: profile.md | preferences.md | projects/<name>/state.md | projects/<name>/context.md]
 ---

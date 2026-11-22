@@ -1,4 +1,5 @@
-// "Start interview": offered while the brain is new (profile.md has at most a name, preferences.md empty).
+// "Start interview": offered while the brain is new (profile.md has at most a name, preferences.md empty) and
+// Claude Code is found.
 // Copies one Terminal command that starts Claude Code in the brain folder with the interview prompt.
 // Polls the inbox after the command is copied so the badge updates as proposals arrive.
 // Whether it is offered is reported to the top bar as a 'brain-setup' event ({ interview: true|false }); the top bar
@@ -30,8 +31,9 @@ export function initInterview() {
 
 export async function checkEligibility() {
   try {
-    const { eligible } = await fetchStatus();
-    window.dispatchEvent(new CustomEvent('brain-setup', { detail: { interview: !!eligible } }));
+    // Start interview launches Claude Code: never offered when Claude Code is not found.
+    const { eligible, claude } = await fetchStatus();
+    window.dispatchEvent(new CustomEvent('brain-setup', { detail: { interview: !!eligible && !!claude } }));
   } catch { /* non-fatal: the offer stays as it was */ }
 }
 
