@@ -292,10 +292,16 @@ done
 LOGIN_SHELL="${BRAIN_LOGIN_SHELL:-$(dscl . -read "/Users/$(id -un)" UserShell 2>/dev/null | awk '{print $2}')}"
 [ -n "$LOGIN_SHELL" ] || LOGIN_SHELL="${SHELL:-/bin/zsh}"
 # Not finding it is an answer, not an error (the installer runs with set -e and pipefail).
-found_in_shell() { { "$LOGIN_SHELL" -lc 'command -v brainmap' 2>/dev/null </dev/null || true; } | tail -1; }
+in_shell() { { "$LOGIN_SHELL" -lc "command -v $1" 2>/dev/null </dev/null || true; } | tail -1; }
+found_in_shell() { in_shell brainmap; }
+# Said only when a new Terminal window would run some other brainmap (one earlier on the PATH than ~/.local/bin).
+other_brainmap() {
+  [ -n "$FOUND" ] && ! [ "$FOUND" -ef "$STATE_DIR/brainmap.sh" ] || return 0
+  echo "Note: a different brainmap comes earlier on your PATH, so new Terminal windows and assistants will run $FOUND, not the Brain's $BIN_DIR/brainmap. Remove or rename that one to use the Brain's."
+}
 FOUND="$(found_in_shell)"
 if [ -n "$FOUND" ]; then
-  echo "A new Terminal window finds brainmap at $FOUND."
+  other_brainmap
 else
   case "$(basename "$LOGIN_SHELL")" in
     zsh) PROFILE="$HOME/.zprofile" ;;
@@ -307,7 +313,7 @@ else
   elif { printf '\n# Added by the Brain installer: commands in ~/.local/bin (brainmap, brainpack)\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$PROFILE"; } 2>/dev/null; then
     echo "Added $BIN_DIR to your PATH in $PROFILE (two lines at the end, marked \"Added by the Brain installer\")."
     FOUND="$(found_in_shell)"
-    if [ -n "$FOUND" ]; then echo "New Terminal windows now find brainmap at $FOUND (this window does not; open a new one)."
+    if [ -n "$FOUND" ]; then other_brainmap
     else echo "A new Terminal window still does not find brainmap. Run it by full path: $STATE_DIR/brainmap.sh"; fi
   else
     echo "Could not write to $PROFILE. To run brainmap by name, add this line to it yourself: export PATH=\"\$HOME/.local/bin:\$PATH\""
@@ -384,6 +390,14 @@ if [ "$MODE" = update ]; then
 fi
 open -a Safari "$URL" 2>/dev/null || true
 echo "Done. The Brain app is open in Safari at $URL. Keep it in the Dock: File > Add to Dock."
-[ "$ADOPT" = yes ] || echo "First step: click 'Copy setup interview' and paste it into a new chat with your assistant."
+# The next steps follow what the app will show: its Connect Claude Code button appears when the login shell finds
+# claude (src/assistant-env.js asks the same shell).
+if [ "$ADOPT" != yes ]; then
+  if [ -n "$(in_shell claude)" ]; then
+    echo "Next: in the Brain app, click Connect Claude Code, then Find my projects, then Start interview."
+  else
+    echo "First step: click 'Copy setup interview' and paste it into a new chat with your assistant."
+  fi
+fi
 echo "Backups: your brain ($(tilde "$BRAIN_DIR")) is saved on this Mac every 15 minutes. It is sent nowhere."
 echo "If a save fails, the Brain app shows a red message at the top saying why."
