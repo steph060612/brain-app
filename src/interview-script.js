@@ -10,13 +10,13 @@
 //   --disallowedTools           hard-blocks the Edit tool itself, NotebookEdit and Bash. (MultiEdit is
 //                               no longer a tool in Claude Code 2.1.)
 //   --strict-mcp-config         loads no MCP servers, so no MCP tool can write to the brain.
-// The script stops before launching when Claude Code is older than MIN_CLAUDE, the first version that
-// accepts all of these flags (2.0.42 rejects --permission-mode dontAsk).
+// The script stops before launching when Claude Code is older than MIN_CLAUDE. 2.0.43 was the first version that
+// accepted all of these flags (2.0.42 rejects --permission-mode dontAsk); the minimum is now 2.1.150.
 // The brain path is resolved with pwd -P so the absolute rule matches symlinked folders too.
 // The first message, "Begin the interview.", is passed as the prompt argument so Claude Code starts asking right
 // away instead of waiting silently for the person to type. "$@" passes extra arguments through after it.
 
-export const MIN_CLAUDE = '2.0.43';
+export const MIN_CLAUDE = '2.1.150';
 export const OPENING = 'Begin the interview.';
 
 const shellq = s => "'" + String(s).replace(/'/g, "'\\''") + "'";
